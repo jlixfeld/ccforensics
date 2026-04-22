@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from platformdirs import user_cache_dir
 
 
 def claude_home() -> Path:
-    return Path(os.environ.get("HOME", "~")).expanduser() / ".claude"
+    """Return ``~/.claude``. Raises ``RuntimeError`` if the home dir can't be resolved."""
+    return Path.home() / ".claude"
 
 
 def claude_projects_dir() -> Path:

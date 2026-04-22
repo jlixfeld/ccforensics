@@ -79,3 +79,13 @@ def test_claude_user_skills_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
 def test_claude_user_agents_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     assert claude_user_agents_dir() == tmp_path / ".claude" / "agents"
+
+
+def test_claude_home_raises_when_unresolvable(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Path.home() raises RuntimeError if it can't resolve a home dir.
+    # Simulate by clearing HOME and the win/posix fallbacks.
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.delenv("USERPROFILE", raising=False)
+    monkeypatch.setattr("os.path.expanduser", lambda p: p)
+    with pytest.raises(RuntimeError):
+        claude_home()
