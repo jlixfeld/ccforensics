@@ -43,3 +43,46 @@ def test_walk_indexes_all_jsonl(tmp_path: Path, pricing_data: dict) -> None:
     file_rows = conn.execute("SELECT kind FROM files").fetchall()
     kinds = {row[0] for row in file_rows}
     assert kinds == {"main", "subagent"}
+
+
+def test_walk_commits_per_file(tmp_path: Path, pricing_data: dict) -> None:
+    """If the walker is interrupted mid-loop, already-processed files
+    must be persisted (per-file commit, not commit-at-end)."""
+    proj = tmp_path / "projects"
+    sess = proj / "-home-test"
+    sess.mkdir(parents=True)
+    for i in range(3):
+        (sess / f"sess-{i}.jsonl").write_bytes((FIXTURES / "basic" / "s1.jsonl").read_bytes())
+
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+
+    # Wrap conn.execute on the third reconcile_file insert to raise, simulating
+    # an interrupt. Then verify the first two files made it to disk by opening
+    # a fresh connection and counting.
+    real_reconcile = __import__("ccforensics.index", fromlist=["reconcile_file"]).reconcile_file
+    call_count = {"n": 0}
+
+    def boom(c, p, pd):
+        call_count["n"] += 1
+        if call_count["n"] >= 3:
+            raise KeyboardInterrupt("simulated interrupt")
+        return real_reconcile(c, p, pd)
+
+    import ccforensics.index as idx_mod
+
+    monkey_target = idx_mod.reconcile_file
+    idx_mod.reconcile_file = boom  # type: ignore[assignment]
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            reconcile_projects_dir(conn, proj, pricing_data)
+    finally:
+        idx_mod.reconcile_file = monkey_target  # type: ignore[assignment]
+
+    # Open a fresh connection — if commits are per-file, the first two
+    # are durable even though the third interrupted before commit.
+    conn.close()
+    fresh = open_connection(db)
+    durable = fresh.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    assert durable == 2, f"expected 2 files persisted before interrupt, got {durable}"

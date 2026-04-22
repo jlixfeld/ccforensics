@@ -330,6 +330,8 @@ def reconcile_projects_dir(
     """Walk the Claude Code projects directory and reconcile every *.jsonl file.
 
     Includes both main session files and subagent files under <session>/subagents/.
+    Commits per file so a mid-walk interrupt only loses the file currently
+    being parsed (each ``reconcile_file`` is idempotent).
     """
     stats = ReconcileStats()
     if not projects_dir.exists():
@@ -342,6 +344,7 @@ def reconcile_projects_dir(
             stats.files_skipped_unchanged += 1
             continue
         reconcile_file(conn, path, pricing_data)
+        conn.commit()
         stats.files_indexed += 1
         stats.files_changed += 1
     return stats
