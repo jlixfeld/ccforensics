@@ -117,6 +117,27 @@ def test_query_reverse_flips_order(conn: sqlite3.Connection) -> None:
     assert [r.session_id for r in rows] == ["sA", "sC", "sB"]
 
 
+def test_query_reverse_keeps_nulls_last(conn: sqlite3.Connection) -> None:
+    """NULL-valued sort column stays at the end even under --reverse.
+
+    Rationale: `--sort cost --reverse` means "cheapest first". Sessions with
+    unresolved pricing (cost IS NULL) aren't "cheaper than cheapest" — they're
+    unknown, and belong at the bottom in both directions.
+    """
+    _insert_summary(conn, session_id="s-hi", total_cost_usd=5.0, last_active_at=300)
+    _insert_summary(conn, session_id="s-null", total_cost_usd=None, last_active_at=200)
+    _insert_summary(conn, session_id="s-lo", total_cost_usd=1.0, last_active_at=100)
+    conn.commit()
+
+    # Default (DESC): s-hi, s-lo, s-null
+    rows = query_session_list(conn, sort_key="cost")
+    assert [r.session_id for r in rows] == ["s-hi", "s-lo", "s-null"]
+
+    # Reversed (ASC): s-lo, s-hi, s-null  — NULL still last
+    rows = query_session_list(conn, sort_key="cost", reverse=True)
+    assert [r.session_id for r in rows] == ["s-lo", "s-hi", "s-null"]
+
+
 def test_query_limit_caps_rows(conn: sqlite3.Connection) -> None:
     for i in range(5):
         _insert_summary(conn, session_id=f"s{i}", last_active_at=100 + i)

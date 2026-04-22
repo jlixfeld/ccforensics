@@ -3235,7 +3235,8 @@ def query_session_list(
         params.append(f"%{grep.lower()}%")
 
     col = _SORT_COLUMN[sort_key]
-    # NULLs last by default (except when user explicitly reverses)
+    # NULLs always sort last (both DESC default and ASC under --reverse).
+    # Rationale: "cheapest first" shouldn't put unknown-cost rows at the top.
     direction = "ASC" if reverse else "DESC"
     sql = (
         "SELECT session_id, project_path, project_display, started_at, "
