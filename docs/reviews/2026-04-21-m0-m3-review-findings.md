@@ -4,19 +4,14 @@ Captured after the superpowers:code-reviewer pass on `feature/initial-implementa
 
 **Assessment:** ship M0–M3 as-is. No critical issues. Six "Important" items below are polish-grade, not blockers — fix before the next milestone *touches the same file*, not speculatively.
 
-## Important (fix opportunistically — before the next milestone touches the same file)
+## Important (RESOLVED — all 6 fixed in commits f553d9d → fe8ccad)
 
-1. **`paths.claude_home()` HOME fragility** — `os.environ.get("HOME", "~")` + `.expanduser()` silently returns a relative `~/.claude` when HOME is unset, producing `./~/.claude` on cache write. Switch to `Path.home()` (raises `RuntimeError` when unresolvable) or explicitly guard. *File:* `src/ccforensics/paths.py:10`.
-
-2. **`resolve_pricing` silent substring fallback** — the second loop (`lowered in kl or kl in lowered`) can match the wrong model entry without any warning. Emit a log.warning when substring fallback resolves so `-v` surfaces it. Risk scenario: LiteLLM drops/renames a Claude key → silent misattribution under the ±1% check. *File:* `src/ccforensics/pricing.py:57-62`.
-
-3. **`cost_usd` inconsistency for non-billable types** — `user` entries get `0.0`; `system`, `attachment`, `file-history-snapshot` get `None`. `SUM()` ignores NULL so totals are fine, but downstream queries distinguishing "zero cost" from "not billable" will be ambiguous. Unify on one convention. *File:* `src/ccforensics/jsonl.py:129-130`.
-
-4. **`_classify_file` silently mislabels malformed subagent filenames** — a file under `subagents/` whose name doesn't match `agent-<hex>.jsonl` is classified as `main` with the wrong `session_id`. If Claude Code ever changes subagent naming, every subagent file becomes a "main" session. Add warn + classify as `subagent` with `None` agent_id. *File:* `src/ccforensics/index.py:162-172`.
-
-5. **`reconcile_projects_dir` has no per-file commit** — mid-walk interrupt on the 14,394-file corpus loses all work. Consider `conn.commit()` after each `reconcile_file` or every N files. Resilience + progress-visibility. *File:* `src/ccforensics/index.py:reconcile_projects_dir`.
-
-6. **`parse_file` claims streaming, actually reads whole file** — `path.read_text().splitlines()` buffers everything. Either make it a true streaming iterator (open + for-line + look-ahead for last-line truncation detection) or update the docstring to say "buffered parse." Spec §3.1 says streaming. *File:* `src/ccforensics/jsonl.py:34`.
+1. ✅ **`paths.claude_home()` HOME fragility** → `f553d9d` switched to `Path.home()`, which raises `RuntimeError` when unresolvable.
+2. ✅ **`resolve_pricing` silent substring fallback** → `4bf7649` added a `logger.warning` when substring fallback fires (exact-match candidates stay silent).
+3. ✅ **`cost_usd` inconsistency for non-billable types** → `69c5412` unified to `0.0` for all non-billable types; `None` is now reserved strictly for the pricing-unresolved case.
+4. ✅ **`_classify_file` silently mislabels malformed subagent filenames** → `e654767` warns + classifies as `subagent` with `agent_id=None` (no more silent `main`).
+5. ✅ **`reconcile_projects_dir` no per-file commit** → `aabdcb3` added `conn.commit()` after each `reconcile_file`. Test simulates a mid-walk `KeyboardInterrupt` and asserts already-reconciled files are durable.
+6. ✅ **`parse_file` claims streaming, actually buffers** → `fe8ccad` rewrote to iterate via `path.open()`; trailing-newline probe handles the last-line truncation classification.
 
 ## Minor (defer to M10 polish)
 
