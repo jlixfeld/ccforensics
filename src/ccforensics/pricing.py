@@ -12,8 +12,7 @@ import httpx
 logger = logging.getLogger("ccforensics.pricing")
 
 LITELLM_URL = (
-    "https://raw.githubusercontent.com/BerriAI/litellm/main/"
-    "model_prices_and_context_window.json"
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 )
 
 
@@ -125,9 +124,7 @@ class PricingCache:
     cache_file: Path
     ttl_seconds: int = 24 * 60 * 60
 
-    def load_or_fetch(
-        self, http_client: httpx.Client | None = None
-    ) -> dict[str, dict[str, Any]]:
+    def load_or_fetch(self, http_client: httpx.Client | None = None) -> dict[str, dict[str, Any]]:
         now = int(time.time())
         if self.cache_file.exists():
             try:
@@ -149,9 +146,7 @@ class PricingCache:
             logger.warning("pricing fetch failed (%s); using hardcoded fallback", e)
             return fallback_hardcoded()
 
-    def _fetch_and_store(
-        self, client: httpx.Client | None, now: int
-    ) -> dict[str, dict[str, Any]]:
+    def _fetch_and_store(self, client: httpx.Client | None, now: int) -> dict[str, dict[str, Any]]:
         client = client or httpx.Client(timeout=15.0)
         resp = client.get(LITELLM_URL)
         resp.raise_for_status()

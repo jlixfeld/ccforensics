@@ -22,9 +22,7 @@ def pricing_data() -> dict:
     return json.loads((FIXTURES / "litellm" / "model_prices.json").read_text())
 
 
-def test_first_reconcile_inserts_files_and_messages(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_first_reconcile_inserts_files_and_messages(tmp_path: Path, pricing_data: dict) -> None:
     db = tmp_path / "index.sqlite"
     conn = open_connection(db)
     ensure_schema(conn)
@@ -64,9 +62,7 @@ def test_reconcile_unchanged_file_is_noop(tmp_path: Path, pricing_data: dict) ->
     assert first_last_parsed == second_last_parsed, "unchanged file should be skipped"
 
 
-def test_reconcile_changed_file_replaces_messages(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_reconcile_changed_file_replaces_messages(tmp_path: Path, pricing_data: dict) -> None:
     db = tmp_path / "index.sqlite"
     conn = open_connection(db)
     ensure_schema(conn)

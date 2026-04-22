@@ -127,9 +127,7 @@ def annotate_cost(
     unresolved: set[str] = set()
     for e in entries:
         if e.type != "assistant" or e.message is None or e.message.usage is None:
-            out.append(
-                AnnotatedEntry(entry=e, cost_usd=0.0 if e.type == "user" else None)
-            )
+            out.append(AnnotatedEntry(entry=e, cost_usd=0.0 if e.type == "user" else None))
             continue
         model = e.message.model
         if model is None:
@@ -138,9 +136,7 @@ def annotate_cost(
         price = resolve_pricing(model, pricing_data)
         if price is None:
             unresolved.add(model)
-            out.append(
-                AnnotatedEntry(entry=e, cost_usd=None, pricing_unresolved_model=model)
-            )
+            out.append(AnnotatedEntry(entry=e, cost_usd=None, pricing_unresolved_model=model))
             continue
         usage = e.message.usage
         cost = compute_message_cost(

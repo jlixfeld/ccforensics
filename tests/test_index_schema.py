@@ -18,9 +18,7 @@ def test_fresh_db_applies_current_schema(tmp_path: Path) -> None:
     cur = conn.execute("PRAGMA user_version")
     assert cur.fetchone()[0] == CURRENT_SCHEMA_VERSION
 
-    existing = {
-        row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    }
+    existing = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     for required in (
         "files",
         "messages",

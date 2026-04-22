@@ -70,9 +70,7 @@ def test_dedup_deterministic_under_shuffle() -> None:
         keys_runs.append(sorted(dedup_key(e) or "" for e in merged))
 
     for run in keys_runs[1:]:
-        assert run == keys_runs[0], (
-            "dedup output must be deterministic regardless of input order"
-        )
+        assert run == keys_runs[0], "dedup output must be deterministic regardless of input order"
 
 
 def test_first_write_wins_earlier_timestamp() -> None:
