@@ -9,6 +9,8 @@ from ccforensics.paths import (
     claude_home,
     claude_plugins_cache_dir,
     claude_projects_dir,
+    claude_user_agents_dir,
+    claude_user_skills_dir,
     decode_project_dirname,
     encode_project_path,
 )
@@ -57,3 +59,23 @@ def test_decode_is_lossy_note() -> None:
 def test_encode_project_path_round_trip() -> None:
     p = Path("/Users/jlixfeld/Documents")
     assert encode_project_path(p) == "-Users-jlixfeld-Documents"
+
+
+def test_encode_rejects_relative_path() -> None:
+    with pytest.raises(ValueError, match="absolute path required"):
+        encode_project_path(Path("relative/path"))
+
+
+def test_decode_rejects_name_without_leading_dash() -> None:
+    with pytest.raises(ValueError, match="expected leading '-'"):
+        decode_project_dirname("bad-name")
+
+
+def test_claude_user_skills_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert claude_user_skills_dir() == tmp_path / ".claude" / "skills"
+
+
+def test_claude_user_agents_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert claude_user_agents_dir() == tmp_path / ".claude" / "agents"
