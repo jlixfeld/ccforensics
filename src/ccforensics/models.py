@@ -107,6 +107,20 @@ KNOWN_TYPES: frozenset[str] = frozenset(
 )
 
 
+def _normalize_message_content(raw: dict[str, Any]) -> None:
+    """Claude Code sometimes emits ``message.content`` as a bare string
+    (common for plain user text prompts); pydantic rejects that because the
+    ``Message.content`` field is typed ``list[ContentBlock]``. Wrap the
+    string into a single-element text block so validation proceeds and
+    downstream consumers see the list-of-blocks shape unchanged."""
+    msg = raw.get("message")
+    if not isinstance(msg, dict):
+        return
+    content = msg.get("content")
+    if isinstance(content, str):
+        msg["content"] = [{"type": "text", "text": content}]
+
+
 def parse_entry(raw: dict[str, Any]) -> TranscriptEntry:
     """Normalize legacy field names, then pydantic-parse. Never raises on
     unknown types or extra fields."""
@@ -114,4 +128,5 @@ def parse_entry(raw: dict[str, Any]) -> TranscriptEntry:
         raw["sourceToolUseID"] = raw.pop("parentToolUseId")
     if "parentToolAssistantUuid" in raw and "sourceToolAssistantUUID" not in raw:
         raw["sourceToolAssistantUUID"] = raw.pop("parentToolAssistantUuid")
+    _normalize_message_content(raw)
     return TranscriptEntry.model_validate(raw)

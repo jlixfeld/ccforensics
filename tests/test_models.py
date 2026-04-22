@@ -87,6 +87,77 @@ def test_tool_use_content_block_parsed() -> None:
     assert blocks[0].name == "Read"
 
 
+def test_parse_entry_accepts_string_content() -> None:
+    """Real Claude Code JSONL emits ``message.content`` as a bare string for
+    plain user text prompts. parse_entry must normalize that into a single
+    text block rather than letting pydantic reject the entry."""
+    raw = json.loads(
+        '{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"2026-04-20T10:00:00Z",'
+        '"message":{"role":"user","content":"hello"}}'
+    )
+    entry = parse_entry(raw)
+    assert entry.message is not None
+    assert len(entry.message.content) == 1
+    block = entry.message.content[0]
+    assert block.type == "text"
+    assert block.text == "hello"
+
+
+def test_parse_entry_accepts_list_content_unchanged() -> None:
+    """When content is already a list, leave it alone — don't double-wrap."""
+    raw = json.loads(
+        '{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"2026-04-20T10:00:00Z",'
+        '"message":{"role":"user","content":[{"type":"text","text":"hi"}]}}'
+    )
+    entry = parse_entry(raw)
+    assert entry.message is not None
+    assert len(entry.message.content) == 1
+    assert entry.message.content[0].type == "text"
+    assert entry.message.content[0].text == "hi"
+
+
+def test_parse_entry_accepts_missing_content() -> None:
+    """message present but content key absent → default empty list, no error."""
+    raw = json.loads(
+        '{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"2026-04-20T10:00:00Z",'
+        '"message":{"role":"user"}}'
+    )
+    entry = parse_entry(raw)
+    assert entry.message is not None
+    assert entry.message.content == []
+
+
+def test_parse_entry_accepts_empty_string_content() -> None:
+    """Empty string content should normalize to one empty text block,
+    preserving _first_text_block semantics (which returns None for empty)."""
+    raw = json.loads(
+        '{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"2026-04-20T10:00:00Z",'
+        '"message":{"role":"user","content":""}}'
+    )
+    entry = parse_entry(raw)
+    assert entry.message is not None
+    assert len(entry.message.content) == 1
+    assert entry.message.content[0].type == "text"
+    assert entry.message.content[0].text == ""
+
+
+def test_parse_entry_accepts_tool_result_list_content() -> None:
+    """List-shaped content with a tool_result block (the other real-corpus
+    shape for type='user' entries) must parse cleanly."""
+    raw = json.loads(
+        '{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"2026-04-20T10:00:00Z",'
+        '"message":{"role":"user","content":[{"tool_use_id":"toolu-x",'
+        '"type":"tool_result","content":"output"}]}}'
+    )
+    entry = parse_entry(raw)
+    assert entry.message is not None
+    assert len(entry.message.content) == 1
+    block = entry.message.content[0]
+    assert block.type == "tool_result"
+    assert block.tool_use_id == "toolu-x"
+    assert block.content == "output"
+
+
 def test_attachment_hook_success_recognized() -> None:
     raw = json.loads(
         '{"type":"attachment","timestamp":"2026-04-20T10:00:00Z",'

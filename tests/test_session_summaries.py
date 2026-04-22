@@ -457,6 +457,44 @@ def test_summary_falls_back_to_first_user_prompt(
     assert row[1] == "first-prompt"
 
 
+def test_summary_from_string_shaped_user_prompt(
+    tmp_path: Path, pricing_data: dict[str, Any]
+) -> None:
+    """Real Claude Code JSONL emits ``message.content`` as a bare string for
+    plain user prompts. End-to-end: a session file whose sole user entry has
+    string-shaped content must still yield ``summary_source='first-prompt'``
+    with the string's text. Guards against the regression where pydantic
+    would reject the entry and drop it silently."""
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    session_path = enc / "sess-str.jsonl"
+    enc.mkdir(parents=True)
+    raw = {
+        "type": "user",
+        "uuid": "u1",
+        "sessionId": "sess-str",
+        "timestamp": "2026-04-20T10:00:00Z",
+        "isSidechain": False,
+        "isMeta": False,
+        "cwd": "/home/test",
+        "message": {"role": "user", "content": "Can we refactor this?"},
+    }
+    session_path.write_text(json.dumps(raw) + "\n")
+
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    row = conn.execute(
+        "SELECT summary_text, summary_source FROM session_summaries WHERE session_id=?",
+        ("sess-str",),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "Can we refactor this?"
+    assert row[1] == "first-prompt"
+
+
 def test_first_prompt_skips_pure_hook_injection(
     tmp_path: Path, pricing_data: dict[str, Any]
 ) -> None:
