@@ -141,6 +141,35 @@ def test_sanitize_handles_empty_and_whitespace() -> None:
     assert _sanitize_prompt("   \n\n  ") == ""
 
 
+def test_sanitize_strips_local_command_wrappers() -> None:
+    raw = "<local-command-caveat>Caveat: ...</local-command-caveat>Do the thing"
+    assert _sanitize_prompt(raw) == "Do the thing"
+
+    raw = "<local-command-stdout>Set model to Opus 4.7</local-command-stdout>"
+    assert _sanitize_prompt(raw) == ""  # whole prompt was wrapped
+
+    raw = "<local-command-stderr>err</local-command-stderr>actual prompt"
+    assert _sanitize_prompt(raw) == "actual prompt"
+
+
+def test_sanitize_strips_bash_wrappers() -> None:
+    raw = "<bash-input>cd ..</bash-input>"
+    assert _sanitize_prompt(raw) == ""
+
+    raw = "<bash-stdout>hello</bash-stdout><bash-stderr>warn</bash-stderr>actual"
+    assert _sanitize_prompt(raw) == "actual"
+
+
+def test_sanitize_composite_real_corpus_shape() -> None:
+    """Realistic shape seen in real-corpus sessions."""
+    raw = (
+        "<local-command-caveat>Caveat: The messages below were generated...</local-command-caveat>"
+        "<bash-input>pwd</bash-input>"
+        "<bash-stdout>/Users/x</bash-stdout>"
+    )
+    assert _sanitize_prompt(raw) == ""
+
+
 def test_is_pure_hook_injection_true_for_long_marker_blob() -> None:
     blob = "<session-start-hook>" + ("a" * 500)
     assert _is_pure_hook_injection(blob) is True
@@ -514,6 +543,50 @@ def test_first_prompt_skips_pure_hook_injection(
             type_="user",
             uuid="u2",
             ts="2026-04-20T10:01:00Z",
+            role="user",
+            text="real human prompt",
+        ),
+    ]
+    proj, _p = _make_projects_dir(tmp_path, entries=entries)
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    row = conn.execute(
+        "SELECT summary_text, summary_source FROM session_summaries WHERE session_id=?",
+        ("sess-1",),
+    ).fetchone()
+    assert row[0] == "real human prompt"
+    assert row[1] == "first-prompt"
+
+
+def test_first_prompt_falls_through_empty_after_sanitize(
+    tmp_path: Path, pricing_data: dict[str, Any]
+) -> None:
+    """A first user prompt that sanitizes to empty (entirely wrapped in
+    bash/local-command wrappers) must fall through to the next eligible
+    user prompt, not render as a blank summary."""
+    entries = [
+        _entry(
+            type_="user",
+            uuid="u1",
+            ts="2026-04-20T10:00:00Z",
+            role="user",
+            text="<local-command-stdout>Set model to Opus 4.7</local-command-stdout>",
+            cwd="/home/test",
+        ),
+        _entry(
+            type_="user",
+            uuid="u2",
+            ts="2026-04-20T10:01:00Z",
+            role="user",
+            text="<bash-input>pwd</bash-input>",
+        ),
+        _entry(
+            type_="user",
+            uuid="u3",
+            ts="2026-04-20T10:02:00Z",
             role="user",
             text="real human prompt",
         ),

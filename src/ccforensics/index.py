@@ -20,6 +20,10 @@ _COMMAND_WRAPPER_RE = re.compile(
     r"<command-(name|message|args)>.*?</command-\1>",
     re.DOTALL,
 )
+_LOCAL_WRAPPER_RE = re.compile(
+    r"<(local-command-(?:caveat|stdout|stderr)|bash-(?:input|stdout|stderr))>.*?</\1>",
+    re.DOTALL,
+)
 _IDE_ATTACHMENT_RE = re.compile(
     r"<ide[^>]*>.*?<file[^>]*>(?P<path>[^<]+)</file>.*?</ide[^>]*>",
     re.DOTALL,
@@ -28,7 +32,12 @@ _HOOK_INJECTION_MARKER = "<session-start-hook>"
 
 
 def _sanitize_prompt(text: str) -> str:
-    """Strip command wrappers, replace IDE attachments, collapse whitespace, cap at 1000."""
+    """Strip command/bash wrappers, replace IDE attachments, collapse whitespace, cap at 1000.
+
+    An empty string after sanitization is meaningful: callers treat it the
+    same as "no text block" and fall through to the next candidate prompt.
+    """
+    text = _LOCAL_WRAPPER_RE.sub("", text)
     text = _COMMAND_WRAPPER_RE.sub("", text)
     text = _IDE_ATTACHMENT_RE.sub(lambda m: f"\U0001f4ce {m.group('path').strip()}", text)
     text = " ".join(text.split())
