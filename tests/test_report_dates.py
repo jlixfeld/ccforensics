@@ -49,3 +49,18 @@ def test_parse_since_bad_input_raises_value_error() -> None:
 def test_parse_until_bad_input_raises_value_error() -> None:
     with pytest.raises(ValueError, match="garbage"):
         parse_until("garbage")
+
+
+def test_parse_since_rejects_non_padded_iso() -> None:
+    with pytest.raises(ValueError, match="2026-4-15"):
+        parse_since("2026-4-15")
+
+
+def test_parse_since_rejects_garbage_iso_like() -> None:
+    with pytest.raises(ValueError, match="2026-13-01"):
+        parse_since("2026-13-01")
+
+
+def test_parse_since_accepts_padded_iso() -> None:
+    result = parse_since("2026-04-15")
+    assert result == datetime(2026, 4, 15, 0, 0, 0, tzinfo=UTC)

@@ -3,8 +3,13 @@ from __future__ import annotations
 _EM_DASH = "—"
 
 
-def format_duration(seconds: int) -> str:
-    """Format a non-negative second count as a compact human string."""
+def format_duration(seconds: float) -> str:
+    """Format a non-negative second count as a compact human string.
+
+    Accepts ``int`` or ``float``. Sub-second precision is truncated via
+    ``int()`` before formatting.
+    """
+    seconds = int(seconds)
     if seconds < 60:
         return f"{seconds}s"
     minutes, _s = divmod(seconds, 60)

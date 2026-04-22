@@ -27,6 +27,11 @@ def test_format_duration_days_with_hours() -> None:
     assert format_duration(183600) == "2d3h"
 
 
+def test_format_duration_accepts_float() -> None:
+    assert format_duration(47.0) == "47s"
+    assert format_duration(15120.9) == "4h12m"
+
+
 def test_format_cost_none_is_em_dash() -> None:
     assert format_cost(None) == "$—"
 
