@@ -25,8 +25,8 @@ Milestones M0–M10 map to the spec §7.1 sequencing:
 | M2 | Cost totals match ccusage within ±1% | ✅ Done |
 | M3 | `index --rebuild` + `index --stats` working; idempotent | ✅ Done |
 | M4 | `session --list` on real corpus; SC5 verified | ✅ Done (SC5 PASS — 3s vs 30s target) |
-| M4.6 | Post-M4 polish — sanitization + grep help | Full task detail (pre-M5) |
-| M5 | Tree reconstruction; per-bucket breakdown | Outline only — expand when M4.6 complete |
+| M4.6 | Post-M4 polish — sanitization + grep help | ✅ Done |
+| M5 | Tree reconstruction; per-bucket breakdown | Outline only — expand next |
 | M6 | Plugin registry + rollup; collision warning | Outline only |
 | M7 | `session <id>` deep report; SC1 verified | Outline only |
 | M8 | Skill ledger + ± band; SC2 + SC3 verified | Outline only |
@@ -3669,11 +3669,11 @@ git commit -m "docs(cli): clarify --grep scope in help text"
 ```
 
 **M4.6 exit criteria:**
-- [ ] Sanitizer strips `<local-command-*>` and `<bash-*>` wrappers; tests cover each.
-- [ ] Empty-after-sanitize falls through to the next user prompt.
-- [ ] Real-corpus smoke shows no `<local-command-*>`- or `<bash-*>`-prefixed summaries.
-- [ ] `--grep` help text explicit about scope.
-- [ ] CI green. Coverage ≥85%.
+- [x] Sanitizer strips `<local-command-*>` and `<bash-*>` wrappers; tests cover each.
+- [x] Empty-after-sanitize falls through to the next user prompt.
+- [x] Real-corpus smoke shows no `<local-command-*>`- or `<bash-*>`-prefixed summaries.
+- [x] `--grep` help text explicit about scope.
+- [x] CI green. Coverage ≥85% (96% achieved).
 
 ---
 
