@@ -34,6 +34,33 @@ def test_resolves_alias_via_substring(pricing_data: dict) -> None:
     assert p is not None
 
 
+def test_substring_fallback_emits_warning(
+    pricing_data: dict, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="ccforensics.pricing")
+    # Hypothetical future-version that isn't in any candidate (no
+    # 'claude-{model}' / 'anthropic/{model}' match), so it falls through to
+    # substring matching on something like the Bedrock alias.
+    resolve_pricing("us.anthropic.claude-sonnet", pricing_data)
+    assert any(
+        "substring fallback" in rec.message
+        and "us.anthropic.claude-sonnet" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_exact_match_does_not_warn(
+    pricing_data: dict, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="ccforensics.pricing")
+    resolve_pricing("claude-sonnet-4-5-20250929", pricing_data)
+    assert not any("substring fallback" in rec.message for rec in caplog.records)
+
+
 def test_returns_none_for_unknown(pricing_data: dict) -> None:
     assert resolve_pricing("definitely-not-a-real-model", pricing_data) is None
 

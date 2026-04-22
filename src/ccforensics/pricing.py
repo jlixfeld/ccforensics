@@ -50,7 +50,12 @@ def _candidates(model: str) -> list[str]:
 
 
 def resolve_pricing(model: str, data: dict[str, dict[str, Any]]) -> ModelPrice | None:
-    """Resolve a model name to a ModelPrice via fuzzy lookup."""
+    """Resolve a model name to a ModelPrice via fuzzy lookup.
+
+    Tries the candidate list (exact + common prefixes) first; falls back to
+    bidirectional substring match. Substring fallback emits a warning so
+    silent misattribution is visible under ``-v``.
+    """
     for c in _candidates(model):
         if c in data:
             return ModelPrice.from_entry(data[c])
@@ -58,6 +63,11 @@ def resolve_pricing(model: str, data: dict[str, dict[str, Any]]) -> ModelPrice |
     for k, v in data.items():
         kl = k.lower()
         if lowered in kl or kl in lowered:
+            logger.warning(
+                "pricing: substring fallback resolved %r -> %r (no exact match)",
+                model,
+                k,
+            )
             return ModelPrice.from_entry(v)
     return None
 
