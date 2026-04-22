@@ -172,9 +172,7 @@ def _classify_file(path: Path) -> tuple[str, str | None, str]:
     return ("main", None, path.stem)
 
 
-def _row_is_unchanged(
-    conn: sqlite3.Connection, path: Path, mtime_ns: int, size: int
-) -> bool:
+def _row_is_unchanged(conn: sqlite3.Connection, path: Path, mtime_ns: int, size: int) -> bool:
     cur = conn.execute("SELECT mtime_ns, size FROM files WHERE path=?", (str(path),))
     row = cur.fetchone()
     return bool(row) and row[0] == mtime_ns and row[1] == size
@@ -245,9 +243,7 @@ def _insert_message(
     )
 
 
-def reconcile_file(
-    conn: sqlite3.Connection, path: Path, pricing_data: dict[str, Any]
-) -> None:
+def reconcile_file(conn: sqlite3.Connection, path: Path, pricing_data: dict[str, Any]) -> None:
     stat = path.stat()
     mtime_ns = stat.st_mtime_ns
     size = stat.st_size
@@ -300,9 +296,7 @@ def reconcile_file(
 
 
 def count_messages_for_file(conn: sqlite3.Connection, path: Path) -> int:
-    row = conn.execute(
-        "SELECT COUNT(*) FROM messages WHERE file_path=?", (str(path),)
-    ).fetchone()
+    row = conn.execute("SELECT COUNT(*) FROM messages WHERE file_path=?", (str(path),)).fetchone()
     return int(row[0])
 
 
@@ -337,3 +331,39 @@ def reconcile_projects_dir(
         stats.files_indexed += 1
         stats.files_changed += 1
     return stats
+
+
+@dataclass
+class IndexStats:
+    files: int
+    messages: int
+    sessions: int
+    subagent_spawns: int
+    skill_activations: int
+    db_size_bytes: int
+    last_refresh: int | None
+
+
+def collect_stats(conn: sqlite3.Connection, db_path: Path) -> IndexStats:
+    def count(table: str) -> int:
+        row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+        return int(row[0])
+
+    def distinct_sessions() -> int:
+        row = conn.execute("SELECT COUNT(DISTINCT session_id) FROM files").fetchone()
+        return int(row[0])
+
+    last_row = conn.execute("SELECT MAX(last_parsed_at) FROM files").fetchone()
+    last_refresh = int(last_row[0]) if last_row and last_row[0] else None
+
+    size = db_path.stat().st_size if db_path.exists() else 0
+
+    return IndexStats(
+        files=count("files"),
+        messages=count("messages"),
+        sessions=distinct_sessions(),
+        subagent_spawns=count("subagent_spawns"),
+        skill_activations=count("skill_activations"),
+        db_size_bytes=size,
+        last_refresh=last_refresh,
+    )
