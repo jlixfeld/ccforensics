@@ -21,4 +21,6 @@ def write_csv(rows: Iterable[Mapping[str, Any]], headers: list[str], out: TextIO
 def _csv_cell(v: Any) -> str:
     if v is None:
         return ""
+    if isinstance(v, bool):
+        return "true" if v else "false"
     return str(v)

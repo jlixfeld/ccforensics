@@ -116,6 +116,14 @@ def test_write_csv_quotes_newlines() -> None:
     assert parsed == [["note"], ["line1\nline2"]]
 
 
+def test_write_csv_quotes_embedded_double_quotes() -> None:
+    buf = io.StringIO()
+    rows = [{"note": 'say "hi"'}]
+    write_csv(rows, headers=["note"], out=buf)
+    parsed = list(csv.reader(io.StringIO(buf.getvalue())))
+    assert parsed == [["note"], ['say "hi"']]
+
+
 def test_write_csv_extra_keys_are_ignored() -> None:
     buf = io.StringIO()
     rows = [{"a": 1, "b": 2, "extra": "dropped"}]
@@ -141,7 +149,8 @@ def test_csv_cell_str() -> None:
 
 
 def test_csv_cell_bool() -> None:
-    assert _csv_cell(True) == "True"
+    assert _csv_cell(True) == "true"
+    assert _csv_cell(False) == "false"
 
 
 def test_write_json_session_list_snapshot(snapshot: SnapshotAssertion) -> None:
