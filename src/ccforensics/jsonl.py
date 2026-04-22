@@ -123,11 +123,22 @@ def annotate_cost(
     entries: list[TranscriptEntry],
     pricing_data: dict[str, dict[str, Any]],
 ) -> list[AnnotatedEntry]:
+    """Annotate entries with cost.
+
+    - Non-billable entries (anything that isn't an assistant turn with a
+      ``message.usage``): ``cost_usd = 0.0``.
+    - Assistant turns with a model whose pricing can't be resolved:
+      ``cost_usd = None`` plus ``pricing_unresolved_model`` set.
+
+    The 0.0/None split lets callers distinguish "intentionally zero"
+    (non-billable system events, user prompts) from "we tried but couldn't
+    compute" (LiteLLM didn't have the model).
+    """
     out: list[AnnotatedEntry] = []
     unresolved: set[str] = set()
     for e in entries:
         if e.type != "assistant" or e.message is None or e.message.usage is None:
-            out.append(AnnotatedEntry(entry=e, cost_usd=0.0 if e.type == "user" else None))
+            out.append(AnnotatedEntry(entry=e, cost_usd=0.0))
             continue
         model = e.message.model
         if model is None:

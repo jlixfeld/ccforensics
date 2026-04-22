@@ -29,8 +29,31 @@ def test_user_entries_have_zero_cost(pricing_data: dict) -> None:
     result = parse_file(FIXTURES / "basic" / "s1.jsonl")
     annotated = annotate_cost(result.entries, pricing_data)
     user_entries = [e for e in annotated if e.entry.type == "user"]
+    assert len(user_entries) > 0
     for e in user_entries:
-        assert e.cost_usd == 0.0 or e.cost_usd is None
+        assert e.cost_usd == 0.0
+
+
+def test_non_billable_types_have_zero_cost(pricing_data: dict) -> None:
+    """Non-assistant types (system, attachment, ...) all get 0.0, never None."""
+    from ccforensics.models import parse_entry
+
+    raws = [
+        {
+            "type": "attachment",
+            "timestamp": "2026-04-20T10:00:00Z",
+            "attachment": {"type": "hook_success", "hookEvent": "SessionStart"},
+        },
+        {
+            "type": "permission-mode",
+            "timestamp": "2026-04-20T10:00:00Z",
+            "sessionId": "s",
+        },
+    ]
+    entries = [parse_entry(r) for r in raws]
+    annotated = annotate_cost(entries, pricing_data)
+    for a in annotated:
+        assert a.cost_usd == 0.0, f"{a.entry.type} should have cost_usd=0.0, got {a.cost_usd}"
 
 
 def test_missing_model_pricing_yields_none(pricing_data: dict) -> None:
