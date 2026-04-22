@@ -2816,33 +2816,681 @@ git commit -m "feat(cli): index rebuild + stats commands"
 
 ---
 
-## Milestone M4 — `session --list` (Outline)
+## Milestone M4 — `session --list`
 
-*Full task expansion to be written when M3 exits.*
+**Exit:** `uv run ccforensics session --list` renders a terminal table on the real corpus; `--project`, `--since`, `--until`, `--grep`, `--sort`, `--reverse`, `--limit`, `--json`, `--csv`, `--no-refresh` all wired. SC5 verified: pick a remembered session in ≤30s. CI green. Coverage ≥85%.
 
-**Objective:** `ccforensics session --list` renders a terminal table from `session_summaries`, with `--project`, `--since`, `--until`, `--grep`, `--sort`, `--reverse`, `--limit`, `--json`, `--csv`, `--no-refresh` flags. SC5 verified: pick any session in ≤30s.
+**Expansion rationale (written post-M3):** no schema migration needed. All numeric summary fields derive from the existing `messages` table; summary text + `cwd` come from re-parsing the session's main JSONL inside `_recompute_session_summary` (only called for sessions whose files changed this run — cheap in practice). Resolver, date-parse, and formatting helpers live under `report/` since they're presentation concerns shared with M7+.
 
-**Modules to create:**
-- `src/ccforensics/report/__init__.py`
-- `src/ccforensics/report/session_list.py`
-- `src/ccforensics/export.py` (shared JSON/CSV writers)
+### Task M4.1: Populate `session_summaries` during reconciliation
 
-**Key subtasks (tentative):**
-1. Populate `session_summaries` during reconciliation: compute started/last-active, turn count, total cost, summary.
-2. Summary extraction priority (spec §5.2): claude-summary via `leafUuid` → first-prompt (sanitized) → fallback.
-3. Project-name decoding: prefer `cwd` from messages, fall back to `decode_project_dirname`.
-4. UUID prefix resolver (≥6 chars, auto-extend on collision).
-5. `rich.Table` rendering with multi-line summary cells.
-6. Date parsing: `YYYY-MM-DD`, `Nd`, `today`, `yesterday`.
-7. `--grep` filter (case-insensitive substring).
-8. Sort + reverse + limit.
-9. `--json` / `--csv` export paths (both to stdout; warnings go to stderr).
+**Files:**
+- Modify: `src/ccforensics/index.py`
+- Create: `tests/test_session_summaries.py`
 
-**New tests:**
-- `tests/test_report_session_list.py` — summary extraction priority, uuid prefix resolver, filters.
-- `tests/test_export.py` — snapshot tests on JSON + CSV shape.
+- [ ] **Step 1: Write failing tests**
 
-**Manual verification:** run on real corpus, pick a remembered session, time the scan.
+`tests/test_session_summaries.py` covers:
+- `started_at == min(message.ts)`, `last_active_at == max(message.ts)`, `duration_s` math.
+- `turn_count` = count of `role='user' AND is_meta=0 AND is_sidechain=0`.
+- `total_cost_usd` = SUM of non-NULL `cost_usd`; NULL iff every message's cost is NULL.
+- Summary extraction priority:
+  1. `type='summary'` entry whose `leafUuid` matches a message uuid in this session wins.
+  2. Else: `isCompactSummary=true` entry in this session's main file, most recent.
+  3. Else: first user prompt (`role='user'`, not meta, not sidechain) — sanitized.
+  4. Else: `<no summary available>`.
+- First-prompt sanitization:
+  - Strip `<command-name>...</command-name>` and sibling `<command-message>`, `<command-args>` wrappers.
+  - Replace IDE-attachment marker blocks with `📎 <path>` emoji form.
+  - Skip hook-injection content entirely when it's the whole prompt body (fall through to next candidate).
+  - Collapse internal newlines to single space.
+  - Trim and cap at 1000 chars (store full; UI layer wraps for display).
+- `project_path`: cwd of first message in session, else `decode_project_dirname(<encoded>)` from main file path.
+- `project_display`: last segment of `project_path`, truncated to 30 chars.
+- Recompute is idempotent: running reconcile twice yields identical `session_summaries` rows.
+- Only touched sessions recompute: if session A's files are unchanged, its summary row is not rewritten.
+
+Use a fixture builder that writes synthetic JSONL with known content: summary entry, user prompt with command-wrapper, cwd field, varying ts values.
+
+- [ ] **Step 2: Extract a session-summary module inside `index.py`**
+
+Add to `src/ccforensics/index.py` (near the top, after imports):
+
+```python
+_COMMAND_WRAPPER_RE = re.compile(
+    r"<command-(name|message|args)>.*?</command-\1>",
+    re.DOTALL,
+)
+_IDE_ATTACHMENT_RE = re.compile(
+    r"<ide[^>]*>.*?<file[^>]*>(?P<path>[^<]+)</file>.*?</ide[^>]*>",
+    re.DOTALL,
+)
+_HOOK_INJECTION_MARKER = "<session-start-hook>"
+
+
+def _sanitize_prompt(text: str) -> str:
+    """Strip command wrappers, replace IDE attachments, collapse whitespace, cap at 1000."""
+    text = _COMMAND_WRAPPER_RE.sub("", text)
+    text = _IDE_ATTACHMENT_RE.sub(lambda m: f"📎 {m.group('path').strip()}", text)
+    text = " ".join(text.split())
+    return text[:1000]
+
+
+def _is_pure_hook_injection(text: str) -> bool:
+    """Heuristic: treat as skip-this-candidate if it's dominated by hook bootstrap markers."""
+    return _HOOK_INJECTION_MARKER in text and len(text) > 200
+```
+
+- [ ] **Step 3: Add `recompute_session_summary(conn, session_id)`**
+
+It:
+1. Looks up the main file row (`SELECT path FROM files WHERE session_id=? AND kind='main' LIMIT 1`).
+2. Computes numeric fields via SQL aggregation on `messages` (started/last-active/duration/turn_count/total_cost).
+3. If a main file exists, re-parses it with `parse_file()` to extract:
+   - `cwd` (from first entry with `.cwd` set)
+   - Summary candidates (scan for `type='summary'` with `leaf_uuid` in the session's uuid set, OR `is_compact_summary=True`)
+   - First user prompt text (first `type='user'` entry where `message.role == 'user'`, skipping hook-injection-dominated prompts)
+4. Applies priority chain, sanitizes, stores.
+5. `INSERT OR REPLACE INTO session_summaries`.
+
+Key SQL:
+```sql
+SELECT MIN(ts), MAX(ts),
+       SUM(CASE WHEN role='user' AND is_meta=0 AND is_sidechain=0 THEN 1 ELSE 0 END),
+       SUM(cost_usd),
+       SUM(CASE WHEN cost_usd IS NOT NULL THEN 1 ELSE 0 END)
+  FROM messages WHERE session_id=?
+```
+The fifth column distinguishes "all NULL" (cost is NULL) from "some populated" (cost is the partial SUM).
+
+- [ ] **Step 4: Wire into `reconcile_projects_dir`**
+
+Track `session_ids_changed: set[str]` as files are indexed. After the file loop:
+```python
+for sid in session_ids_changed:
+    recompute_session_summary(conn, sid)
+conn.commit()
+```
+
+Return the set via `ReconcileStats.sessions_recomputed` so the CLI can report it.
+
+- [ ] **Step 5: Run tests + smoke-run on real corpus**
+
+```bash
+uv run pytest tests/test_session_summaries.py -v
+uv run ccforensics index rebuild --force --yes
+sqlite3 ~/.cache/ccforensics/index.sqlite \
+  "SELECT session_id, project_display, turn_count, total_cost_usd,
+          substr(summary_text,1,60), summary_source
+     FROM session_summaries ORDER BY last_active_at DESC LIMIT 10"
+# Expected: recognizable session data; no NULL summary_source unless truly no-prompt.
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/ccforensics/index.py tests/test_session_summaries.py
+git commit -m "feat(index): populate session_summaries during reconcile"
+```
+
+---
+
+### Task M4.2: Shared report helpers (resolver, dates, format)
+
+**Files:**
+- Create: `src/ccforensics/report/__init__.py`
+- Create: `src/ccforensics/report/resolver.py`
+- Create: `src/ccforensics/report/_dates.py`
+- Create: `src/ccforensics/report/_format.py`
+- Create: `tests/test_report_resolver.py`
+- Create: `tests/test_report_dates.py`
+- Create: `tests/test_report_format.py`
+
+- [ ] **Step 1: Write failing tests**
+
+`tests/test_report_resolver.py`:
+- Full UUID → returns unchanged.
+- ≥6-char prefix unique → returns full.
+- Prefix <6 chars → `ValueError("prefix must be ≥6 characters")`.
+- Prefix matches 2 sessions → `AmbiguousPrefix` exception listing all matches.
+- No match → `SessionNotFound(prefix)`.
+- Absolute `.jsonl` path → resolved via `files.path`; file not in index → `SessionNotFound`.
+
+`tests/test_report_dates.py`:
+- `parse_since("2026-04-15")` → 2026-04-15 00:00:00 UTC.
+- `parse_until("2026-04-15")` → 2026-04-15 23:59:59 UTC.
+- `parse_since("7d")` at fixed `now=2026-04-22` → 2026-04-15 00:00:00 UTC.
+- `parse_since("today")` → start of today.
+- `parse_since("yesterday")` → start of yesterday.
+- Bad input → `ValueError` with the bad spec in the message.
+- Test uses `freezegun` or direct `now=` injection (prefer `now=` to avoid adding a dep).
+
+`tests/test_report_format.py`:
+- `format_duration(0)` → `"0s"`.
+- `format_duration(47)` → `"47s"`.
+- `format_duration(60)` → `"1m"`, `format_duration(2820)` → `"47m"`.
+- `format_duration(15120)` → `"4h12m"`.
+- `format_duration(183600)` → `"2d3h"`.
+- `format_cost(None)` → `"$—"` (em-dash U+2014).
+- `format_cost(0.0)` → `"$0.00"`.
+- `format_cost(1.234)` → `"$1.23"` (round-half-even per Python `round()`; call out if it matters).
+
+- [ ] **Step 2: Implement `resolver.py`**
+
+```python
+class AmbiguousPrefix(Exception):
+    def __init__(self, prefix: str, matches: list[str]) -> None:
+        super().__init__(f"{prefix!r} matches {len(matches)} sessions: {matches}")
+        self.prefix = prefix
+        self.matches = matches
+
+
+class SessionNotFound(Exception):
+    def __init__(self, spec: str) -> None:
+        super().__init__(f"no session matches {spec!r}")
+        self.spec = spec
+
+
+def resolve_session_id(spec: str, conn: sqlite3.Connection) -> str:
+    if spec.endswith(".jsonl") and os.path.isabs(spec):
+        row = conn.execute(
+            "SELECT session_id FROM files WHERE path=?", (spec,)
+        ).fetchone()
+        if row is None:
+            raise SessionNotFound(spec)
+        return str(row[0])
+
+    if len(spec) < 6:
+        raise ValueError("session prefix must be ≥6 characters")
+
+    rows = conn.execute(
+        "SELECT DISTINCT session_id FROM files WHERE session_id LIKE ?",
+        (spec + "%",),
+    ).fetchall()
+    if not rows:
+        raise SessionNotFound(spec)
+    if len(rows) > 1:
+        raise AmbiguousPrefix(spec, sorted(r[0] for r in rows))
+    return str(rows[0][0])
+```
+
+- [ ] **Step 3: Implement `_dates.py`**
+
+```python
+from datetime import UTC, date, datetime, time, timedelta
+
+_N_DAYS_RE = re.compile(r"^(\d+)d$")
+
+
+def _parse_token(spec: str, now: datetime) -> date:
+    spec = spec.strip().lower()
+    if spec == "today":
+        return now.date()
+    if spec == "yesterday":
+        return now.date() - timedelta(days=1)
+    m = _N_DAYS_RE.match(spec)
+    if m:
+        return now.date() - timedelta(days=int(m.group(1)))
+    try:
+        return date.fromisoformat(spec)
+    except ValueError as e:
+        raise ValueError(f"unrecognized date spec: {spec!r}") from e
+
+
+def parse_since(spec: str, now: datetime | None = None) -> datetime:
+    now = now or datetime.now(UTC)
+    d = _parse_token(spec, now)
+    return datetime.combine(d, time.min, tzinfo=UTC)
+
+
+def parse_until(spec: str, now: datetime | None = None) -> datetime:
+    now = now or datetime.now(UTC)
+    d = _parse_token(spec, now)
+    return datetime.combine(d, time.max, tzinfo=UTC)
+```
+
+- [ ] **Step 4: Implement `_format.py`**
+
+```python
+_EM_DASH = "—"
+
+
+def format_duration(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, s = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, m = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h{m:02d}m" if m else f"{hours}h"
+    days, h = divmod(hours, 24)
+    return f"{days}d{h}h" if h else f"{days}d"
+
+
+def format_cost(cost_usd: float | None) -> str:
+    if cost_usd is None:
+        return f"${_EM_DASH}"
+    return f"${cost_usd:.2f}"
+```
+
+- [ ] **Step 5: Run tests**
+
+```bash
+uv run pytest tests/test_report_resolver.py tests/test_report_dates.py tests/test_report_format.py -v
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/ccforensics/report/ tests/test_report_*.py
+git commit -m "feat(report): shared resolver, date, and format helpers"
+```
+
+---
+
+### Task M4.3: `export.py` — shared JSON/CSV writers
+
+**Files:**
+- Create: `src/ccforensics/export.py`
+- Create: `tests/test_export.py`
+
+- [ ] **Step 1: Write failing tests**
+
+`tests/test_export.py`:
+- `write_json` output is `json.loads`-round-trippable, stable key order, UTF-8, indent=2, `ensure_ascii=False` (emoji survive).
+- `write_csv` output parses with stdlib `csv.reader`, header row matches given headers in order, missing keys → empty string.
+- `write_csv` with no rows still emits the header row.
+- Round-trip: serialize then re-parse yields equivalent data.
+- Use syrupy for snapshot of a representative session-list payload.
+
+- [ ] **Step 2: Implement**
+
+```python
+from __future__ import annotations
+
+import csv
+import json
+from collections.abc import Iterable, Mapping
+from typing import Any, TextIO
+
+
+def write_json(data: Any, out: TextIO) -> None:
+    json.dump(data, out, indent=2, ensure_ascii=False, sort_keys=False)
+    out.write("\n")
+
+
+def write_csv(rows: Iterable[Mapping[str, Any]], headers: list[str], out: TextIO) -> None:
+    writer = csv.DictWriter(out, fieldnames=headers, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({h: _csv_cell(row.get(h)) for h in headers})
+
+
+def _csv_cell(v: Any) -> str:
+    if v is None:
+        return ""
+    return str(v)
+```
+
+Note: `sort_keys=False` because caller controls key order (stable schemas matter more than alphabetical).
+
+- [ ] **Step 3: Run tests**
+
+```bash
+uv run pytest tests/test_export.py -v
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add src/ccforensics/export.py tests/test_export.py
+git commit -m "feat(export): shared JSON/CSV writers"
+```
+
+---
+
+### Task M4.4: `report/session_list.py` — query, filter, sort, render
+
+**Files:**
+- Create: `src/ccforensics/report/session_list.py`
+- Create: `tests/test_report_session_list.py`
+
+- [ ] **Step 1: Write failing tests**
+
+`tests/test_report_session_list.py` covers:
+- `query_session_list` with no filters returns all sessions from `session_summaries`, sorted by `last_active_at DESC`.
+- `sort_key='cost'` sorts by `total_cost_usd DESC` (NULLs last).
+- `sort_key='started'`, `'turns'` variants.
+- `reverse=True` flips order.
+- `limit=N` caps rows.
+- `project='X'` filters via `project_path LIKE '%X%'` (case-insensitive).
+- `grep='foo'` filters via `summary_text` case-insensitive substring.
+- `since=dt1, until=dt2` filters on `last_active_at`.
+- `shorten_session_ids`:
+  - All unique at 6 chars → all returned at 6.
+  - Two sessions share 6-char prefix → both extend to 7 (or more if still colliding).
+  - Empty input → `{}`.
+- `render_session_list(rows)` returns a `rich.Table` with expected column set and row count.
+- `render_session_list(rows, verbose=True)` adds the source-badge column.
+- Summary column is multi-line (no truncation): a 500-char summary remains intact in the cell's text.
+
+- [ ] **Step 2: Implement `SessionListRow` + query**
+
+```python
+from __future__ import annotations
+
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Literal
+
+SortKey = Literal["cost", "started", "last-active", "turns"]
+_SORT_COLUMN: dict[SortKey, str] = {
+    "cost": "total_cost_usd",
+    "started": "started_at",
+    "last-active": "last_active_at",
+    "turns": "turn_count",
+}
+
+
+@dataclass
+class SessionListRow:
+    session_id: str
+    project_path: str | None
+    project_display: str | None
+    started_at: int
+    last_active_at: int
+    duration_s: int
+    turn_count: int
+    total_cost_usd: float | None
+    summary_text: str | None
+    summary_source: str | None
+
+
+def query_session_list(
+    conn: sqlite3.Connection,
+    *,
+    project: str | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    grep: str | None = None,
+    sort_key: SortKey = "last-active",
+    reverse: bool = False,
+    limit: int | None = None,
+) -> list[SessionListRow]:
+    where: list[str] = []
+    params: list[object] = []
+    if project:
+        where.append("LOWER(IFNULL(project_path,'')) LIKE ?")
+        params.append(f"%{project.lower()}%")
+    if since:
+        where.append("last_active_at >= ?")
+        params.append(int(since.timestamp()))
+    if until:
+        where.append("last_active_at <= ?")
+        params.append(int(until.timestamp()))
+    if grep:
+        where.append("LOWER(IFNULL(summary_text,'')) LIKE ?")
+        params.append(f"%{grep.lower()}%")
+
+    col = _SORT_COLUMN[sort_key]
+    # NULLs last by default (except when user explicitly reverses)
+    direction = "ASC" if reverse else "DESC"
+    sql = (
+        "SELECT session_id, project_path, project_display, started_at, "
+        "last_active_at, duration_s, turn_count, total_cost_usd, "
+        "summary_text, summary_source FROM session_summaries"
+    )
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += f" ORDER BY {col} IS NULL, {col} {direction}, session_id"
+    if limit is not None:
+        sql += f" LIMIT {int(limit)}"
+    cur = conn.execute(sql, params)
+    return [SessionListRow(*row) for row in cur.fetchall()]
+```
+
+- [ ] **Step 3: Implement `shorten_session_ids`**
+
+```python
+def shorten_session_ids(session_ids: list[str], min_chars: int = 6) -> dict[str, str]:
+    ids = list(dict.fromkeys(session_ids))  # de-dup, preserve order
+    if not ids:
+        return {}
+    lengths: dict[str, int] = {sid: min_chars for sid in ids}
+    while True:
+        seen: dict[str, list[str]] = {}
+        for sid in ids:
+            key = sid[: lengths[sid]]
+            seen.setdefault(key, []).append(sid)
+        collisions = [group for group in seen.values() if len(group) > 1]
+        if not collisions:
+            return {sid: sid[: lengths[sid]] for sid in ids}
+        for group in collisions:
+            for sid in group:
+                lengths[sid] = min(len(sid), lengths[sid] + 1)
+```
+
+- [ ] **Step 4: Implement `render_session_list` with `rich.Table`**
+
+```python
+from rich.table import Table
+from rich.text import Text
+
+from .._format import format_cost, format_duration
+
+
+_SOURCE_BADGE = {
+    "claude-summary": "[C]",
+    "first-prompt": "[F]",
+    "none": "[-]",
+}
+
+
+def render_session_list(rows: list[SessionListRow], *, verbose: bool = False) -> Table:
+    table = Table(show_lines=False, expand=True, pad_edge=False)
+    short_ids = shorten_session_ids([r.session_id for r in rows])
+    table.add_column("UUID", no_wrap=True)
+    table.add_column("Project", no_wrap=True, max_width=30)
+    table.add_column("Started", no_wrap=True)
+    table.add_column("Dur", no_wrap=True, justify="right")
+    table.add_column("Turns", no_wrap=True, justify="right")
+    table.add_column("Cost", no_wrap=True, justify="right")
+    if verbose:
+        table.add_column("Src", no_wrap=True)
+    table.add_column("Summary", overflow="fold")
+
+    for r in rows:
+        started = datetime.fromtimestamp(r.started_at, tz=UTC).strftime("%Y-%m-%d %H:%M")
+        cells = [
+            short_ids[r.session_id],
+            (r.project_display or "")[:30],
+            started,
+            format_duration(r.duration_s),
+            str(r.turn_count),
+            format_cost(r.total_cost_usd),
+        ]
+        if verbose:
+            cells.append(_SOURCE_BADGE.get(r.summary_source or "none", "[-]"))
+        cells.append(Text(r.summary_text or "<no summary available>"))
+        table.add_row(*cells)
+    return table
+```
+
+- [ ] **Step 5: Run tests**
+
+```bash
+uv run pytest tests/test_report_session_list.py -v
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/ccforensics/report/session_list.py tests/test_report_session_list.py
+git commit -m "feat(report): session_list query + rich render"
+```
+
+---
+
+### Task M4.5: CLI wiring + integration test + SC5 verification
+
+**Files:**
+- Modify: `src/ccforensics/cli.py`
+- Modify: `tests/test_cli.py`
+- Create: `docs/sc5-verification.md`
+
+- [ ] **Step 1: Write failing CLI integration tests**
+
+Append to `tests/test_cli.py`:
+
+```python
+def test_session_list_no_sessions(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    (tmp_path / ".claude" / "projects").mkdir(parents=True)
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["session", "list", "--no-refresh"])
+    assert result.exit_code == 0
+
+
+def test_session_list_json_export(tmp_path, monkeypatch):
+    # Build a synthetic corpus, index it, dump --json, parse output.
+    ...
+
+
+def test_session_list_csv_export(tmp_path, monkeypatch):
+    ...
+
+
+def test_session_list_grep_filter(tmp_path, monkeypatch):
+    ...
+```
+
+At least one test should write a real JSONL into the fixture projects dir, run `index rebuild --force --yes`, then `session list --json`, and assert the expected session appears with correct fields.
+
+- [ ] **Step 2: Implement the CLI command**
+
+Replace the `session_list` stub in `src/ccforensics/cli.py`:
+
+```python
+import sys
+
+from rich.console import Console
+
+from .export import write_csv, write_json
+from .report._dates import parse_since, parse_until
+from .report.session_list import query_session_list, render_session_list
+
+
+@session.command("list")
+@click.option("--project", help="Filter by project path substring (case-insensitive).")
+@click.option("--since", help="Date filter: YYYY-MM-DD | Nd | today | yesterday")
+@click.option("--until", help="Date filter: YYYY-MM-DD | Nd | today | yesterday")
+@click.option("--grep", help="Case-insensitive substring on summary text.")
+@click.option(
+    "--sort", "sort_key",
+    type=click.Choice(["cost", "started", "last-active", "turns"]),
+    default="last-active",
+)
+@click.option("--reverse", is_flag=True, help="Reverse the sort order.")
+@click.option("--limit", type=int, help="Cap the number of rows.")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON to stdout.")
+@click.option("--csv", "as_csv", is_flag=True, help="Emit CSV to stdout.")
+@click.option("--no-refresh", is_flag=True, help="Skip index reconciliation.")
+@click.pass_context
+def session_list_cmd(
+    ctx, project, since, until, grep, sort_key, reverse, limit, as_json, as_csv, no_refresh
+):
+    """List all discoverable sessions."""
+    if as_json and as_csv:
+        raise click.UsageError("--json and --csv are mutually exclusive")
+
+    db = _index_db_path()
+    conn = open_connection(db)
+    ensure_schema(conn)
+
+    if not no_refresh:
+        pricing = PricingCache(cache_file=ccforensics_cache_dir() / "litellm.json").load_or_fetch()
+        reconcile_projects_dir(conn, claude_projects_dir(), pricing)
+        conn.commit()
+
+    since_dt = parse_since(since) if since else None
+    until_dt = parse_until(until) if until else None
+
+    rows = query_session_list(
+        conn,
+        project=project,
+        since=since_dt,
+        until=until_dt,
+        grep=grep,
+        sort_key=sort_key,
+        reverse=reverse,
+        limit=limit,
+    )
+
+    if as_json:
+        payload = [dataclasses.asdict(r) for r in rows]
+        write_json(payload, sys.stdout)
+        return
+    if as_csv:
+        headers = [
+            "session_id", "project_path", "project_display",
+            "started_at", "last_active_at", "duration_s",
+            "turn_count", "total_cost_usd", "summary_text", "summary_source",
+        ]
+        write_csv((dataclasses.asdict(r) for r in rows), headers, sys.stdout)
+        return
+
+    Console().print(render_session_list(rows, verbose=ctx.obj.get("verbose", False)))
+```
+
+Data goes to stdout, warnings to stderr (`Console(stderr=True)` for the reconcile progress line, if added).
+
+- [ ] **Step 3: Run unit + integration tests + lint + typecheck**
+
+```bash
+uv run pytest -x
+uv run ruff check src/ tests/
+uv run ruff format --check src/ tests/
+uv run mypy src/
+```
+
+- [ ] **Step 4: SC5 manual verification**
+
+Pick a remembered past session. Time how long it takes to locate via:
+
+```bash
+time uv run ccforensics session list --sort last-active --limit 20
+```
+
+Then pipe to grep:
+```bash
+uv run ccforensics session list --no-refresh --grep "<keyword from memory>"
+```
+
+Write results to `docs/sc5-verification.md`:
+- Date of test.
+- Remembered session (one-line description, no sensitive content).
+- Time to identify session via `--list` scan.
+- Time to identify via `--grep`.
+- SC5 pass/fail (≤30s target).
+- Any summary-extraction surprises — tune if fallback chain picked a bad candidate.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/ccforensics/cli.py tests/test_cli.py docs/sc5-verification.md
+git commit -m "feat(cli): session --list with filter, sort, export"
+```
+
+**M4 exit criteria:**
+- [ ] `session --list` runs on real corpus and renders a recognizable table.
+- [ ] JSON + CSV exports parse cleanly.
+- [ ] All filters work: `--project`, `--since`, `--until`, `--grep`.
+- [ ] Sort + reverse + limit verified.
+- [ ] SC5 documented in `docs/sc5-verification.md` with pass/fail.
+- [ ] CI green. Coverage ≥85%.
 
 ---
 
