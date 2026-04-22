@@ -68,7 +68,7 @@ def session() -> None:
 @click.option(
     "--no-refresh",
     is_flag=True,
-    help="Skip index reconciliation (and pricing fetch). Read-only query.",
+    help="Skip reconciliation and pricing fetch (schema still initializes on first run).",
 )
 @click.pass_context
 def session_list(

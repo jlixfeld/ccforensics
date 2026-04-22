@@ -172,7 +172,7 @@ def test_session_list_json_mutually_exclusive_with_csv(
     (tmp_path / ".claude" / "projects").mkdir(parents=True)
     runner = CliRunner()
     result = runner.invoke(main, ["session", "list", "--no-refresh", "--json", "--csv"])
-    assert result.exit_code != 0
+    assert result.exit_code == 2  # click UsageError
     assert "mutually exclusive" in result.output.lower()
 
 
