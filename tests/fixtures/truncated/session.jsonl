@@ -1,0 +1,3 @@
+{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"2026-04-20T10:00:00Z","message":null}
+{"type":"assistant","uuid":"u2","sessionId":"s1","timestamp":"2026-04-20T10:00:05Z","requestId":"req-a","message":{"id":"m","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[],"usage":{"input_tokens":10,"output_tokens":1}}}
+{"type":"user","uuid":"u3","sessionId":"s1","timestamp":"2026-04-20T10:01
