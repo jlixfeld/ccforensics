@@ -4,6 +4,7 @@ import logging
 import re
 import sqlite3
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -303,3 +304,36 @@ def count_messages_for_file(conn: sqlite3.Connection, path: Path) -> int:
         "SELECT COUNT(*) FROM messages WHERE file_path=?", (str(path),)
     ).fetchone()
     return int(row[0])
+
+
+@dataclass
+class ReconcileStats:
+    files_scanned: int = 0
+    files_indexed: int = 0
+    files_changed: int = 0
+    files_skipped_unchanged: int = 0
+
+
+def reconcile_projects_dir(
+    conn: sqlite3.Connection,
+    projects_dir: Path,
+    pricing_data: dict[str, Any],
+) -> ReconcileStats:
+    """Walk the Claude Code projects directory and reconcile every *.jsonl file.
+
+    Includes both main session files and subagent files under <session>/subagents/.
+    """
+    stats = ReconcileStats()
+    if not projects_dir.exists():
+        return stats
+
+    for path in sorted(projects_dir.rglob("*.jsonl")):
+        stats.files_scanned += 1
+        stat = path.stat()
+        if _row_is_unchanged(conn, path, stat.st_mtime_ns, stat.st_size):
+            stats.files_skipped_unchanged += 1
+            continue
+        reconcile_file(conn, path, pricing_data)
+        stats.files_indexed += 1
+        stats.files_changed += 1
+    return stats
