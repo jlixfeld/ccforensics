@@ -45,15 +45,12 @@ def test_substring_fallback_emits_warning(
     # substring matching on something like the Bedrock alias.
     resolve_pricing("us.anthropic.claude-sonnet", pricing_data)
     assert any(
-        "substring fallback" in rec.message
-        and "us.anthropic.claude-sonnet" in rec.message
+        "substring fallback" in rec.message and "us.anthropic.claude-sonnet" in rec.message
         for rec in caplog.records
     )
 
 
-def test_exact_match_does_not_warn(
-    pricing_data: dict, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_exact_match_does_not_warn(pricing_data: dict, caplog: pytest.LogCaptureFixture) -> None:
     import logging
 
     caplog.set_level(logging.WARNING, logger="ccforensics.pricing")

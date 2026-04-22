@@ -26,46 +26,81 @@ def parse_file(path: Path) -> ParseResult:
     - Final line JSON-parse failure at EOF: silently marked as truncated_tail.
     - Unknown ``type`` values: recorded in unknown_types, entry kept.
     - File not found: raises FileNotFoundError.
+
+    Iterates the file line-by-line rather than loading the whole text into
+    memory. Truncation detection: a JSONL file that ends without a trailing
+    newline has potentially-truncated last bytes; if that final partial line
+    fails to parse it's marked ``truncated_tail`` instead of counted as a
+    parse error.
     """
     if not path.exists():
         raise FileNotFoundError(path)
 
+    file_size = path.stat().st_size
+    final_line_is_complete = True
+    if file_size > 0:
+        with path.open("rb") as fb:
+            fb.seek(-1, 2)
+            final_line_is_complete = fb.read(1) == b"\n"
+
     result = ParseResult()
-    lines = path.read_text(encoding="utf-8").splitlines(keepends=False)
-    last_idx = len(lines) - 1
+    last_line_num = 0
+    last_was_blank = True
 
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        try:
-            raw = json.loads(stripped)
-        except json.JSONDecodeError:
-            if i == last_idx:
-                result.truncated_tail = True
-            else:
+    with path.open("r", encoding="utf-8") as f:
+        for line_num, raw_line in enumerate(f, start=1):
+            last_line_num = line_num
+            stripped = raw_line.strip()
+            if not stripped:
+                last_was_blank = True
+                continue
+            last_was_blank = False
+            try:
+                raw = json.loads(stripped)
+            except json.JSONDecodeError:
+                # We can't tell here whether this is "the last line" — only
+                # the post-loop check (using the trailing-newline probe and
+                # the final line number) can. Record as a parse error for
+                # now; the retraction block at the bottom will downgrade to
+                # truncated_tail if this turns out to have been the unfinished
+                # last line.
                 result.parse_errors += 1
-                result.warnings.append(f"{path}:{i + 1}: malformed JSON, skipped")
-            continue
+                result.warnings.append(f"{path}:{line_num}: malformed JSON, skipped")
+                continue
 
-        try:
-            entry = parse_entry(raw)
-        except Exception as e:
-            result.parse_errors += 1
-            result.warnings.append(
-                f"{path}:{i + 1}: pydantic rejected line ({e.__class__.__name__}), skipped"
-            )
-            continue
+            try:
+                entry = parse_entry(raw)
+            except Exception as e:
+                result.parse_errors += 1
+                result.warnings.append(
+                    f"{path}:{line_num}: pydantic rejected line ({e.__class__.__name__}), skipped"
+                )
+                continue
 
-        if entry.type not in KNOWN_TYPES:
-            if entry.type not in result.unknown_types:
-                result.warnings.append(f"{path}: unknown type {entry.type!r} (kept, non-billable)")
-            result.unknown_types.add(entry.type)
+            if entry.type not in KNOWN_TYPES:
+                if entry.type not in result.unknown_types:
+                    result.warnings.append(
+                        f"{path}: unknown type {entry.type!r} (kept, non-billable)"
+                    )
+                result.unknown_types.add(entry.type)
 
-        if entry.version:
-            result.seen_versions.add(entry.version)
+            if entry.version:
+                result.seen_versions.add(entry.version)
 
-        result.entries.append(entry)
+            result.entries.append(entry)
+
+    # Truncation: the file's last byte isn't a newline AND the very last
+    # processed line was the one that failed to parse. Retract that error
+    # and mark the tail truncated.
+    if (
+        not final_line_is_complete
+        and not last_was_blank
+        and result.warnings
+        and result.warnings[-1].startswith(f"{path}:{last_line_num}: malformed JSON")
+    ):
+        result.warnings.pop()
+        result.parse_errors -= 1
+        result.truncated_tail = True
 
     return result
 

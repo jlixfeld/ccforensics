@@ -83,9 +83,7 @@ def test_subagents_dir_with_malformed_filename_warns(
     assert kind == "subagent"
     assert agent_id is None
     assert session_id == "sess-x"
-    assert any(
-        "doesn't match agent-<hex>.jsonl" in rec.message for rec in caplog.records
-    )
+    assert any("doesn't match agent-<hex>.jsonl" in rec.message for rec in caplog.records)
 
 
 def test_reconcile_changed_file_replaces_messages(tmp_path: Path, pricing_data: dict) -> None:
