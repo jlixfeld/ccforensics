@@ -158,6 +158,15 @@ def test_parse_entry_accepts_tool_result_list_content() -> None:
     assert block.content == "output"
 
 
+def test_parse_entry_message_none_does_not_raise() -> None:
+    """message=None must not crash _normalize_message_content."""
+    raw = json.loads(
+        '{"type":"user","timestamp":"2026-04-20T10:00:00Z","message":null}'
+    )
+    entry = parse_entry(raw)
+    assert entry.message is None
+
+
 def test_attachment_hook_success_recognized() -> None:
     raw = json.loads(
         '{"type":"attachment","timestamp":"2026-04-20T10:00:00Z",'
