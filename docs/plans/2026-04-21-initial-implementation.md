@@ -20,19 +20,23 @@ Milestones M0–M10 map to the spec §7.1 sequencing:
 
 | Milestone | Ends with demoable state | Status in this plan |
 |---|---|---|
-| M0 | Repo skeleton, CI green, entrypoint prints `--help` | Full task detail |
-| M1 | Parser + dedup ingesting real JSONL without crash | Full task detail |
-| M2 | Cost totals match ccusage within ±1% | Full task detail |
-| M3 | `index --rebuild` + `index --stats` working; idempotent | Full task detail |
-| M4 | `session --list` on real corpus; SC5 verified | Outline only — expand when M3 complete |
-| M5 | Tree reconstruction; per-bucket breakdown | Outline only |
+| M0 | Repo skeleton, CI green, entrypoint prints `--help` | ✅ Done |
+| M1 | Parser + dedup ingesting real JSONL without crash | ✅ Done |
+| M2 | Cost totals match ccusage within ±1% | ✅ Done |
+| M3 | `index --rebuild` + `index --stats` working; idempotent | ✅ Done |
+| M4 | `session --list` on real corpus; SC5 verified | ✅ Done (SC5 PASS — 3s vs 30s target) |
+| M4.6 | Post-M4 polish — sanitization + grep help | Full task detail (pre-M5) |
+| M5 | Tree reconstruction; per-bucket breakdown | Outline only — expand when M4.6 complete |
 | M6 | Plugin registry + rollup; collision warning | Outline only |
 | M7 | `session <id>` deep report; SC1 verified | Outline only |
 | M8 | Skill ledger + ± band; SC2 + SC3 verified | Outline only |
 | M9 | `aggregate` + `plugins` commands | Outline only |
 | M10 | Polish, README, v0.1.0 tag; SC4 verified | Outline only |
 
-**Why the split:** M4–M10 build on M0–M3's concrete code. Writing their task steps in full before that code exists produces either fabrications or placeholders. When we hit the end of M3, plan expansion for M4 is a 30-minute task informed by what actually landed.
+**Why the split:** M4–M10 build on M0–M3's concrete code. Writing their task steps in full before that code exists produces either fabrications or placeholders. When we hit the end of M3, plan expansion for M4 is a 30-minute task informed by what actually landed. Same pattern for M5 onward: expand each when the prior milestone lands.
+
+**Unplanned mid-M4 work that already landed:**
+- **M4.4.5 — parser fix (`fix(models): normalize string-shaped message.content at parse time`, commit `fba40fd`).** Pre-existing bug from M1.2: `Message.content` was typed `list[ContentBlock]` but real Claude Code JSONL emits user text prompts as a bare `str`. Pydantic rejected those entries, silently dropping ~20% of real corpus messages and leaving 12307 sessions with `summary_source='none'` vs 62 with `'first-prompt'`. Fix normalizes at parse time. Post-fix: 11285 first-prompt, 1013 claude-summary, 72 none. SC5 was blocked on this and unblocked by the fix.
 
 ---
 
@@ -3486,11 +3490,189 @@ git commit -m "feat(cli): session --list with filter, sort, export"
 ```
 
 **M4 exit criteria:**
-- [ ] `session --list` runs on real corpus and renders a recognizable table.
-- [ ] JSON + CSV exports parse cleanly.
-- [ ] All filters work: `--project`, `--since`, `--until`, `--grep`.
-- [ ] Sort + reverse + limit verified.
-- [ ] SC5 documented in `docs/sc5-verification.md` with pass/fail.
+- [x] `session --list` runs on real corpus and renders a recognizable table.
+- [x] JSON + CSV exports parse cleanly.
+- [x] All filters work: `--project`, `--since`, `--until`, `--grep`.
+- [x] Sort + reverse + limit verified.
+- [x] SC5 documented in `docs/sc5-verification.md` with pass/fail — PASS (~3s end-to-end).
+- [x] CI green. Coverage ≥85% (actual: 95%).
+
+---
+
+## Milestone M4.6 — Post-M4 Sanitization + Help Text Polish
+
+**Context:** M4.5 SC5 verification surfaced two small but concrete gaps that should land before M5 opens. Neither requires design work; both are in-place tweaks.
+
+**Observations (from M4.5 SC5 run + subagent reports):**
+1. `_sanitize_prompt` in `src/ccforensics/index.py` strips `<command-name>`, `<command-message>`, `<command-args>` wrappers, but NOT `<local-command-caveat>`, `<local-command-stdout>`, `<bash-input>`, `<bash-stdout>`, `<bash-stderr>`. These appear verbatim in real-corpus summaries, making them noisy. Sample: session `65c788` shows "Set model to Opus 4.7" as its summary (which is the stdout of a `/model` slash-command, not a useful first-prompt). Dozens of sessions show `<bash-input>cd ..</bash-input>`-style summaries that would be better filtered.
+2. `--grep` searches `summary_text` only (by spec). Users may expect it to match project names; when they don't, a user types `--grep ccforensics` and gets zero hits on sessions that are about ccforensics. Fix is documentation only: tighten the option's `help=` text to say it searches summary text, and suggest `--project` for project-path matching.
+
+**Exit:** Real-corpus `session --list --sort last-active --limit 20` shows summaries free of bash/command wrapper noise; `--grep` help text is explicit about its scope.
+
+### Task M4.6.1: Extend sanitization to strip local-command + bash wrappers
+
+**Files:**
+- Modify: `src/ccforensics/index.py`
+- Modify: `tests/test_session_summaries.py`
+
+- [ ] **Step 1: Read the current sanitizer**
+
+`src/ccforensics/index.py` currently has two regexes for sanitization:
+
+```python
+_COMMAND_WRAPPER_RE = re.compile(
+    r"<command-(name|message|args)>.*?</command-\1>",
+    re.DOTALL,
+)
+_IDE_ATTACHMENT_RE = re.compile(
+    r"<ide[^>]*>.*?<file[^>]*>(?P<path>[^<]+)</file>.*?</ide[^>]*>",
+    re.DOTALL,
+)
+```
+
+Extend the wrapper regex (or add a sibling) so the following real-corpus tags also get stripped entirely: `<local-command-caveat>…</local-command-caveat>`, `<local-command-stdout>…</local-command-stdout>`, `<local-command-stderr>…</local-command-stderr>`, `<bash-input>…</bash-input>`, `<bash-stdout>…</bash-stdout>`, `<bash-stderr>…</bash-stderr>`.
+
+**Why strip, not preserve:** these wrappers surround content Claude emitted or captured as part of tool execution, not user intent. The goal of the "first-prompt" summary is to reflect the user's actual first message — bash output and slash-command stdout are noise in that context.
+
+- [ ] **Step 2: Write failing tests**
+
+Add to `tests/test_session_summaries.py`:
+
+```python
+def test_sanitize_strips_local_command_wrappers() -> None:
+    raw = "<local-command-caveat>Caveat: ...</local-command-caveat>Do the thing"
+    assert _sanitize_prompt(raw) == "Do the thing"
+
+    raw = "<local-command-stdout>Set model to Opus 4.7</local-command-stdout>"
+    assert _sanitize_prompt(raw) == ""  # whole prompt was wrapped
+
+    raw = "<local-command-stderr>err</local-command-stderr>actual prompt"
+    assert _sanitize_prompt(raw) == "actual prompt"
+
+
+def test_sanitize_strips_bash_wrappers() -> None:
+    raw = "<bash-input>cd ..</bash-input>"
+    assert _sanitize_prompt(raw) == ""
+
+    raw = "<bash-stdout>hello</bash-stdout><bash-stderr>warn</bash-stderr>actual"
+    assert _sanitize_prompt(raw) == "actual"
+
+
+def test_sanitize_composite_real_corpus_shape() -> None:
+    """Realistic shape seen in real-corpus sessions."""
+    raw = (
+        "<local-command-caveat>Caveat: The messages below were generated...</local-command-caveat>"
+        "<bash-input>pwd</bash-input>"
+        "<bash-stdout>/Users/x</bash-stdout>"
+    )
+    assert _sanitize_prompt(raw) == ""
+```
+
+The expectation "whole prompt was wrapped → empty string" is important: these summaries should fall through to the next candidate in the priority chain, not render as an empty string. The caller (`_extract_summary`) should treat empty-after-sanitize the same as no-text-block, skipping to the next user prompt. Verify this fall-through behavior has a test, too:
+
+```python
+def test_extract_summary_falls_through_empty_sanitized_prompt(tmp_path):
+    """A session whose first 'user' message is entirely bash wrappers
+    should fall through to the second user message if it has real text."""
+    # Build a synthetic session with: msg1 (bash-input wrapper only),
+    # msg2 (real prompt). Reconcile. Assert summary_source='first-prompt'
+    # and summary_text reflects msg2.
+```
+
+- [ ] **Step 3: Extend the regex**
+
+Approach A (extend existing): expand `_COMMAND_WRAPPER_RE` to an alternation over all the wrapper types. Likely cleaner:
+
+```python
+_COMMAND_WRAPPER_RE = re.compile(
+    r"<(command-(?:name|message|args)|local-command-(?:caveat|stdout|stderr)|bash-(?:input|stdout|stderr))>.*?</\1>",
+    re.DOTALL,
+)
+```
+
+Approach B (second regex): add a new `_LOCAL_WRAPPER_RE` and apply it in `_sanitize_prompt` before the existing one. Two passes, simpler to reason about:
+
+```python
+_LOCAL_WRAPPER_RE = re.compile(
+    r"<(local-command-(?:caveat|stdout|stderr)|bash-(?:input|stdout|stderr))>.*?</\1>",
+    re.DOTALL,
+)
+
+def _sanitize_prompt(text: str) -> str:
+    text = _LOCAL_WRAPPER_RE.sub("", text)
+    text = _COMMAND_WRAPPER_RE.sub("", text)
+    text = _IDE_ATTACHMENT_RE.sub(lambda m: f"📎 {m.group('path').strip()}", text)
+    text = " ".join(text.split())
+    return text[:1000]
+```
+
+Pick whichever reads cleaner. Approach B is more maintainable.
+
+- [ ] **Step 4: Handle empty-after-sanitize fall-through**
+
+In `_extract_summary` (or wherever the first-prompt selection loop lives in `index.py`), after `_sanitize_prompt`, check for empty string. If empty, `continue` to the next user prompt. The current code already does this when `_first_text_block` returns None; extend to cover empty post-sanitize too.
+
+- [ ] **Step 5: Run tests + smoke-verify**
+
+```bash
+uv run pytest tests/test_session_summaries.py -v
+uv run ccforensics index rebuild --force --yes
+sqlite3 ~/.cache/ccforensics/index.sqlite \
+  "SELECT substr(summary_text,1,80), COUNT(*) FROM session_summaries
+   WHERE summary_text LIKE '<%' GROUP BY substr(summary_text,1,80)
+   ORDER BY 2 DESC LIMIT 10"
+# Expected: no rows, or rows that clearly aren't the local-command/bash wrappers.
+```
+
+Also spot-check that previously-noisy sessions now have readable summaries:
+
+```bash
+sqlite3 ~/.cache/ccforensics/index.sqlite \
+  "SELECT substr(session_id,1,6), summary_source, substr(summary_text,1,100)
+   FROM session_summaries ORDER BY last_active_at DESC LIMIT 20"
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+git commit -m "fix(index): strip local-command and bash wrappers from summaries"
+```
+
+---
+
+### Task M4.6.2: Tighten `--grep` help text
+
+**Files:**
+- Modify: `src/ccforensics/cli.py`
+- Modify: `tests/test_cli.py` (optional — only if an existing test asserts help text)
+
+- [ ] **Step 1: Update the help string**
+
+Current: `@click.option("--grep", help="Case-insensitive substring on summary text.")`
+
+Updated:
+
+```python
+@click.option(
+    "--grep",
+    help=(
+        "Case-insensitive substring on summary text. "
+        "Does NOT match project paths or session IDs — use --project for project filtering."
+    ),
+)
+```
+
+- [ ] **Step 2: Commit**
+
+```bash
+git commit -m "docs(cli): clarify --grep scope in help text"
+```
+
+**M4.6 exit criteria:**
+- [ ] Sanitizer strips `<local-command-*>` and `<bash-*>` wrappers; tests cover each.
+- [ ] Empty-after-sanitize falls through to the next user prompt.
+- [ ] Real-corpus smoke shows no `<local-command-*>`- or `<bash-*>`-prefixed summaries.
+- [ ] `--grep` help text explicit about scope.
 - [ ] CI green. Coverage ≥85%.
 
 ---
@@ -3626,9 +3808,10 @@ git commit -m "feat(cli): session --list with filter, sort, export"
 2. Manual validation pass (spec §6.5): `index --rebuild`, `session --list` scan, 3 remembered sessions, `plugins` rollup, 30d `aggregate`.
 3. SC4 verification: run reports, identify 2 actionable workflow changes. If the reports don't support the conclusion, re-open the relevant milestone.
 4. `CHANGELOG.md` for v0.1.0.
-5. PR `feature/initial-implementation` → `main`. Request review via `/pr-quality` per CLAUDE.md.
-6. Squash-merge, tag `v0.1.0`, push tag.
-7. End-to-end test: `uv tool install git+https://github.com/jlixfeld/ccforensics@v0.1.0` in a fresh shell, run `ccforensics --help`.
+5. **UX polish: narrow-terminal `session --list` rendering.** M4.5 observation: on 80-column terminals, rich's `overflow="fold"` on the Summary column folds text to ~3 chars of usable width (the other columns consume the rest). Options: detect `Console.width < N` and switch to a compact mode (truncate summary with `…`); or detect non-TTY stdout and emit plain text instead of a rich table; or drop the Project column when narrow. Pick one, implement, test at three widths (60, 100, 200 cols).
+6. PR `feature/initial-implementation` → `main`. Request review via `/pr-quality` per CLAUDE.md.
+7. Squash-merge, tag `v0.1.0`, push tag.
+8. End-to-end test: `uv tool install git+https://github.com/jlixfeld/ccforensics@v0.1.0` in a fresh shell, run `ccforensics --help`.
 
 ---
 
