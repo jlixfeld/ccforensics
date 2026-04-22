@@ -36,8 +36,15 @@ def _sanitize_prompt(text: str) -> str:
 
 
 def _is_pure_hook_injection(text: str) -> bool:
-    """Heuristic: treat as skip-this-candidate if it's dominated by hook bootstrap markers."""
-    return _HOOK_INJECTION_MARKER in text and len(text) > 200
+    """Heuristic: length-gated marker check to skip hook-bootstrap blobs as summaries.
+
+    Returns True only when the text both contains the ``<session-start-hook>``
+    marker AND exceeds 500 characters. Real hook-bootstrap payloads are
+    multi-KB, so 500 comfortably separates them from a legitimate user
+    message that merely mentions the marker string (e.g., a user asking
+    about hooks) while still matching any plausible bootstrap blob.
+    """
+    return _HOOK_INJECTION_MARKER in text and len(text) > 500
 
 
 CURRENT_SCHEMA_VERSION = 1
@@ -414,6 +421,20 @@ def recompute_session_summary(conn: sqlite3.Connection, session_id: str) -> None
     come from re-parsing the session's main JSONL (when one exists). If the
     session has no rows in ``messages``, no summary row is written and any
     pre-existing one is left alone.
+
+    Why we re-parse the main JSONL: the ``messages`` table doesn't store
+    ``cwd`` or the per-entry ``summary``/text fields needed by the summary
+    extraction chain (that would require a schema migration). Re-parsing is
+    the cheapest way to recover those without widening the schema.
+
+    Known drift: if the main file mutates between ``reconcile_file`` and
+    this call, the ``cwd`` read here reflects post-reconcile disk state
+    rather than what was indexed. This is acceptable because
+    ``reconcile_projects_dir`` calls this immediately after the file walk
+    (tiny window) and the ``FileNotFoundError`` path is caught by the
+    caller's per-session error-isolation wrapper (see
+    ``reconcile_projects_dir``), so a mid-pass delete doesn't abort the
+    remaining recomputes.
     """
     agg = conn.execute(
         """SELECT MIN(ts), MAX(ts),
@@ -444,6 +465,10 @@ def recompute_session_summary(conn: sqlite3.Connection, session_id: str) -> None
 
     if main_row is not None:
         main_path = Path(main_row[0])
+        # NOTE: double-parse — reconcile_file already parsed this file, but
+        # cwd + per-entry summary text aren't stored in messages, so we
+        # re-parse here. Caller (reconcile_projects_dir) must catch
+        # FileNotFoundError / OSError for mid-pass deletes.
         result = parse_file(main_path)
         entries = result.entries
 
@@ -527,7 +552,20 @@ def reconcile_projects_dir(
         stats.sessions_recomputed.add(session_id)
 
     for sid in stats.sessions_recomputed:
-        recompute_session_summary(conn, sid)
+        try:
+            recompute_session_summary(conn, sid)
+        except Exception:
+            # TOCTOU: Claude Code may delete/rotate a main file between the
+            # file walk and this pass, so parse_file raises FileNotFoundError.
+            # Other I/O errors (permissions, disk read) are similarly
+            # isolated here so one bad session can't abort the remaining
+            # recomputes or lose the final commit for sessions already
+            # summarized in this pass.
+            logger.warning(
+                "failed to recompute session_summaries for session_id=%s; skipping",
+                sid,
+                exc_info=True,
+            )
     conn.commit()
     return stats
 

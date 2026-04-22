@@ -151,6 +151,26 @@ def test_is_pure_hook_injection_false_for_normal_prompt() -> None:
     assert _is_pure_hook_injection("<session-start-hook> brief") is False
 
 
+def test_is_pure_hook_injection_threshold_boundary() -> None:
+    """Length gate is > 500 chars AND marker present."""
+    marker = "<session-start-hook>"
+
+    # 600-char text with marker → hook injection.
+    long_with_marker = marker + "x" * (600 - len(marker))
+    assert len(long_with_marker) == 600
+    assert _is_pure_hook_injection(long_with_marker) is True
+
+    # 200-char text with marker → NOT hook injection (previous threshold
+    # would have flagged this; current threshold of 500 does not).
+    short_with_marker = marker + "x" * (200 - len(marker))
+    assert len(short_with_marker) == 200
+    assert _is_pure_hook_injection(short_with_marker) is False
+
+    # 600-char text without marker → NOT hook injection.
+    long_no_marker = "x" * 600
+    assert _is_pure_hook_injection(long_no_marker) is False
+
+
 # ---------- numeric aggregations ----------
 
 
@@ -717,3 +737,133 @@ def test_recompute_skipped_when_session_has_no_messages(
         "SELECT * FROM session_summaries WHERE session_id=?", ("sess-empty",)
     ).fetchone()
     assert row is None
+
+
+# ---------- error isolation in recompute loop ----------
+
+
+def test_recompute_loop_isolates_per_session_failures(
+    tmp_path: Path,
+    pricing_data: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """If one session's main file vanishes between the file walk and the
+    recompute pass (realistic TOCTOU from concurrent Claude Code writes),
+    the surviving sessions must still get their summary rows written, the
+    failed session id must still appear in ``sessions_recomputed`` (it was
+    attempted), and a warning must be logged.
+    """
+    proj = tmp_path / "projects"
+    enc_a = proj / "-home-test-a"
+    enc_b = proj / "-home-test-b"
+
+    entries_a_v1 = [
+        _entry(
+            type_="user",
+            uuid="ua1",
+            ts="2026-04-20T10:00:00Z",
+            role="user",
+            text="A first prompt",
+            cwd="/home/test/a",
+            session_id="sess-a",
+        ),
+    ]
+    entries_b_v1 = [
+        _entry(
+            type_="user",
+            uuid="ub1",
+            ts="2026-04-20T11:00:00Z",
+            role="user",
+            text="B first prompt",
+            cwd="/home/test/b",
+            session_id="sess-b",
+        ),
+    ]
+    _write_jsonl(enc_a / "sess-a.jsonl", entries_a_v1)
+    _write_jsonl(enc_b / "sess-b.jsonl", entries_b_v1)
+
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    # Mutate A's file; delete B's main file right before the second pass
+    # will try to recompute it (simulates concurrent rotation). We also
+    # bump mtimes so the file-walk actually processes A's change.
+    entries_a_v2 = [
+        *entries_a_v1,
+        _entry(
+            type_="user",
+            uuid="ua2",
+            ts="2026-04-20T10:30:00Z",
+            role="user",
+            text="A second prompt",
+            session_id="sess-a",
+        ),
+    ]
+    _write_jsonl(enc_a / "sess-a.jsonl", entries_a_v2)
+    future = time.time() + 5
+    os.utime(enc_a / "sess-a.jsonl", (future, future))
+
+    # Also bump B's file so it's picked up by the walk and added to
+    # sessions_recomputed — then delete it before recompute_session_summary
+    # is called. We do that by monkeypatching recompute to delete the file
+    # on the first invocation. Simpler alternative: mutate B's file too,
+    # then arrange for parse_file to fail by deleting mid-loop. The
+    # cleanest way is to patch recompute_session_summary.
+    entries_b_v2 = [
+        *entries_b_v1,
+        _entry(
+            type_="user",
+            uuid="ub2",
+            ts="2026-04-20T11:30:00Z",
+            role="user",
+            text="B second prompt",
+            session_id="sess-b",
+        ),
+    ]
+    _write_jsonl(enc_b / "sess-b.jsonl", entries_b_v2)
+    os.utime(enc_b / "sess-b.jsonl", (future, future))
+
+    # Delete B's main file immediately before the recompute pass. We can't
+    # reach "between walk and recompute" cleanly without a hook — so patch
+    # recompute_session_summary to raise FileNotFoundError for sess-b,
+    # leaving sess-a to go through normally.
+    import ccforensics.index as index_mod
+
+    real_recompute = index_mod.recompute_session_summary
+
+    def fake_recompute(conn: Any, sid: str) -> None:
+        if sid == "sess-b":
+            raise FileNotFoundError("simulated concurrent delete of sess-b main")
+        real_recompute(conn, sid)
+
+    caplog.set_level("WARNING", logger="ccforensics.index")
+    # Patch the reference used inside reconcile_projects_dir.
+    original = index_mod.recompute_session_summary
+    index_mod.recompute_session_summary = fake_recompute  # type: ignore[assignment]
+    try:
+        stats2 = reconcile_projects_dir(conn, proj, pricing_data)
+    finally:
+        index_mod.recompute_session_summary = original  # type: ignore[assignment]
+
+    # (a) Other session still got its row updated with the mutation.
+    row_a = conn.execute(
+        "SELECT turn_count, summary_text FROM session_summaries WHERE session_id=?",
+        ("sess-a",),
+    ).fetchone()
+    assert row_a is not None
+    assert row_a[0] == 2
+    assert row_a[1] == "A first prompt"
+
+    # (b) Failed session id is still in sessions_recomputed (it was attempted).
+    assert "sess-b" in stats2.sessions_recomputed
+    assert "sess-a" in stats2.sessions_recomputed
+
+    # (c) A warning was logged mentioning the failed session id.
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any("sess-b" in r.getMessage() for r in warnings), (
+        f"expected warning mentioning sess-b, got: {[r.getMessage() for r in warnings]}"
+    )
+    # exc_info captured on the warning record.
+    assert any(r.exc_info is not None for r in warnings if "sess-b" in r.getMessage())
