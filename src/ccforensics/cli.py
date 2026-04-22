@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import dataclasses
+import sqlite3
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
 import click
+from rich.console import Console
 
 from . import __version__
+from .export import write_csv, write_json
 from .index import (
     collect_stats,
     ensure_schema,
@@ -14,10 +19,18 @@ from .index import (
 )
 from .paths import ccforensics_cache_dir, claude_projects_dir
 from .pricing import PricingCache
+from .report._dates import parse_since, parse_until
+from .report.session_list import query_session_list, render_session_list
 
 
 def _index_db_path() -> Path:
     return ccforensics_cache_dir() / "index.sqlite"
+
+
+def _open_index() -> sqlite3.Connection:
+    conn = open_connection(_index_db_path())
+    ensure_schema(conn)
+    return conn
 
 
 @click.group()
@@ -36,9 +49,88 @@ def session() -> None:
 
 
 @session.command("list")
-def session_list() -> None:
-    """List all discoverable sessions (not yet implemented)."""
-    click.echo("session --list: not yet implemented (milestone M4)")
+@click.option("--project", help="Filter by project path substring (case-insensitive).")
+@click.option("--since", help="Date filter: YYYY-MM-DD | Nd | today | yesterday")
+@click.option("--until", help="Date filter: YYYY-MM-DD | Nd | today | yesterday")
+@click.option("--grep", help="Case-insensitive substring on summary text.")
+@click.option(
+    "--sort",
+    "sort_key",
+    type=click.Choice(["cost", "started", "last-active", "turns"]),
+    default="last-active",
+    show_default=True,
+    help="Column to sort on.",
+)
+@click.option("--reverse", is_flag=True, help="Reverse the sort order.")
+@click.option("--limit", type=int, help="Cap the number of rows.")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON to stdout.")
+@click.option("--csv", "as_csv", is_flag=True, help="Emit CSV to stdout.")
+@click.option(
+    "--no-refresh",
+    is_flag=True,
+    help="Skip index reconciliation (and pricing fetch). Read-only query.",
+)
+@click.pass_context
+def session_list(
+    ctx: click.Context,
+    project: str | None,
+    since: str | None,
+    until: str | None,
+    grep: str | None,
+    sort_key: str,
+    reverse: bool,
+    limit: int | None,
+    as_json: bool,
+    as_csv: bool,
+    no_refresh: bool,
+) -> None:
+    """List all discoverable sessions."""
+    if as_json and as_csv:
+        raise click.UsageError("--json and --csv are mutually exclusive")
+
+    conn = _open_index()
+
+    if not no_refresh:
+        pricing = PricingCache(cache_file=ccforensics_cache_dir() / "litellm.json").load_or_fetch()
+        reconcile_projects_dir(conn, claude_projects_dir(), pricing)
+        conn.commit()
+
+    since_dt = parse_since(since) if since else None
+    until_dt = parse_until(until) if until else None
+
+    # click.Choice narrows `sort_key` at parse time; the cast is safe.
+    rows = query_session_list(
+        conn,
+        project=project,
+        since=since_dt,
+        until=until_dt,
+        grep=grep,
+        sort_key=sort_key,  # type: ignore[arg-type]
+        reverse=reverse,
+        limit=limit,
+    )
+
+    if as_json:
+        payload = [dataclasses.asdict(r) for r in rows]
+        write_json(payload, sys.stdout)
+        return
+    if as_csv:
+        headers = [
+            "session_id",
+            "project_path",
+            "project_display",
+            "started_at",
+            "last_active_at",
+            "duration_s",
+            "turn_count",
+            "total_cost_usd",
+            "summary_text",
+            "summary_source",
+        ]
+        write_csv((dataclasses.asdict(r) for r in rows), headers, sys.stdout)
+        return
+
+    Console().print(render_session_list(rows, verbose=bool(ctx.obj.get("verbose", False))))
 
 
 @main.command()
