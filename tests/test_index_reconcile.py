@@ -62,6 +62,32 @@ def test_reconcile_unchanged_file_is_noop(tmp_path: Path, pricing_data: dict) ->
     assert first_last_parsed == second_last_parsed, "unchanged file should be skipped"
 
 
+def test_subagents_dir_with_malformed_filename_warns(
+    tmp_path: Path, pricing_data: dict, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A file under subagents/ with the wrong naming pattern is classified
+    as subagent (with no agent_id) AND logs a warning. Never silently main."""
+    import logging
+
+    from ccforensics.index import _classify_file
+
+    caplog.set_level(logging.WARNING, logger="ccforensics.index")
+
+    proj = tmp_path / "-home-test"
+    sess_dir = proj / "sess-x" / "subagents"
+    sess_dir.mkdir(parents=True)
+    bad = sess_dir / "agent-WITHOUT-hex-pattern.jsonl"
+    bad.write_text("")
+
+    kind, agent_id, session_id = _classify_file(bad)
+    assert kind == "subagent"
+    assert agent_id is None
+    assert session_id == "sess-x"
+    assert any(
+        "doesn't match agent-<hex>.jsonl" in rec.message for rec in caplog.records
+    )
+
+
 def test_reconcile_changed_file_replaces_messages(tmp_path: Path, pricing_data: dict) -> None:
     db = tmp_path / "index.sqlite"
     conn = open_connection(db)

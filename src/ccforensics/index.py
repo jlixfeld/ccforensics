@@ -164,11 +164,25 @@ def _classify_file(path: Path) -> tuple[str, str | None, str]:
 
     - Main session: ``~/.claude/projects/<enc>/<sessionId>.jsonl``
     - Subagent:     ``~/.claude/projects/<enc>/<sessionId>/subagents/agent-<id>.jsonl``
+
+    Files under a ``subagents/`` directory whose name doesn't match the
+    ``agent-<hex>.jsonl`` pattern are classified as ``subagent`` with
+    ``agent_id=None`` and a warning is logged — never silently mislabeled
+    as ``main`` (which would make a future Claude Code rename of the
+    subagent filename convention quietly mis-attribute every subagent
+    file).
     """
     name = path.name
-    m = _SUBAGENT_FILENAME.match(name)
-    if m and path.parent.name == "subagents":
-        return ("subagent", m.group(1), path.parent.parent.name)
+    if path.parent.name == "subagents":
+        m = _SUBAGENT_FILENAME.match(name)
+        if m:
+            return ("subagent", m.group(1), path.parent.parent.name)
+        logger.warning(
+            "subagent file %s under subagents/ doesn't match agent-<hex>.jsonl; "
+            "classifying as subagent with no agent_id",
+            path,
+        )
+        return ("subagent", None, path.parent.parent.name)
     return ("main", None, path.stem)
 
 
