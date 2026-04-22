@@ -66,3 +66,45 @@ def parse_file(path: Path) -> ParseResult:
         result.entries.append(entry)
 
     return result
+
+
+def dedup_key(entry: TranscriptEntry) -> str | None:
+    """Compute a tiered dedup key. Prefix prevents cross-tier collisions.
+
+    Priority:
+    1. ``req:<message.id>:<requestId>``   (billing-accurate)
+    2. ``session:<message.id>:<sessionId>``  (fallback)
+
+    Returns ``None`` when the entry has no ``message.id`` — caller passes
+    the entry through un-deduped.
+    """
+    mid = entry.message.id if entry.message else None
+    if mid and entry.request_id:
+        return f"req:{mid}:{entry.request_id}"
+    if mid and entry.session_id:
+        return f"session:{mid}:{entry.session_id}"
+    return None
+
+
+def dedup_entries(entries: list[TranscriptEntry]) -> list[TranscriptEntry]:
+    """Dedup by key; on collision the earliest-timestamped entry wins.
+
+    Entries with no dedup_key (e.g., system events) pass through unchanged
+    and their order relative to each other is preserved.
+    """
+    first_seen: dict[str, TranscriptEntry] = {}
+    keyless: list[TranscriptEntry] = []
+
+    for entry in entries:
+        k = dedup_key(entry)
+        if k is None:
+            keyless.append(entry)
+            continue
+        prev = first_seen.get(k)
+        if prev is None or entry.timestamp < prev.timestamp:
+            first_seen[k] = entry
+
+    deduped = list(first_seen.values())
+    deduped.sort(key=lambda e: (e.timestamp, dedup_key(e) or ""))
+    keyless.sort(key=lambda e: (e.timestamp, e.uuid or ""))
+    return deduped + keyless
