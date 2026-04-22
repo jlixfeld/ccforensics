@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from .models import KNOWN_TYPES, TranscriptEntry, parse_entry
+from .pricing import compute_message_cost, resolve_pricing
 
 
 @dataclass
@@ -108,3 +110,45 @@ def dedup_entries(entries: list[TranscriptEntry]) -> list[TranscriptEntry]:
     deduped.sort(key=lambda e: (e.timestamp, dedup_key(e) or ""))
     keyless.sort(key=lambda e: (e.timestamp, e.uuid or ""))
     return deduped + keyless
+
+
+@dataclass
+class AnnotatedEntry:
+    entry: TranscriptEntry
+    cost_usd: float | None
+    pricing_unresolved_model: str | None = None
+
+
+def annotate_cost(
+    entries: list[TranscriptEntry],
+    pricing_data: dict[str, dict[str, Any]],
+) -> list[AnnotatedEntry]:
+    out: list[AnnotatedEntry] = []
+    unresolved: set[str] = set()
+    for e in entries:
+        if e.type != "assistant" or e.message is None or e.message.usage is None:
+            out.append(
+                AnnotatedEntry(entry=e, cost_usd=0.0 if e.type == "user" else None)
+            )
+            continue
+        model = e.message.model
+        if model is None:
+            out.append(AnnotatedEntry(entry=e, cost_usd=None))
+            continue
+        price = resolve_pricing(model, pricing_data)
+        if price is None:
+            unresolved.add(model)
+            out.append(
+                AnnotatedEntry(entry=e, cost_usd=None, pricing_unresolved_model=model)
+            )
+            continue
+        usage = e.message.usage
+        cost = compute_message_cost(
+            price=price,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cache_creation=usage.cache_creation_input_tokens,
+            cache_read=usage.cache_read_input_tokens,
+        )
+        out.append(AnnotatedEntry(entry=e, cost_usd=cost))
+    return out
