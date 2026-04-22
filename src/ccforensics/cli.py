@@ -52,7 +52,13 @@ def session() -> None:
 @click.option("--project", help="Filter by project path substring (case-insensitive).")
 @click.option("--since", help="Date filter: YYYY-MM-DD | Nd | today | yesterday")
 @click.option("--until", help="Date filter: YYYY-MM-DD | Nd | today | yesterday")
-@click.option("--grep", help="Case-insensitive substring on summary text.")
+@click.option(
+    "--grep",
+    help=(
+        "Case-insensitive substring on summary text. "
+        "Does NOT match project paths or session IDs — use --project for project filtering."
+    ),
+)
 @click.option(
     "--sort",
     "sort_key",
