@@ -32,3 +32,6 @@ venv/
 # IDE
 .vscode/
 .idea/
+
+# Project-local agent memory (not tracked)
+.claude/
