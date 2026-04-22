@@ -16,7 +16,7 @@ def pricing_data() -> dict:
 
 
 def test_assistant_entries_get_cost(pricing_data: dict) -> None:
-    result = parse_file(FIXTURES / "basic" / "session.jsonl")
+    result = parse_file(FIXTURES / "basic" / "s1.jsonl")
     annotated = annotate_cost(result.entries, pricing_data)
     assistant = [e for e in annotated if e.entry.type == "assistant"]
     assert len(assistant) == 2
@@ -26,7 +26,7 @@ def test_assistant_entries_get_cost(pricing_data: dict) -> None:
 
 
 def test_user_entries_have_zero_cost(pricing_data: dict) -> None:
-    result = parse_file(FIXTURES / "basic" / "session.jsonl")
+    result = parse_file(FIXTURES / "basic" / "s1.jsonl")
     annotated = annotate_cost(result.entries, pricing_data)
     user_entries = [e for e in annotated if e.entry.type == "user"]
     for e in user_entries:

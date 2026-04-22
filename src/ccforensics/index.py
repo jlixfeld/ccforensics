@@ -1,7 +1,18 @@
 from __future__ import annotations
 
+import logging
+import re
 import sqlite3
+import time
 from pathlib import Path
+from typing import Any
+
+from .jsonl import annotate_cost, dedup_key, parse_file
+from .models import TranscriptEntry
+
+logger = logging.getLogger("ccforensics.index")
+
+_SUBAGENT_FILENAME = re.compile(r"^agent-([0-9a-f]+)\.jsonl$", re.IGNORECASE)
 
 CURRENT_SCHEMA_VERSION = 1
 
@@ -145,3 +156,150 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             conn.execute(ddl)
         conn.execute(f"PRAGMA user_version = {target + 1}")
     conn.commit()
+
+
+def _classify_file(path: Path) -> tuple[str, str | None, str]:
+    """Return ``(kind, agent_id, session_id)``.
+
+    - Main session: ``~/.claude/projects/<enc>/<sessionId>.jsonl``
+    - Subagent:     ``~/.claude/projects/<enc>/<sessionId>/subagents/agent-<id>.jsonl``
+    """
+    name = path.name
+    m = _SUBAGENT_FILENAME.match(name)
+    if m and path.parent.name == "subagents":
+        return ("subagent", m.group(1), path.parent.parent.name)
+    return ("main", None, path.stem)
+
+
+def _row_is_unchanged(
+    conn: sqlite3.Connection, path: Path, mtime_ns: int, size: int
+) -> bool:
+    cur = conn.execute("SELECT mtime_ns, size FROM files WHERE path=?", (str(path),))
+    row = cur.fetchone()
+    return bool(row) and row[0] == mtime_ns and row[1] == size
+
+
+def _purge_file_rows(conn: sqlite3.Connection, path: Path) -> None:
+    s = str(path)
+    conn.execute("DELETE FROM subagent_spawns WHERE child_file_path=?", (s,))
+    conn.execute(
+        "DELETE FROM skill_activations WHERE activated_by_dedup_key IN "
+        "(SELECT dedup_key FROM messages WHERE file_path=?)",
+        (s,),
+    )
+    conn.execute("DELETE FROM messages WHERE file_path=?", (s,))
+    conn.execute("DELETE FROM files WHERE path=?", (s,))
+
+
+def _insert_message(
+    conn: sqlite3.Connection,
+    file_path: str,
+    session_id: str,
+    agent_id: str | None,
+    entry: TranscriptEntry,
+    cost_usd: float | None,
+    key: str,
+) -> None:
+    msg = entry.message
+    usage = msg.usage if msg else None
+    tool_use_id = None
+    tool_name = None
+    if msg and msg.content:
+        for block in msg.content:
+            if block.type == "tool_use":
+                tool_use_id = block.id
+                tool_name = block.name
+                break
+    conn.execute(
+        """INSERT OR REPLACE INTO messages (
+            dedup_key, file_path, session_id, uuid, parent_uuid,
+            source_tool_use_id, source_tool_assistant_uuid,
+            tool_use_id, tool_name, agent_id, role, type, model, ts,
+            is_sidechain, is_meta,
+            input_tokens, output_tokens, cache_creation, cache_read, cost_usd
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            key,
+            file_path,
+            session_id,
+            entry.uuid,
+            entry.parent_uuid,
+            entry.source_tool_use_id,
+            entry.source_tool_assistant_uuid,
+            tool_use_id,
+            tool_name,
+            agent_id or entry.agent_id,
+            (msg.role if msg else entry.type),
+            entry.type,
+            msg.model if msg else None,
+            int(entry.timestamp.timestamp()),
+            1 if entry.is_sidechain else 0,
+            1 if entry.is_meta else 0,
+            usage.input_tokens if usage else None,
+            usage.output_tokens if usage else None,
+            usage.cache_creation_input_tokens if usage else None,
+            usage.cache_read_input_tokens if usage else None,
+            cost_usd,
+        ),
+    )
+
+
+def reconcile_file(
+    conn: sqlite3.Connection, path: Path, pricing_data: dict[str, Any]
+) -> None:
+    stat = path.stat()
+    mtime_ns = stat.st_mtime_ns
+    size = stat.st_size
+
+    if _row_is_unchanged(conn, path, mtime_ns, size):
+        return
+
+    _purge_file_rows(conn, path)
+
+    kind, agent_id, session_id = _classify_file(path)
+
+    result = parse_file(path)
+    annotated = annotate_cost(result.entries, pricing_data)
+
+    seen: dict[str, tuple[TranscriptEntry, float | None]] = {}
+    kept_non_keyed: list[tuple[TranscriptEntry, float | None]] = []
+    for a in annotated:
+        key = dedup_key(a.entry)
+        if key is None:
+            kept_non_keyed.append((a.entry, a.cost_usd))
+            continue
+        prev = seen.get(key)
+        if prev is None or a.entry.timestamp < prev[0].timestamp:
+            seen[key] = (a.entry, a.cost_usd)
+
+    conn.execute(
+        """INSERT OR REPLACE INTO files
+           (path, mtime_ns, size, session_id, kind, agent_id, schema_version,
+            parse_warnings, last_parsed_at)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (
+            str(path),
+            mtime_ns,
+            size,
+            session_id,
+            kind,
+            agent_id,
+            next(iter(result.seen_versions), None) if result.seen_versions else None,
+            len(result.warnings),
+            int(time.time()),
+        ),
+    )
+
+    for key, (entry, cost) in seen.items():
+        _insert_message(conn, str(path), session_id, agent_id, entry, cost, key)
+
+    for i, (entry, cost) in enumerate(kept_non_keyed):
+        synth = f"file:{path}:{i}"
+        _insert_message(conn, str(path), session_id, agent_id, entry, cost, synth)
+
+
+def count_messages_for_file(conn: sqlite3.Connection, path: Path) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE file_path=?", (str(path),)
+    ).fetchone()
+    return int(row[0])

@@ -10,7 +10,7 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def test_parses_basic_session() -> None:
-    result = parse_file(FIXTURES / "basic" / "session.jsonl")
+    result = parse_file(FIXTURES / "basic" / "s1.jsonl")
     assert len(result.entries) == 5
     assert result.warnings == []
     assert result.parse_errors == 0
