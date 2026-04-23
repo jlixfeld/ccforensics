@@ -20,6 +20,12 @@ from .index import (
 from .paths import ccforensics_cache_dir, claude_projects_dir
 from .pricing import PricingCache
 from .report._dates import parse_since, parse_until
+from .report.resolver import AmbiguousPrefix, SessionNotFound, resolve_session_id
+from .report.session import (
+    SessionReportNotFound,
+    build_session_report,
+    render_session_report,
+)
 from .report.session_list import query_session_list, render_session_list
 
 
@@ -137,6 +143,90 @@ def session_list(
         return
 
     Console().print(render_session_list(rows, verbose=bool(ctx.obj.get("verbose", False))))
+
+
+@session.command("show")
+@click.argument("spec")
+@click.option(
+    "--include-unattributed",
+    is_flag=True,
+    help="List the subagent files whose cost landed in the unattributed bucket.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON to stdout.")
+@click.option("--csv", "as_csv", is_flag=True, help="Emit CSV (one row per bucket).")
+@click.option(
+    "--no-refresh",
+    is_flag=True,
+    help="Skip reconciliation and pricing fetch.",
+)
+def session_show(
+    spec: str,
+    include_unattributed: bool,
+    as_json: bool,
+    as_csv: bool,
+    no_refresh: bool,
+) -> None:
+    """Show the deep report for one session.
+
+    ``SPEC`` is a full session id, a prefix of ≥6 characters, or an
+    absolute path to a session JSONL file.
+    """
+    if as_json and as_csv:
+        raise click.UsageError("--json and --csv are mutually exclusive")
+
+    conn = _open_index()
+
+    if not no_refresh:
+        pricing = PricingCache(cache_file=ccforensics_cache_dir() / "litellm.json").load_or_fetch()
+        reconcile_projects_dir(conn, claude_projects_dir(), pricing)
+        conn.commit()
+
+    try:
+        session_id = resolve_session_id(spec, conn)
+    except AmbiguousPrefix as e:
+        raise click.UsageError(str(e)) from e
+    except SessionNotFound as e:
+        raise click.UsageError(str(e)) from e
+
+    try:
+        report = build_session_report(
+            conn, session_id, include_unattributed=include_unattributed
+        )
+    except SessionReportNotFound as e:
+        raise click.UsageError(str(e)) from e
+
+    if as_json:
+        payload = dataclasses.asdict(report)
+        write_json(payload, sys.stdout)
+        return
+    if as_csv:
+        rows = [
+            {
+                "session_id": session_id,
+                "bucket_kind": b.bucket_kind,
+                "bucket_name": b.bucket_name,
+                "cost_usd": b.cost_usd,
+                "input_tokens": b.input_tokens,
+                "output_tokens": b.output_tokens,
+                "cache_create": b.cache_create,
+                "cache_read": b.cache_read,
+            }
+            for b in report.buckets
+        ]
+        headers = [
+            "session_id",
+            "bucket_kind",
+            "bucket_name",
+            "cost_usd",
+            "input_tokens",
+            "output_tokens",
+            "cache_create",
+            "cache_read",
+        ]
+        write_csv(iter(rows), headers, sys.stdout)
+        return
+
+    Console().print(render_session_report(report))
 
 
 @main.command()
