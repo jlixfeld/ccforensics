@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import json
+import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
+
+logger = logging.getLogger("ccforensics.models")
 
 
 class UsageStats(BaseModel):
@@ -119,6 +124,57 @@ def _normalize_message_content(raw: dict[str, Any]) -> None:
     content = msg.get("content")
     if isinstance(content, str):
         msg["content"] = [{"type": "text", "text": content}]
+
+
+class SpawnMeta(BaseModel):
+    """Schema for ``agent-<id>.meta.json`` — the sibling metadata file
+    Claude Code writes next to a subagent JSONL. Only ``agentType`` and
+    ``description`` are consumed downstream; extras are preserved in
+    ``__pydantic_extra__`` for future use.
+    """
+
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    agent_type: str | None = Field(default=None, alias="agentType")
+    description: str | None = None
+
+
+def load_meta_json(path: Path) -> SpawnMeta | None:
+    """Read and parse ``agent-<id>.meta.json``. Returns ``None`` on any
+    failure (missing file, malformed JSON, unexpected top-level shape),
+    with a warning logged so the caller can proceed without that linkage.
+
+    Missing-file is silent: older Claude Code versions and auto-compact
+    artifacts don't emit meta.json, and every caller must already handle
+    ``None``. Raising would just force try/except at every call site.
+    """
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        logger.warning("failed to read meta.json at %s", path, exc_info=True)
+        return None
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("malformed JSON in meta.json at %s", path, exc_info=True)
+        return None
+
+    if not isinstance(data, dict):
+        logger.warning(
+            "meta.json at %s has unexpected top-level shape (expected object, got %s)",
+            path,
+            type(data).__name__,
+        )
+        return None
+
+    try:
+        return SpawnMeta.model_validate(data)
+    except Exception:
+        logger.warning("meta.json at %s failed schema validation", path, exc_info=True)
+        return None
 
 
 def parse_entry(raw: dict[str, Any]) -> TranscriptEntry:

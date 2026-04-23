@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
-from ccforensics.models import parse_entry
+import pytest
+
+from ccforensics.models import SpawnMeta, load_meta_json, parse_entry
 
 
 def test_parses_user_entry() -> None:
@@ -176,3 +179,67 @@ def test_attachment_hook_success_recognized() -> None:
     assert entry.attachment is not None
     assert entry.attachment.type == "hook_success"
     assert entry.attachment.hook_event == "SessionStart"
+
+
+# ---------- SpawnMeta + load_meta_json ----------
+
+
+def test_spawn_meta_parses_minimal_shape(tmp_path: Path) -> None:
+    p = tmp_path / "agent-abc.meta.json"
+    p.write_text('{"agentType":"Explore","description":"walk the src tree"}')
+    meta = load_meta_json(p)
+    assert meta is not None
+    assert meta.agent_type == "Explore"
+    assert meta.description == "walk the src tree"
+
+
+def test_spawn_meta_allows_extra_fields(tmp_path: Path) -> None:
+    """Future meta.json fields must not break the loader."""
+    p = tmp_path / "agent-abc.meta.json"
+    p.write_text('{"agentType":"general-purpose","description":"x","futureField":42}')
+    meta = load_meta_json(p)
+    assert meta is not None
+    assert meta.agent_type == "general-purpose"
+
+
+def test_load_meta_json_missing_file_returns_none(tmp_path: Path) -> None:
+    p = tmp_path / "agent-nope.meta.json"
+    assert load_meta_json(p) is None
+
+
+def test_load_meta_json_malformed_json_returns_none_and_warns(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    p = tmp_path / "agent-bad.meta.json"
+    p.write_text("{not valid json")
+    caplog.set_level("WARNING", logger="ccforensics.models")
+    assert load_meta_json(p) is None
+    assert any("agent-bad" in r.getMessage() for r in caplog.records)
+
+
+def test_load_meta_json_unexpected_schema_returns_none_and_warns(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Top-level array instead of object — don't crash, log, return None."""
+    p = tmp_path / "agent-weird.meta.json"
+    p.write_text('["not","an","object"]')
+    caplog.set_level("WARNING", logger="ccforensics.models")
+    assert load_meta_json(p) is None
+
+
+def test_load_meta_json_missing_agent_type_still_parses(tmp_path: Path) -> None:
+    """Permissive: agentType may be absent. Return SpawnMeta with
+    agent_type=None; let caller decide."""
+    p = tmp_path / "agent-notype.meta.json"
+    p.write_text('{"description":"only desc"}')
+    meta = load_meta_json(p)
+    assert meta is not None
+    assert meta.agent_type is None
+    assert meta.description == "only desc"
+
+
+def test_spawn_meta_directly_constructible() -> None:
+    """SpawnMeta can be built in-memory (used by tests in tree module)."""
+    meta = SpawnMeta(agentType="Plan", description="plan the refactor")
+    assert meta.agent_type == "Plan"
+    assert meta.description == "plan the refactor"
