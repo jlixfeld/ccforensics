@@ -11,7 +11,8 @@ from typing import Any
 from .attribution import backfill_spawn_totals, recompute_session_rollups
 from .jsonl import _dedup_preference, annotate_cost, dedup_key, parse_file
 from .models import TranscriptEntry, load_meta_json
-from .paths import decode_project_dirname
+from .paths import claude_home, claude_plugins_cache_dir, decode_project_dirname
+from .registry import populate_registry
 from .tree import discover_spawn
 
 logger = logging.getLogger("ccforensics.index")
@@ -728,6 +729,15 @@ def reconcile_projects_dir(
         stats.files_indexed += 1
         stats.files_changed += 1
         stats.sessions_recomputed.add(session_id)
+
+    # Refresh the plugin + user-level registry once per reconcile pass.
+    # Cheap (~100ms on a real install) and keeps the registry in lockstep
+    # with on-disk plugin updates.
+    try:
+        populate_registry(conn, claude_plugins_cache_dir(), claude_home())
+        conn.commit()
+    except Exception:
+        logger.warning("failed to populate plugin registry; skipping", exc_info=True)
 
     for sid in stats.sessions_recomputed:
         try:

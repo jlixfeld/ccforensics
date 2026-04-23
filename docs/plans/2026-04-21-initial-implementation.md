@@ -27,8 +27,8 @@ Milestones M0–M10 map to the spec §7.1 sequencing:
 | M4 | `session --list` on real corpus; SC5 verified | ✅ Done (SC5 PASS — 3s vs 30s target) |
 | M4.6 | Post-M4 polish — sanitization + grep help | ✅ Done |
 | M5 | Tree reconstruction; per-bucket breakdown | ✅ Done (invariant holds 12,371/12,371 real-corpus sessions) |
-| M6 | Plugin registry + rollup; collision warning | Outline only — expand next |
-| M7 | `session <id>` deep report; SC1 verified | Outline only |
+| M6 | Plugin registry + rollup; collision warning | ✅ Done (14 plugins / 6 user-level skills / 1 collision detected) |
+| M7 | `session <id>` deep report; SC1 verified | Outline only — expand next |
 | M8 | Skill ledger + ± band; SC2 + SC3 verified | Outline only |
 | M9 | `aggregate` + `plugins` commands | Outline only |
 | M10 | Polish, README, v0.1.0 tag; SC4 verified | Outline only |
