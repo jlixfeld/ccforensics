@@ -467,3 +467,29 @@ def test_render_to_console_contains_summary_text() -> None:
     console.print(table)
     out = console.export_text()
     assert "distinct-marker-abc" in out
+
+
+def test_render_wide_terminal_includes_project_column() -> None:
+    rows = [_row(project_display="proj-a")]
+    table = render_session_list(rows, console_width=180)
+    headers = [c.header for c in table.columns]
+    assert "Project" in headers
+
+
+def test_render_narrow_terminal_drops_project_column() -> None:
+    """Below 120 cols the Project column is dropped so Summary has room."""
+    rows = [_row(project_display="proj-a", summary_text="real summary here")]
+    table = render_session_list(rows, console_width=80)
+    headers = [c.header for c in table.columns]
+    assert "Project" not in headers
+    # Summary column still present.
+    assert "Summary" in headers
+
+
+def test_render_boundary_at_120_is_wide() -> None:
+    """120 is the wide threshold — 119 narrow, 120 wide."""
+    rows = [_row()]
+    narrow = render_session_list(rows, console_width=119)
+    wide = render_session_list(rows, console_width=120)
+    assert "Project" not in [c.header for c in narrow.columns]
+    assert "Project" in [c.header for c in wide.columns]

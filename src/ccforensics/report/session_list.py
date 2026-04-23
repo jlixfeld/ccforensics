@@ -119,16 +119,30 @@ def shorten_session_ids(session_ids: list[str], min_chars: int = 6) -> dict[str,
             return {sid: sid[: lengths[sid]] for sid in ids}
 
 
-def render_session_list(rows: list[SessionListRow], *, verbose: bool = False) -> Table:
+def render_session_list(
+    rows: list[SessionListRow],
+    *,
+    verbose: bool = False,
+    console_width: int | None = None,
+) -> Table:
     """Render session rows as a ``rich.Table``.
 
     Summary column uses ``overflow='fold'`` so long summaries wrap rather
     than truncate. The UUID column shows the shortest unique prefix per id.
+
+    Narrow-terminal mode: when ``console_width`` is below 120 columns,
+    the Project column is dropped so the Summary still has usable width.
+    When ``console_width`` is ``None``, the terminal width is detected
+    automatically.
     """
+    width = console_width if console_width is not None else _detect_console_width()
+    narrow = width < 120
+
     table = Table(show_lines=False, expand=True, pad_edge=False)
     short_ids = shorten_session_ids([r.session_id for r in rows])
     table.add_column("UUID", no_wrap=True)
-    table.add_column("Project", no_wrap=True, max_width=30)
+    if not narrow:
+        table.add_column("Project", no_wrap=True, max_width=30)
     table.add_column("Started", no_wrap=True)
     table.add_column("Dur", no_wrap=True, justify="right")
     table.add_column("Turns", no_wrap=True, justify="right")
@@ -139,16 +153,33 @@ def render_session_list(rows: list[SessionListRow], *, verbose: bool = False) ->
 
     for r in rows:
         started = datetime.fromtimestamp(r.started_at, tz=UTC).strftime("%Y-%m-%d %H:%M")
-        cells: list[str | Text] = [
-            short_ids[r.session_id],
-            (r.project_display or "")[:30],
-            started,
-            format_duration(r.duration_s),
-            str(r.turn_count),
-            Text(format_cost(r.total_cost_usd)),
-        ]
+        cells: list[str | Text] = [short_ids[r.session_id]]
+        if not narrow:
+            cells.append((r.project_display or "")[:30])
+        cells.extend(
+            [
+                started,
+                format_duration(r.duration_s),
+                str(r.turn_count),
+                Text(format_cost(r.total_cost_usd)),
+            ]
+        )
         if verbose:
             cells.append(_SOURCE_BADGE.get(r.summary_source or "none", "[-]"))
         cells.append(Text(r.summary_text or "<no summary available>"))
         table.add_row(*cells)
     return table
+
+
+def _detect_console_width() -> int:
+    """Best-effort console width detection; defaults to 120 when unknown
+    (so the default rendering doesn't trigger narrow-mode by accident)."""
+    import os
+    import shutil
+
+    w = shutil.get_terminal_size(fallback=(120, 24)).columns
+    # Honor explicit override for tests / non-TTY callers.
+    override = os.environ.get("COLUMNS")
+    if override and override.isdigit():
+        return int(override)
+    return w
