@@ -13,6 +13,7 @@ from .jsonl import _dedup_preference, annotate_cost, dedup_key, parse_file
 from .models import TranscriptEntry, load_meta_json
 from .paths import claude_home, claude_plugins_cache_dir, decode_project_dirname
 from .registry import populate_registry
+from .skills import build_resolver_from_paths, populate_from_session_files
 from .tree import discover_spawn
 
 logger = logging.getLogger("ccforensics.index")
@@ -353,8 +354,7 @@ def _reconcile_spawn(
             parent_dedup_key = row[0]
     if parent_dedup_key is None and spawn.parent_message_uuid is not None:
         logger.warning(
-            "spawn parent uuid %s / tool_use_id %s not resolvable to a "
-            "messages row for session %s",
+            "spawn parent uuid %s / tool_use_id %s not resolvable to a messages row for session %s",
             spawn.parent_message_uuid,
             spawn.parent_tool_use_id,
             session_id,
@@ -739,11 +739,14 @@ def reconcile_projects_dir(
     except Exception:
         logger.warning("failed to populate plugin registry; skipping", exc_info=True)
 
+    skill_resolver = build_resolver_from_paths()
+
     for sid in stats.sessions_recomputed:
         try:
             recompute_session_summary(conn, sid)
             recompute_session_rollups(conn, sid)
             backfill_spawn_totals(conn, sid)
+            populate_from_session_files(conn, sid, skill_resolver)
         except Exception:
             # TOCTOU: Claude Code may delete/rotate a main file between the
             # file walk and this pass, so parse_file raises FileNotFoundError.

@@ -28,9 +28,9 @@ Milestones M0–M10 map to the spec §7.1 sequencing:
 | M4.6 | Post-M4 polish — sanitization + grep help | ✅ Done |
 | M5 | Tree reconstruction; per-bucket breakdown | ✅ Done (invariant holds 12,371/12,371 real-corpus sessions) |
 | M6 | Plugin registry + rollup; collision warning | ✅ Done (14 plugins / 6 user-level skills / 1 collision detected) |
-| M7 | `session <id>` deep report; SC1 verified | ✅ Done (sections: header, cost-by-bucket, cost-by-plugin, parse notes; JSON + CSV export). Skill ledger deferred to M8. |
-| M8 | Skill ledger + ± band; SC2 + SC3 verified | Outline only — expand next |
-| M9 | `aggregate` + `plugins` commands | Outline only |
+| M7 | `session <id>` deep report; SC1 verified | ✅ Done (sections: header, cost-by-bucket, cost-by-plugin, parse notes; JSON + CSV export). |
+| M8 | Skill ledger + ± band; SC2 + SC3 verified | ✅ Detection done (956 activations across 259 sessions; all 3 channels). Cost ± band math deferred to M8.2. |
+| M9 | `aggregate` + `plugins` commands | Outline only — expand next |
 | M10 | Polish, README, v0.1.0 tag; SC4 verified | Outline only |
 
 **Why the split:** M4–M10 build on M0–M3's concrete code. Writing their task steps in full before that code exists produces either fabrications or placeholders. When we hit the end of M3, plan expansion for M4 is a 30-minute task informed by what actually landed. Same pattern for M5 onward: expand each when the prior milestone lands.

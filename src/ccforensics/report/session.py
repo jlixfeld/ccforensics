@@ -84,12 +84,25 @@ class ParseNotes:
 
 
 @dataclass
+class SkillLedgerEntry:
+    activated_at: int
+    skill_name: str
+    plugin_name: str | None
+    source: str
+    content_size: int | None
+    skill_path: str
+    estimated_cost_usd: float | None
+    estimated_cost_band_usd: float | None
+
+
+@dataclass
 class SessionReport:
     header: SessionHeader
     buckets: list[BucketRow] = field(default_factory=list)
     plugins: list[PluginRow] = field(default_factory=list)
     unattributed_items: list[UnattributedItem] = field(default_factory=list)
     parse_notes: ParseNotes | None = None
+    skill_ledger: list[SkillLedgerEntry] = field(default_factory=list)
 
 
 class SessionReportNotFound(Exception):  # noqa: N818 — public name matches resolver style
@@ -151,9 +164,7 @@ def _load_buckets(conn: sqlite3.Connection, session_id: str) -> list[BucketRow]:
     ]
 
 
-def _rollup_plugins(
-    conn: sqlite3.Connection, buckets: list[BucketRow]
-) -> list[PluginRow]:
+def _rollup_plugins(conn: sqlite3.Connection, buckets: list[BucketRow]) -> list[PluginRow]:
     """Map each bucket to a plugin-level ``source`` and sum.
 
     Buckets other than ``subagent:*`` map to themselves (``main``,
@@ -172,16 +183,13 @@ def _rollup_plugins(
         cost, count = totals.get(source, (0.0, 0))
         totals[source] = (cost + b.cost_usd, count + 1)
     out = [
-        PluginRow(source=s, cost_usd=c, session_fragment_count=n)
-        for s, (c, n) in totals.items()
+        PluginRow(source=s, cost_usd=c, session_fragment_count=n) for s, (c, n) in totals.items()
     ]
     out.sort(key=lambda r: (-r.cost_usd, r.source))
     return out
 
 
-def _load_unattributed_items(
-    conn: sqlite3.Connection, session_id: str
-) -> list[UnattributedItem]:
+def _load_unattributed_items(conn: sqlite3.Connection, session_id: str) -> list[UnattributedItem]:
     """Subagent files whose spawn row has null ``parent_message_dedup_key``
     OR whose ``subagent_type`` is null — both route to unattributed per
     the SQL bucket-CASE in ``attribution.py``."""
@@ -198,6 +206,29 @@ def _load_unattributed_items(
             child_file_path=r[0],
             subagent_type=r[1],
             cost_usd=r[2],
+        )
+        for r in rows
+    ]
+
+
+def _load_skill_ledger(conn: sqlite3.Connection, session_id: str) -> list[SkillLedgerEntry]:
+    rows = conn.execute(
+        """SELECT activated_at, skill_name, plugin_name, source, content_size,
+                  skill_path, estimated_cost_usd, estimated_cost_band_usd
+             FROM skill_activations WHERE session_id=?
+             ORDER BY activated_at, id""",
+        (session_id,),
+    ).fetchall()
+    return [
+        SkillLedgerEntry(
+            activated_at=int(r[0]),
+            skill_name=r[1],
+            plugin_name=r[2],
+            source=r[3],
+            content_size=r[4],
+            skill_path=r[5],
+            estimated_cost_usd=r[6],
+            estimated_cost_band_usd=r[7],
         )
         for r in rows
     ]
@@ -234,12 +265,14 @@ def build_session_report(
     plugins = _rollup_plugins(conn, buckets)
     items = _load_unattributed_items(conn, session_id) if include_unattributed else []
     parse_notes = _load_parse_notes(conn, session_id)
+    skill_ledger = _load_skill_ledger(conn, session_id)
     return SessionReport(
         header=header,
         buckets=buckets,
         plugins=plugins,
         unattributed_items=items,
         parse_notes=parse_notes,
+        skill_ledger=skill_ledger,
     )
 
 
@@ -273,9 +306,7 @@ def _render_header(h: SessionHeader) -> RenderableType:
         Text.assemble(("total cost: ", "bold"), format_cost(h.total_cost_usd)),
     ]
     if h.summary_text:
-        lines.append(
-            Text.assemble(("summary: ", "bold"), h.summary_text[:120])
-        )
+        lines.append(Text.assemble(("summary: ", "bold"), h.summary_text[:120]))
     return Group(*lines)
 
 
@@ -325,6 +356,29 @@ def _render_unattributed(items: list[UnattributedItem]) -> Table:
     return t
 
 
+def _render_skill_ledger(ledger: list[SkillLedgerEntry]) -> Table:
+    t = Table(title="Skill activations", show_edge=False)
+    t.add_column("when", style="dim")
+    t.add_column("skill", style="green")
+    t.add_column("plugin")
+    t.add_column("source")
+    t.add_column("size", justify="right")
+    t.add_column("est.cost", justify="right")
+    for entry in ledger:
+        ts = datetime.fromtimestamp(entry.activated_at, tz=UTC).strftime("%m-%d %H:%M")
+        size = f"{entry.content_size:,}" if entry.content_size is not None else "-"
+        cost = format_cost(entry.estimated_cost_usd) if entry.estimated_cost_usd else "-"
+        t.add_row(
+            ts,
+            entry.skill_name,
+            entry.plugin_name or "<user-level>",
+            entry.source,
+            size,
+            cost,
+        )
+    return t
+
+
 def _render_parse_notes(notes: ParseNotes) -> RenderableType:
     return Text.assemble(
         ("files: ", "bold"),
@@ -344,6 +398,8 @@ def render_session_report(report: SessionReport) -> RenderableType:
     ]
     if report.unattributed_items:
         sections.append(_render_unattributed(report.unattributed_items))
+    if report.skill_ledger:
+        sections.append(_render_skill_ledger(report.skill_ledger))
     if report.parse_notes is not None:
         sections.append(_render_parse_notes(report.parse_notes))
     return Group(*sections)

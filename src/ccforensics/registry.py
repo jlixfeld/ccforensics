@@ -78,9 +78,7 @@ def _discover_one_plugin(manifest_path: Path) -> DiscoveredPlugin | None:
         logger.warning("malformed plugin.json at %s", manifest_path, exc_info=True)
         return None
     if not isinstance(data, dict) or "name" not in data:
-        logger.warning(
-            "plugin.json at %s missing required 'name' field; skipping", manifest_path
-        )
+        logger.warning("plugin.json at %s missing required 'name' field; skipping", manifest_path)
         return None
 
     name = str(data["name"])
@@ -139,9 +137,7 @@ def discover_user_level(claude_home: Path) -> list[UserLevelArtifact]:
     skills_dir = claude_home / "skills"
     if skills_dir.is_dir():
         for skill in sorted(skills_dir.glob("*/SKILL.md")):
-            out.append(
-                UserLevelArtifact(path=skill, kind="skill", name=skill.parent.name)
-            )
+            out.append(UserLevelArtifact(path=skill, kind="skill", name=skill.parent.name))
 
     agents_dir = claude_home / "agents"
     if agents_dir.is_dir():
@@ -183,14 +179,10 @@ def _detect_collisions(
     report = CollisionReport()
     for name, locations in plugin_skill_map.items():
         if name in user_skills:
-            report.skill_collisions.append(
-                (name, [*locations, f"user-level:{name}"])
-            )
+            report.skill_collisions.append((name, [*locations, f"user-level:{name}"]))
     for name, locations in plugin_agent_map.items():
         if name in user_agents:
-            report.agent_collisions.append(
-                (name, [*locations, f"user-level:{name}"])
-            )
+            report.agent_collisions.append((name, [*locations, f"user-level:{name}"]))
     return report
 
 

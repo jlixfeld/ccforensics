@@ -140,9 +140,7 @@ def _reconcile(tmp_path: Path, pricing: dict) -> tuple[Any, str]:
     return conn, sid
 
 
-def test_build_session_report_has_header_and_buckets(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_build_session_report_has_header_and_buckets(tmp_path: Path, pricing_data: dict) -> None:
     conn, sid = _reconcile(tmp_path, pricing_data)
     report = build_session_report(conn, sid)
 
@@ -156,9 +154,7 @@ def test_build_session_report_has_header_and_buckets(
     assert ("subagent", "pr-review-toolkit:code-reviewer") in bucket_kinds
 
 
-def test_plugin_rollup_resolves_known_plugin(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_plugin_rollup_resolves_known_plugin(tmp_path: Path, pricing_data: dict) -> None:
     conn, sid = _reconcile(tmp_path, pricing_data)
     # Seed the plugins table so the pr-review-toolkit namespace resolves.
     conn.execute(
@@ -173,9 +169,7 @@ def test_plugin_rollup_resolves_known_plugin(
     assert "main" in sources
 
 
-def test_plugin_rollup_unknown_prefix_is_marked_unknown(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_plugin_rollup_unknown_prefix_is_marked_unknown(tmp_path: Path, pricing_data: dict) -> None:
     """Subagent_type with an unfamiliar prefix → 'unknown'.
 
     Reconcile auto-populates the plugins table from ``~/.claude/plugins``,
@@ -192,9 +186,7 @@ def test_plugin_rollup_unknown_prefix_is_marked_unknown(
     assert "unknown" in sources
 
 
-def test_include_unattributed_populates_items(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_include_unattributed_populates_items(tmp_path: Path, pricing_data: dict) -> None:
     """Unresolvable subagent → listed when --include-unattributed."""
     proj = tmp_path / "projects"
     enc = proj / "-home-test"
@@ -250,9 +242,7 @@ def test_parse_notes_populated(tmp_path: Path, pricing_data: dict) -> None:
     assert report.parse_notes.files_count >= 2  # main + subagent
 
 
-def test_build_report_missing_session_raises(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_build_report_missing_session_raises(tmp_path: Path, pricing_data: dict) -> None:
     db = tmp_path / "index.sqlite"
     conn = open_connection(db)
     ensure_schema(conn)
@@ -260,9 +250,7 @@ def test_build_report_missing_session_raises(
         build_session_report(conn, "does-not-exist")
 
 
-def test_render_session_report_produces_output(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_render_session_report_produces_output(tmp_path: Path, pricing_data: dict) -> None:
     from io import StringIO
 
     from rich.console import Console
@@ -282,9 +270,7 @@ def test_render_session_report_produces_output(
     assert "Cost by plugin" in out
 
 
-def test_report_cost_totals_match_session_total(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_report_cost_totals_match_session_total(tmp_path: Path, pricing_data: dict) -> None:
     """Sum over rendered buckets == session total (the invariant, surfaced
     through the report)."""
     conn, sid = _reconcile(tmp_path, pricing_data)

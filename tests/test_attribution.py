@@ -168,9 +168,7 @@ def test_main_plus_subagent_two_buckets(tmp_path: Path, pricing_data: dict) -> N
             ),
         ],
     )
-    (sub_dir / "agent-abc.meta.json").write_text(
-        '{"agentType":"Explore","description":"walk src"}'
-    )
+    (sub_dir / "agent-abc.meta.json").write_text('{"agentType":"Explore","description":"walk src"}')
 
     db = tmp_path / "index.sqlite"
     conn = open_connection(db)
@@ -228,9 +226,7 @@ def test_autocompact_own_bucket(tmp_path: Path, pricing_data: dict) -> None:
     assert "auto-compact" in buckets
 
 
-def test_unresolved_spawn_goes_to_unattributed(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_unresolved_spawn_goes_to_unattributed(tmp_path: Path, pricing_data: dict) -> None:
     """Subagent with no parent Agent/Task call before ts_spawned →
     unattributed bucket (spec §4.2)."""
     proj = tmp_path / "projects"
@@ -285,9 +281,7 @@ def test_unresolved_spawn_goes_to_unattributed(
 # ---------- invariant ----------
 
 
-def test_invariant_sum_buckets_equals_session_total(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_invariant_sum_buckets_equals_session_total(tmp_path: Path, pricing_data: dict) -> None:
     """Hard invariant (spec §4.2): sum(buckets) == session_total."""
     proj = tmp_path / "projects"
     enc = proj / "-home-test"
@@ -347,9 +341,7 @@ def test_invariant_sum_buckets_equals_session_total(
             ),
         ],
     )
-    (sub_dir / "agent-abc.meta.json").write_text(
-        '{"agentType":"Explore","description":"x"}'
-    )
+    (sub_dir / "agent-abc.meta.json").write_text('{"agentType":"Explore","description":"x"}')
 
     db = tmp_path / "index.sqlite"
     conn = open_connection(db)
@@ -418,9 +410,7 @@ def test_spawn_totals_backfilled(tmp_path: Path, pricing_data: dict) -> None:
             ),
         ],
     )
-    (sub_dir / "agent-abc.meta.json").write_text(
-        '{"agentType":"Explore","description":"y"}'
-    )
+    (sub_dir / "agent-abc.meta.json").write_text('{"agentType":"Explore","description":"y"}')
 
     db = tmp_path / "index.sqlite"
     conn = open_connection(db)
@@ -472,9 +462,7 @@ def test_rollups_idempotent_on_reconcile(tmp_path: Path, pricing_data: dict) -> 
     assert first == second
 
 
-def test_buckets_have_exact_per_bucket_token_counts(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_buckets_have_exact_per_bucket_token_counts(tmp_path: Path, pricing_data: dict) -> None:
     """Pin exact per-bucket numerics — not just invariant, but that the
     right tokens land in the right bucket."""
     proj = tmp_path / "projects"
@@ -534,9 +522,7 @@ def test_buckets_have_exact_per_bucket_token_counts(
             ),
         ],
     )
-    (sub_dir / "agent-abc.meta.json").write_text(
-        '{"agentType":"Explore","description":"x"}'
-    )
+    (sub_dir / "agent-abc.meta.json").write_text('{"agentType":"Explore","description":"x"}')
     _write_jsonl(
         sub_dir / "agent-acompact-abcdef.jsonl",
         [
@@ -583,9 +569,7 @@ def test_buckets_have_exact_per_bucket_token_counts(
     assert by_bucket[("auto-compact", "auto-compact")]["output"] == 200
 
 
-def test_rollup_helper_can_be_called_standalone(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_rollup_helper_can_be_called_standalone(tmp_path: Path, pricing_data: dict) -> None:
     """recompute_session_rollups + backfill_spawn_totals are safe to call
     repeatedly outside the reconcile loop (e.g., in report code that
     wants fresh totals)."""

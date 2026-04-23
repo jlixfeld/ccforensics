@@ -122,9 +122,7 @@ def test_dedup_tool_use_wins_over_empty() -> None:
             "message": {
                 "id": "m",
                 "role": "assistant",
-                "content": [
-                    {"type": "tool_use", "id": "tu1", "name": "Agent", "input": {}}
-                ],
+                "content": [{"type": "tool_use", "id": "tu1", "name": "Agent", "input": {}}],
             },
         }
     )

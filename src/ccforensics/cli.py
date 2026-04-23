@@ -189,9 +189,7 @@ def session_show(
         raise click.UsageError(str(e)) from e
 
     try:
-        report = build_session_report(
-            conn, session_id, include_unattributed=include_unattributed
-        )
+        report = build_session_report(conn, session_id, include_unattributed=include_unattributed)
     except SessionReportNotFound as e:
         raise click.UsageError(str(e)) from e
 

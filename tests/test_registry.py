@@ -157,14 +157,10 @@ def test_populate_registry_writes_rows(tmp_path: Path) -> None:
     populate_registry(conn, cache, home)
     conn.commit()
 
-    plugin_row = conn.execute(
-        "SELECT name, version, scope FROM plugins"
-    ).fetchone()
+    plugin_row = conn.execute("SELECT name, version, scope FROM plugins").fetchone()
     assert plugin_row == ("pr-review-loop", "0.1.0", "user")
 
-    ul_rows = sorted(
-        conn.execute("SELECT kind, name FROM user_level_artifacts").fetchall()
-    )
+    ul_rows = sorted(conn.execute("SELECT kind, name FROM user_level_artifacts").fetchall())
     assert ul_rows == [("agent", "custom-agent"), ("skill", "pr-quality")]
 
 
@@ -178,28 +174,24 @@ def test_populate_registry_is_idempotent(tmp_path: Path) -> None:
     ensure_schema(conn)
     populate_registry(conn, cache, home)
     conn.commit()
-    first = conn.execute(
-        "SELECT * FROM plugins ORDER BY name"
-    ).fetchall() + conn.execute(
-        "SELECT * FROM user_level_artifacts ORDER BY path"
-    ).fetchall()
+    first = (
+        conn.execute("SELECT * FROM plugins ORDER BY name").fetchall()
+        + conn.execute("SELECT * FROM user_level_artifacts ORDER BY path").fetchall()
+    )
 
     populate_registry(conn, cache, home)
     conn.commit()
-    second = conn.execute(
-        "SELECT * FROM plugins ORDER BY name"
-    ).fetchall() + conn.execute(
-        "SELECT * FROM user_level_artifacts ORDER BY path"
-    ).fetchall()
+    second = (
+        conn.execute("SELECT * FROM plugins ORDER BY name").fetchall()
+        + conn.execute("SELECT * FROM user_level_artifacts ORDER BY path").fetchall()
+    )
     assert first == second
 
 
 # ---------- collision detection ----------
 
 
-def test_skill_name_collision_is_warned(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_skill_name_collision_is_warned(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     """User-level skill named X + any plugin skill named X → warning."""
     cache = tmp_path / "cache"
     home = tmp_path / "home"
@@ -257,9 +249,7 @@ def test_classify_plugin_prefix_not_found_falls_through() -> None:
     """Bucket name with ':' but no matching plugin — not plugin, so
     user-level or unknown."""
     plugins = {"known-plugin"}
-    assert (
-        classify_agent_source("stranger:agent", plugins, set()) == "unknown"
-    )
+    assert classify_agent_source("stranger:agent", plugins, set()) == "unknown"
 
 
 def test_classify_user_level_agent() -> None:
