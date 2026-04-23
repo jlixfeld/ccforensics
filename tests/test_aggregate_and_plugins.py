@@ -9,7 +9,7 @@ import pytest
 
 from ccforensics.index import ensure_schema, open_connection, reconcile_projects_dir
 from ccforensics.report.aggregate import query_aggregate
-from ccforensics.report.plugins import query_plugins
+from ccforensics.report.plugins import PluginRollup, query_plugins, render_plugins
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -239,3 +239,31 @@ def test_plugins_since_until_filters(tmp_path: Path, pricing_data: dict) -> None
     main_rollup = next((r for r in rows if r.plugin == "main"), None)
     assert main_rollup is not None
     assert main_rollup.session_count == 1
+
+
+def test_render_plugins_preserves_epoch_zero_seen() -> None:
+    """first_seen=0 / last_seen=0 must render as 1970-01-01, not '-'.
+
+    Guards against a falsy-check regression (``if r.first_seen``) that would
+    otherwise misreport a session legitimately anchored at epoch 0.
+    """
+    from io import StringIO
+
+    from rich.console import Console
+
+    rollup = PluginRollup(
+        plugin="main",
+        total_cost_usd=0.0,
+        session_count=1,
+        most_used_agent_type=None,
+        agent_type_count=0,
+        most_used_skill=None,
+        skill_count=0,
+        first_seen=0,
+        last_seen=0,
+    )
+    buf = StringIO()
+    Console(file=buf, width=120, force_terminal=False).print(render_plugins([rollup]))
+    out = buf.getvalue()
+    # Exactly two date cells: first_seen + last_seen both render as 1970-01-01.
+    assert out.count("1970-01-01") == 2

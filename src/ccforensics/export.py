@@ -18,9 +18,17 @@ def write_csv(rows: Iterable[Mapping[str, Any]], headers: list[str], out: TextIO
         writer.writerow({h: _csv_cell(row.get(h)) for h in headers})
 
 
+_FORMULA_INJECT_PREFIX = ("=", "+", "-", "@", "\t", "\r")
+
+
 def _csv_cell(v: Any) -> str:
     if v is None:
         return ""
     if isinstance(v, bool):
         return "true" if v else "false"
-    return str(v)
+    s = str(v)
+    # Guard against spreadsheet formula injection: prefix a single quote so
+    # Excel/LibreOffice render the cell as literal text, not a formula.
+    if s.startswith(_FORMULA_INJECT_PREFIX):
+        return "'" + s
+    return s

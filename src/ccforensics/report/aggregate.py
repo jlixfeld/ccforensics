@@ -1,4 +1,4 @@
-"""Aggregate cost across a date range, grouped per spec §5.4."""
+"""Aggregate cost across a date range, grouped by project / plugin / day / none."""
 
 from __future__ import annotations
 

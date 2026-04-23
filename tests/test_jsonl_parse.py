@@ -35,3 +35,29 @@ def test_unknown_type_recorded_not_crashed() -> None:
 def test_missing_file_raises(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         parse_file(tmp_path / "nope.jsonl")
+
+
+def test_oversized_line_is_skipped_with_warning(tmp_path: Path) -> None:
+    """A pathologically long line (> 16 MB, no newline) is dropped with a
+    warning — bounds memory under hostile input. Subsequent well-formed
+    lines still parse.
+    """
+    from ccforensics.jsonl import _MAX_LINE_BYTES
+
+    path = tmp_path / "oversize.jsonl"
+    # 17 MB of junk on line 1 (no newline until the end), then one valid entry.
+    junk = "x" * (_MAX_LINE_BYTES + 1024)
+    valid = (
+        '{"type":"user","uuid":"u1","sessionId":"s",'
+        '"timestamp":"2026-04-22T10:00:00Z","isSidechain":false,"isMeta":false,'
+        '"message":{"role":"user","content":"ok"}}'
+    )
+    path.write_text(junk + "\n" + valid + "\n")
+
+    result = parse_file(path)
+    # The oversize line was dropped.
+    assert result.parse_errors == 1
+    assert any("exceeded" in w and "skipped" in w for w in result.warnings)
+    # The valid trailing entry still parsed.
+    assert len(result.entries) == 1
+    assert result.entries[0].uuid == "u1"

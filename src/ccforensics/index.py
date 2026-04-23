@@ -37,11 +37,8 @@ _HOOK_INJECTION_MARKER = "<session-start-hook>"
 
 
 def _sanitize_prompt(text: str) -> str:
-    """Strip command/bash wrappers, replace IDE attachments, collapse whitespace, cap at 1000.
-
-    An empty string after sanitization is meaningful: callers treat it the
-    same as "no text block" and fall through to the next candidate prompt.
-    """
+    """Strip wrappers, replace IDE attachments, collapse whitespace, cap at 1000.
+    Empty result is meaningful — callers fall through to the next candidate."""
     text = _LOCAL_WRAPPER_RE.sub("", text)
     text = _COMMAND_WRAPPER_RE.sub("", text)
     text = _IDE_ATTACHMENT_RE.sub(lambda m: f"\U0001f4ce {m.group('path').strip()}", text)
@@ -63,11 +60,7 @@ def _is_pure_hook_injection(text: str) -> bool:
 
 CURRENT_SCHEMA_VERSION = 1
 
-# Ordered DDL statements applied when migrating from version N-1 to N.
-# To add a schema version, append a new entry to MIGRATIONS and bump
-# CURRENT_SCHEMA_VERSION.
 MIGRATIONS: list[list[str]] = [
-    # v0 -> v1: initial schema
     [
         """CREATE TABLE files (
             path            TEXT PRIMARY KEY,
@@ -278,12 +271,7 @@ def _reconcile_spawn(
     agent_id: str | None,
     parent_cache: dict[Path, list[TranscriptEntry]],
 ) -> None:
-    """Discover and write the ``subagent_spawns`` row for a subagent JSONL.
-
-    Caller ensures ``reconcile_file`` ran first. On missing parent file
-    or unresolvable linkage, still writes a row with null parent fields
-    so the subagent's cost is represented.
-    """
+    """Write the subagent_spawns row. Caller must have run reconcile_file first."""
     if agent_id is None:
         logger.warning("subagent %s has no agent_id; skipping spawn discovery", subagent_path)
         return
@@ -315,19 +303,9 @@ def _reconcile_spawn(
     if spawn is None:
         return
 
-    # Resolve parent_message_uuid → dedup_key.
-    #
-    # A single LLM response can stream multiple parallel Agent tool_uses,
-    # each serialized to disk as a separate raw entry sharing the same
-    # (msg.id, requestId) — hence the same dedup_key. Dedup collapses
-    # them to one ``messages`` row; that row's single ``tool_use_id``
-    # column only records one of the N tool_uses.
-    #
-    # So we can't rely on looking up messages by uuid or by
-    # ``tool_use_id``. Instead, compute the dedup_key from the raw parent
-    # entry (still in memory as ``parent_entries``) and look up by that.
-    # Every raw entry that collapses into the same ``messages`` row
-    # computes the same key.
+    # Parallel Agent tool_uses in one response share a dedup_key, so looking
+    # up messages by uuid or tool_use_id would miss. Compute the key from
+    # the raw parent entry and look up by that instead.
     parent_dedup_key: str | None = None
     if spawn.parent_message_uuid is not None:
         raw_parent = next(
@@ -475,6 +453,14 @@ def reconcile_file(conn: sqlite3.Connection, path: Path, pricing_data: dict[str,
     result = parse_file(path)
     annotated = annotate_cost(result.entries, pricing_data)
 
+    unresolved_models = {a.pricing_unresolved_model for a in annotated if a.pricing_unresolved_model}
+    for model in sorted(unresolved_models):
+        logger.warning(
+            "pricing unresolved for model %r in %s — messages recorded with NULL cost",
+            model,
+            path,
+        )
+
     seen: dict[str, tuple[TranscriptEntry, float | None]] = {}
     kept_non_keyed: list[tuple[TranscriptEntry, float | None]] = []
     for a in annotated:
@@ -498,7 +484,7 @@ def reconcile_file(conn: sqlite3.Connection, path: Path, pricing_data: dict[str,
             session_id,
             kind,
             agent_id,
-            next(iter(result.seen_versions), None) if result.seen_versions else None,
+            min(result.seen_versions, default=None),
             len(result.warnings),
             int(time.time()),
         ),
@@ -586,27 +572,8 @@ def _extract_summary(
 
 
 def recompute_session_summary(conn: sqlite3.Connection, session_id: str) -> None:
-    """Recompute the ``session_summaries`` row for ``session_id``.
-
-    Numeric fields come from SQL aggregation on ``messages``. Text fields
-    come from re-parsing the session's main JSONL (when one exists). If the
-    session has no rows in ``messages``, no summary row is written and any
-    pre-existing one is left alone.
-
-    Why we re-parse the main JSONL: the ``messages`` table doesn't store
-    ``cwd`` or the per-entry ``summary``/text fields needed by the summary
-    extraction chain (that would require a schema migration). Re-parsing is
-    the cheapest way to recover those without widening the schema.
-
-    Known drift: if the main file mutates between ``reconcile_file`` and
-    this call, the ``cwd`` read here reflects post-reconcile disk state
-    rather than what was indexed. This is acceptable because
-    ``reconcile_projects_dir`` calls this immediately after the file walk
-    (tiny window) and the ``FileNotFoundError`` path is caught by the
-    caller's per-session error-isolation wrapper (see
-    ``reconcile_projects_dir``), so a mid-pass delete doesn't abort the
-    remaining recomputes.
-    """
+    """Recompute session_summaries. Re-parses the main JSONL because the
+    messages table doesn't carry cwd or per-entry summary text."""
     agg = conn.execute(
         """SELECT MIN(ts), MAX(ts),
                   SUM(CASE WHEN role='user' AND is_meta=0 AND is_sidechain=0 THEN 1 ELSE 0 END),
@@ -636,14 +603,11 @@ def recompute_session_summary(conn: sqlite3.Connection, session_id: str) -> None
 
     if main_row is not None:
         main_path = Path(main_row[0])
-        # NOTE: double-parse — reconcile_file already parsed this file, but
-        # cwd + per-entry summary text aren't stored in messages, so we
-        # re-parse here. Caller (reconcile_projects_dir) must catch
-        # FileNotFoundError / OSError for mid-pass deletes.
+        # Caller (reconcile_projects_dir) catches FileNotFoundError/OSError
+        # to isolate mid-pass deletes.
         result = parse_file(main_path)
         entries = result.entries
 
-        # cwd from first entry that carries one (timestamp order).
         cwd_entry = next(
             (e for e in sorted(entries, key=lambda e: e.timestamp) if e.cwd),
             None,
@@ -697,14 +661,8 @@ def reconcile_projects_dir(
     projects_dir: Path,
     pricing_data: dict[str, Any],
 ) -> ReconcileStats:
-    """Walk the Claude Code projects directory and reconcile every *.jsonl file.
-
-    Includes both main session files and subagent files under <session>/subagents/.
-    Commits per file so a mid-walk interrupt only loses the file currently
-    being parsed (each ``reconcile_file`` is idempotent). After the file
-    loop, every session whose files changed has its ``session_summaries``
-    row recomputed.
-    """
+    """Walk the projects dir and reconcile every *.jsonl. Commits per file
+    so a mid-walk interrupt only drops the file currently being parsed."""
     stats = ReconcileStats()
     if not projects_dir.exists():
         return stats
@@ -736,7 +694,7 @@ def reconcile_projects_dir(
     try:
         populate_registry(conn, claude_plugins_cache_dir(), claude_home())
         conn.commit()
-    except Exception:
+    except (OSError, sqlite3.Error):
         logger.warning("failed to populate plugin registry; skipping", exc_info=True)
 
     skill_resolver = build_resolver_from_paths()
@@ -747,13 +705,14 @@ def reconcile_projects_dir(
             recompute_session_rollups(conn, sid)
             backfill_spawn_totals(conn, sid)
             populate_from_session_files(conn, sid, skill_resolver)
-        except Exception:
+        except (OSError, sqlite3.Error):
             # TOCTOU: Claude Code may delete/rotate a main file between the
-            # file walk and this pass, so parse_file raises FileNotFoundError.
-            # Other I/O errors (permissions, disk read) are similarly
-            # isolated here so one bad session can't abort the remaining
-            # recomputes or lose the final commit for sessions already
-            # summarized in this pass.
+            # file walk and this pass, so parse_file raises FileNotFoundError
+            # (an OSError subclass). Other I/O errors (permissions, disk read)
+            # and sqlite3 transient errors are similarly isolated so one bad
+            # session can't abort the remaining recomputes. Programmer errors
+            # (KeyError, AttributeError, ValueError) deliberately propagate —
+            # they indicate real bugs and should not be silently swallowed.
             logger.warning(
                 "failed to recompute per-session aggregates for session_id=%s; skipping",
                 sid,

@@ -54,11 +54,7 @@ class Attachment(BaseModel):
 
 
 class TranscriptEntry(BaseModel):
-    """Permissive, versioned container for a single JSONL line.
-
-    Required: type, timestamp. Everything else optional. Unknown top-level fields
-    preserved in `.extras`. Normalizes legacy field names at parse time.
-    """
+    """Permissive container for one JSONL line. Unknown fields preserved in .extras."""
 
     model_config = ConfigDict(extra="allow", populate_by_name=True)
 
@@ -113,11 +109,8 @@ KNOWN_TYPES: frozenset[str] = frozenset(
 
 
 def _normalize_message_content(raw: dict[str, Any]) -> None:
-    """Claude Code sometimes emits ``message.content`` as a bare string
-    (common for plain user text prompts); pydantic rejects that because the
-    ``Message.content`` field is typed ``list[ContentBlock]``. Wrap the
-    string into a single-element text block so validation proceeds and
-    downstream consumers see the list-of-blocks shape unchanged."""
+    """Wrap bare-string message.content into a single text block so pydantic
+    accepts it — Claude Code emits plain strings for simple user prompts."""
     msg = raw.get("message")
     if not isinstance(msg, dict):
         return
@@ -127,11 +120,7 @@ def _normalize_message_content(raw: dict[str, Any]) -> None:
 
 
 class SpawnMeta(BaseModel):
-    """Schema for ``agent-<id>.meta.json`` — the sibling metadata file
-    Claude Code writes next to a subagent JSONL. Only ``agentType`` and
-    ``description`` are consumed downstream; extras are preserved in
-    ``__pydantic_extra__`` for future use.
-    """
+    """Schema for agent-<id>.meta.json."""
 
     model_config = ConfigDict(extra="allow", populate_by_name=True)
 
@@ -140,14 +129,8 @@ class SpawnMeta(BaseModel):
 
 
 def load_meta_json(path: Path) -> SpawnMeta | None:
-    """Read and parse ``agent-<id>.meta.json``. Returns ``None`` on any
-    failure (missing file, malformed JSON, unexpected top-level shape),
-    with a warning logged so the caller can proceed without that linkage.
-
-    Missing-file is silent: older Claude Code versions and auto-compact
-    artifacts don't emit meta.json, and every caller must already handle
-    ``None``. Raising would just force try/except at every call site.
-    """
+    """Read agent-<id>.meta.json. Missing-file is silent because older Claude
+    Code versions and auto-compact artifacts don't emit it."""
     try:
         raw = path.read_text()
     except FileNotFoundError:
@@ -178,8 +161,7 @@ def load_meta_json(path: Path) -> SpawnMeta | None:
 
 
 def parse_entry(raw: dict[str, Any]) -> TranscriptEntry:
-    """Normalize legacy field names, then pydantic-parse. Never raises on
-    unknown types or extra fields."""
+    """Normalize legacy field names, then pydantic-parse."""
     if "parentToolUseId" in raw and "sourceToolUseID" not in raw:
         raw["sourceToolUseID"] = raw.pop("parentToolUseId")
     if "parentToolAssistantUuid" in raw and "sourceToolAssistantUUID" not in raw:

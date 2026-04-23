@@ -163,6 +163,86 @@ def test_resolver_miss_returns_none(tmp_path: Path) -> None:
     assert r.resolve_name("ghost:nope") == (None, None)
 
 
+def test_resolver_warns_on_broken_plugin_manifest(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A malformed plugin.json must log a warning, not disappear silently —
+    otherwise a single broken plugin erases its skills from every report."""
+    import logging as _lg
+
+    plugins_cache = tmp_path / "home" / "plugins" / "cache"
+    install = plugins_cache / "marketplace" / "broken-plugin" / "0.1.0"
+    (install / ".claude-plugin").mkdir(parents=True)
+    (install / ".claude-plugin" / "plugin.json").write_text("{not valid json")
+
+    caplog.set_level(_lg.WARNING, logger="ccforensics.skills")
+    _resolver(tmp_path)
+    assert any("unreadable manifest" in r.getMessage() for r in caplog.records)
+
+
+def test_resolver_picks_highest_version_when_multiple_installed(tmp_path: Path) -> None:
+    """When the plugin cache has two versions of the same plugin, the resolver
+    must register the higher-versioned one's skill path — deterministically,
+    not whichever glob surfaces first."""
+    plugins_cache = tmp_path / "home" / "plugins" / "cache"
+    # 0.1.10 (higher via numeric compare) and 0.1.2 (lower).
+    for version, content in [("0.1.10", "# newer\n"), ("0.1.2", "# older\n")]:
+        install = plugins_cache / "market" / "same-plugin" / version
+        (install / ".claude-plugin").mkdir(parents=True)
+        (install / ".claude-plugin" / "plugin.json").write_text(
+            json.dumps({"name": "same-plugin", "version": version})
+        )
+        skill_md = install / "skills" / "only-skill" / "SKILL.md"
+        skill_md.parent.mkdir(parents=True)
+        skill_md.write_text(content)
+
+    r = _resolver(tmp_path)
+    path, plugin = r.resolve_name("same-plugin:only-skill")
+    assert plugin == "same-plugin"
+    assert path is not None
+    # Path must point at the 0.1.10 install, not 0.1.2.
+    assert "/0.1.10/" in str(path)
+    assert path.read_text() == "# newer\n"
+
+
+def test_resolver_plugin_and_user_skills_coexist_with_same_name(tmp_path: Path) -> None:
+    """A plugin X and a user-level skill both named 'common' must resolve
+    independently — plugin lookup via ``X:common``, user via ``common``.
+    Pin this contract; collision warnings live in the registry layer."""
+    _write_plugin_skill(
+        tmp_path / "home" / "plugins" / "cache",
+        "plug",
+        "common",
+        "# plugin\n",
+    )
+    _write_user_skill(tmp_path / "home", "common", "# user\n")
+
+    r = _resolver(tmp_path)
+    plugin_path, plugin_name = r.resolve_name("plug:common")
+    user_path, user_plugin = r.resolve_name("common")
+
+    assert plugin_name == "plug"
+    assert plugin_path is not None and plugin_path.read_text() == "# plugin\n"
+    assert user_plugin is None
+    assert user_path is not None and user_path.read_text() == "# user\n"
+
+
+def test_resolver_warns_on_non_string_plugin_name(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """plugin.json with a non-string ``name`` must warn, not skip silently."""
+    import logging as _lg
+
+    plugins_cache = tmp_path / "home" / "plugins" / "cache"
+    install = plugins_cache / "marketplace" / "weird-plugin" / "0.1.0"
+    (install / ".claude-plugin").mkdir(parents=True)
+    (install / ".claude-plugin" / "plugin.json").write_text(json.dumps({"name": 42}))
+
+    caplog.set_level(_lg.WARNING, logger="ccforensics.skills")
+    _resolver(tmp_path)
+    assert any("non-string 'name'" in r.getMessage() for r in caplog.records)
+
+
 # ---------- Channel A: Skill tool ----------
 
 
@@ -238,6 +318,38 @@ def test_channel_b_ignores_non_skill_reads(tmp_path: Path) -> None:
     assert detect_activations([entry], "sess-1", _resolver(tmp_path)) == []
 
 
+def test_channel_a_and_channel_b_both_fire_for_same_skill(tmp_path: Path) -> None:
+    """Current behavior: a session that both invokes Skill(name='X') AND
+    Reads the SKILL.md for X produces TWO activations — one per channel.
+    Pin this contract so it can't silently change.
+    """
+    skill_md = _write_plugin_skill(
+        tmp_path / "home" / "plugins" / "cache",
+        "superpowers",
+        "debugging",
+    )
+    a_entry = _assistant_with_tool_use(
+        "u1",
+        "2026-04-22T10:00:00Z",
+        tool_name="Skill",
+        tool_input={"skill": "superpowers:debugging"},
+        msg_id="m1",
+        req_id="r1",
+    )
+    b_entry = _assistant_with_tool_use(
+        "u2",
+        "2026-04-22T10:00:05Z",
+        tool_name="Read",
+        tool_input={"file_path": str(skill_md)},
+        msg_id="m2",
+        req_id="r2",
+    )
+    acts = detect_activations([a_entry, b_entry], "sess-1", _resolver(tmp_path))
+    sources = sorted(a.source for a in acts)
+    assert sources == ["read", "skill-tool"]
+    assert all(a.skill_name == "debugging" for a in acts)
+
+
 # ---------- Channel C: SessionStart hook injection ----------
 
 
@@ -283,7 +395,11 @@ def test_channel_c_fallback_bootstrap_heuristic(tmp_path: Path) -> None:
     assert acts[0].skill_name == "using-superpowers"
 
 
-def test_channel_c_malformed_stdout_is_ignored(tmp_path: Path) -> None:
+def test_channel_c_malformed_stdout_is_ignored(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging as _lg
+
     entry = parse_entry(
         {
             "type": "attachment",
@@ -300,7 +416,14 @@ def test_channel_c_malformed_stdout_is_ignored(tmp_path: Path) -> None:
             },
         }
     )
+    caplog.set_level(_lg.WARNING, logger="ccforensics.skills")
     assert detect_activations([entry], "sess-1", _resolver(tmp_path)) == []
+    # Malformed payload must not disappear silently — a hook-format drift is
+    # exactly the condition a forensics tool should flag.
+    assert any(
+        "not valid JSON" in r.getMessage() and "sess-1" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 def test_channel_c_ignores_other_hook_events(tmp_path: Path) -> None:

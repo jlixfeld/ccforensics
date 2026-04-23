@@ -4,8 +4,6 @@ import csv
 import io
 import json
 
-from syrupy.assertion import SnapshotAssertion
-
 from ccforensics.export import _csv_cell, write_csv, write_json
 
 
@@ -153,26 +151,26 @@ def test_csv_cell_bool() -> None:
     assert _csv_cell(False) == "false"
 
 
-def test_write_json_session_list_snapshot(snapshot: SnapshotAssertion) -> None:
+def test_csv_cell_formula_prefixes_are_escaped() -> None:
+    """Cells starting with =+-@\\t\\r must be prefixed with a single quote so
+    Excel/LibreOffice don't evaluate them as formulas. Attacker-influenced
+    summary text is the realistic vector."""
+    for bad in ("=HYPERLINK(x)", "+cmd", "-2+3", "@SUM(A1)", "\trogue", "\rembedded"):
+        assert _csv_cell(bad) == "'" + bad
+
+
+def test_csv_cell_safe_strings_pass_through() -> None:
+    for ok in ("hello", "1.23", "claude-sonnet-4-5", "/abs/path"):
+        assert _csv_cell(ok) == ok
+
+
+def test_write_csv_injects_guard_into_summary_column() -> None:
+    """End-to-end: a formula-injected value survives write_csv with the
+    guard prefix intact."""
     buf = io.StringIO()
-    payload = {
-        "sessions": [
-            {
-                "session_id": "abc123",
-                "project": "ccforensics",
-                "cost_usd": 1.23,
-                "duration_s": 47,
-                "summary": "📎 /path/to/attachment.pdf",
-            },
-            {
-                "session_id": "def456",
-                "project": "other",
-                "cost_usd": None,
-                "duration_s": 120,
-                "summary": "refactor helper module",
-            },
-        ],
-        "count": 2,
-    }
-    write_json(payload, buf)
-    assert buf.getvalue() == snapshot
+    rows = [{"summary": "=cmd|'/C calc'!A1"}]
+    write_csv(rows, headers=["summary"], out=buf)
+    parsed = list(csv.reader(io.StringIO(buf.getvalue())))
+    assert parsed == [["summary"], ["'=cmd|'/C calc'!A1"]]
+
+

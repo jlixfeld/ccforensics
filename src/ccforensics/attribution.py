@@ -1,67 +1,48 @@
-"""Attribution: classify each message into a bucket + populate session_rollups.
-
-Buckets (spec §4.2):
-
-- ``main``: message in a main session JSONL.
-- ``subagent:<type>``: message in a subagent JSONL with a resolvable
-  spawn. ``<type>`` comes from ``subagent_spawns.subagent_type``
-  (meta.json::agentType else parent tool_use input.subagent_type).
-- ``auto-compact``: message in an ``agent-acompact-<hex>.jsonl`` file —
-  Claude Code's internal compaction worker; billable but not
-  user-spawned.
-- ``unattributed``: subagent JSONL with an unresolvable parent, or
-  subagent_type missing entirely.
-
-Hard invariant: ``sum(rollups) == sum(messages.cost_usd)`` per session,
-because every message is in exactly one bucket. Classification is
-SQL-driven, so the invariant is automatic rather than asserted.
-
-``subagent_spawns.total_*`` columns are backfilled per-session as the
-sum of each child file's own messages. Recursive rollup (a spawn
-totalling its nested spawns' cost) is deferred — the per-file totals
-are the right granularity for the session-level bucket view.
-"""
+"""Classify messages into buckets and populate session_rollups."""
 
 from __future__ import annotations
 
 import logging
 import sqlite3
+from enum import StrEnum
 
 logger = logging.getLogger("ccforensics.attribution")
 
 
-_BUCKET_KIND_EXPR = """
+class BucketKind(StrEnum):
+    MAIN = "main"
+    AUTO_COMPACT = "auto-compact"
+    SUBAGENT = "subagent"
+    UNATTRIBUTED = "unattributed"
+
+
+_BUCKET_KIND_EXPR = f"""
     CASE
-        WHEN f.kind = 'main'         THEN 'main'
-        WHEN f.kind = 'auto-compact' THEN 'auto-compact'
+        WHEN f.kind = 'main'         THEN '{BucketKind.MAIN}'
+        WHEN f.kind = 'auto-compact' THEN '{BucketKind.AUTO_COMPACT}'
         WHEN f.kind = 'subagent'
              AND s.parent_message_dedup_key IS NOT NULL
              AND s.subagent_type IS NOT NULL
-            THEN 'subagent'
-        ELSE 'unattributed'
+            THEN '{BucketKind.SUBAGENT}'
+        ELSE '{BucketKind.UNATTRIBUTED}'
     END
 """
 
-_BUCKET_NAME_EXPR = """
+_BUCKET_NAME_EXPR = f"""
     CASE
-        WHEN f.kind = 'main'         THEN 'main'
-        WHEN f.kind = 'auto-compact' THEN 'auto-compact'
+        WHEN f.kind = 'main'         THEN '{BucketKind.MAIN}'
+        WHEN f.kind = 'auto-compact' THEN '{BucketKind.AUTO_COMPACT}'
         WHEN f.kind = 'subagent'
              AND s.parent_message_dedup_key IS NOT NULL
              AND s.subagent_type IS NOT NULL
             THEN s.subagent_type
-        ELSE 'unattributed'
+        ELSE '{BucketKind.UNATTRIBUTED}'
     END
 """
 
 
 def recompute_session_rollups(conn: sqlite3.Connection, session_id: str) -> None:
-    """Recompute ``session_rollups`` rows for ``session_id``.
-
-    Deletes existing rows for the session and re-inserts one row per
-    (bucket_kind, bucket_name) present in the session's messages.
-    Sessions with zero messages produce no rows.
-    """
+    """Delete and re-insert one rollup row per (bucket_kind, bucket_name)."""
     conn.execute("DELETE FROM session_rollups WHERE session_id = ?", (session_id,))
     conn.execute(
         f"""
@@ -90,10 +71,7 @@ def recompute_session_rollups(conn: sqlite3.Connection, session_id: str) -> None
 
 
 def backfill_spawn_totals(conn: sqlite3.Connection, session_id: str) -> None:
-    """Populate ``subagent_spawns.total_*`` for every spawn whose parent
-    session is ``session_id`` — direct-cost only (the child file's own
-    messages, no nested rollup).
-    """
+    """Populate subagent_spawns.total_* — direct cost only, no nested rollup."""
     conn.execute(
         """
         UPDATE subagent_spawns
@@ -137,13 +115,7 @@ def backfill_spawn_totals(conn: sqlite3.Connection, session_id: str) -> None:
 def verify_invariant(
     conn: sqlite3.Connection, session_id: str, tolerance: float = 1e-6
 ) -> tuple[bool, float, float]:
-    """Check ``sum(rollups.cost_usd) == sum(messages.cost_usd)``.
-
-    Returns ``(passed, session_total, rollup_total)``. NULL costs are
-    ignored on both sides (messages with unresolvable pricing don't
-    contribute to either). Tolerance is an absolute-difference check in
-    dollars.
-    """
+    """Return (passed, session_total, rollup_total). NULL costs skipped."""
     session_total = conn.execute(
         "SELECT COALESCE(SUM(cost_usd), 0.0) FROM messages WHERE session_id = ?",
         (session_id,),

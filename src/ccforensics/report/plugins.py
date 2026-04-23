@@ -1,4 +1,4 @@
-"""Per-plugin all-time rollup (spec §5.5)."""
+"""Per-plugin cost and session rollup."""
 
 from __future__ import annotations
 
@@ -180,11 +180,13 @@ def render_plugins(rows: list[PluginRollup]) -> Table:
     for r in rows:
         first = (
             datetime.fromtimestamp(r.first_seen, tz=UTC).strftime("%Y-%m-%d")
-            if r.first_seen
+            if r.first_seen is not None
             else "-"
         )
         last = (
-            datetime.fromtimestamp(r.last_seen, tz=UTC).strftime("%Y-%m-%d") if r.last_seen else "-"
+            datetime.fromtimestamp(r.last_seen, tz=UTC).strftime("%Y-%m-%d")
+            if r.last_seen is not None
+            else "-"
         )
         agent = (
             f"{r.most_used_agent_type} ({r.agent_type_count})" if r.most_used_agent_type else "-"

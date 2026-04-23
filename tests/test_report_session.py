@@ -278,3 +278,75 @@ def test_report_cost_totals_match_session_total(tmp_path: Path, pricing_data: di
     bucket_total = sum(b.cost_usd for b in report.buckets)
     assert report.header.total_cost_usd is not None
     assert abs(bucket_total - report.header.total_cost_usd) < 1e-6
+
+
+def test_render_handles_zero_cost_and_empty_tables() -> None:
+    """A session with total_cost_usd=0.0 and no buckets/plugins must still
+    render — no divide-by-zero, no broken tables, no crash. Covers the
+    degenerate case of an empty/user-only session before any billable
+    activity lands."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    from ccforensics.report.session import (
+        ParseNotes,
+        SessionHeader,
+        SessionReport,
+        render_session_report,
+    )
+
+    header = SessionHeader(
+        session_id="empty-sid",
+        project_path="/home/test/proj",
+        started_at=1_713_600_000,
+        last_active_at=1_713_600_030,
+        duration_s=30,
+        turn_count=0,
+        total_cost_usd=0.0,
+        models_seen=[],
+        summary_text=None,
+        summary_source=None,
+    )
+    report = SessionReport(
+        header=header,
+        buckets=[],
+        plugins=[],
+        unattributed_items=[],
+        parse_notes=ParseNotes(schema_versions=[], parse_warnings_total=0, files_count=0),
+    )
+    buf = StringIO()
+    Console(file=buf, width=120, force_terminal=False).print(render_session_report(report))
+    out = buf.getvalue()
+    assert "empty-sid" in out
+    assert "$0.00" in out
+    assert "Cost by bucket" in out
+    assert "Cost by plugin" in out
+
+
+def test_skill_ledger_zero_cost_renders_dollar_zero() -> None:
+    """estimated_cost_usd=0.0 must render as $0.00, not '-'.
+
+    Guards against a falsy-check regression (``if entry.estimated_cost_usd``)
+    that would otherwise suppress legitimate zero-cost activations.
+    """
+    from io import StringIO
+
+    from rich.console import Console
+
+    from ccforensics.report.session import SkillLedgerEntry, _render_skill_ledger
+
+    entry = SkillLedgerEntry(
+        activated_at=1_713_600_000,
+        skill_name="my-skill",
+        plugin_name=None,
+        source="skill-tool",
+        content_size=100,
+        skill_path="/tmp/skills/my-skill/SKILL.md",
+        estimated_cost_usd=0.0,
+        estimated_cost_band_usd=None,
+    )
+    buf = StringIO()
+    Console(file=buf, width=120, force_terminal=False).print(_render_skill_ledger([entry]))
+    out = buf.getvalue()
+    assert "$0.00" in out

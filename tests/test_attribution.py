@@ -353,6 +353,56 @@ def test_invariant_sum_buckets_equals_session_total(tmp_path: Path, pricing_data
     assert session_total > 0
 
 
+def test_invariant_holds_when_pricing_unresolved(tmp_path: Path, pricing_data: dict) -> None:
+    """A session with some messages having NULL cost_usd (unresolved pricing)
+    must still satisfy the invariant — session_total and rollup_total both
+    COALESCE NULL→0, so the equality holds on the resolvable slice."""
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    sid = "sess-partial"
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            _user("u1", sid, "2026-04-22T10:00:00Z", "go", cwd="/home/test"),
+            _assistant(
+                "u2",
+                sid,
+                "2026-04-22T10:00:10Z",
+                msg_id="m1",
+                req_id="r1",
+                model="claude-sonnet-4-5-20250929",
+                input_tokens=100,
+                output_tokens=50,
+            ),
+            _assistant(
+                "u3",
+                sid,
+                "2026-04-22T10:00:20Z",
+                msg_id="m2",
+                req_id="r2",
+                model="unreleased-model-xyz-20300101",
+                input_tokens=200,
+                output_tokens=100,
+            ),
+        ],
+    )
+
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    ok, session_total, rollup_total = verify_invariant(conn, sid)
+    assert ok, f"session={session_total} rollup={rollup_total}"
+    # session_total reflects only the resolvable entry.
+    assert session_total > 0
+    # The unresolvable message is present but its cost_usd is NULL.
+    nulls = conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id=? AND cost_usd IS NULL", (sid,)
+    ).fetchone()[0]
+    assert nulls == 1
+
+
 # ---------- spawn totals backfill ----------
 
 

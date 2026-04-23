@@ -36,6 +36,88 @@ def test_verbose_flag_is_accepted() -> None:
     assert result.exit_code == 0
 
 
+def test_pricing_fallback_prints_banner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When PricingCache lands in the hardcoded-fallback path, the CLI
+    surfaces a banner on stderr — otherwise users would see fabricated
+    costs with no indication the network lookup failed."""
+    from ccforensics import pricing as pricing_mod
+
+    def _raise(*_a: object, **_k: object) -> None:
+        raise RuntimeError("simulated offline")
+
+    monkeypatch.setattr(pricing_mod.PricingCache, "_fetch_and_store", _raise)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    (tmp_path / ".claude" / "projects").mkdir(parents=True)
+    runner = CliRunner()
+    result = runner.invoke(main, ["aggregate"])
+    assert result.exit_code == 0
+    assert "built-in fallback" in result.stderr
+
+
+def test_pricing_stale_prints_banner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stale cache (refresh failure with cache present) also surfaces a banner."""
+    import json as _json
+
+    from ccforensics import pricing as pricing_mod
+    from ccforensics.paths import ccforensics_cache_dir
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    (tmp_path / ".claude" / "projects").mkdir(parents=True)
+    # Seed a stale cache at whatever path platformdirs resolves to under the
+    # redirected envs — no guessing between Linux/macOS layouts.
+    data = _json.loads((FIXTURES / "litellm" / "model_prices.json").read_text())
+    cache_dir = ccforensics_cache_dir()
+    (cache_dir / "litellm.json").write_text(_json.dumps({"fetched_at": 0, "data": data}))
+
+    def _raise(*_a: object, **_k: object) -> None:
+        raise RuntimeError("simulated refresh failure")
+
+    monkeypatch.setattr(pricing_mod.PricingCache, "_fetch_and_store", _raise)
+    runner = CliRunner()
+    result = runner.invoke(main, ["aggregate"])
+    assert result.exit_code == 0
+    assert "last cached pricing" in result.stderr
+
+
+def test_main_installs_stderr_log_handler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """main() must call logging.basicConfig so module warnings reach stderr.
+
+    Without this, every ``logger.warning(...)`` in pricing/registry/index/skills
+    is silently discarded. Covers the Tier 1 audit finding that the CLI never
+    configured Python logging.
+    """
+    import logging as lg
+
+    root = lg.getLogger()
+    original_handlers = list(root.handlers)
+    original_level = root.level
+    for h in original_handlers:
+        root.removeHandler(h)
+    try:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        runner = CliRunner()
+        result = runner.invoke(main, ["index", "stats"])
+        assert result.exit_code == 0
+        assert any(isinstance(h, lg.StreamHandler) for h in root.handlers), (
+            "main() should install a StreamHandler on the root logger"
+        )
+    finally:
+        for h in list(root.handlers):
+            root.removeHandler(h)
+        for h in original_handlers:
+            root.addHandler(h)
+        root.setLevel(original_level)
+
+
 def test_index_stats_on_missing_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
@@ -138,6 +220,55 @@ def _write_synthetic_session(
             f.write(json.dumps(e))
             f.write("\n")
     return path
+
+
+def test_session_show_prefix_not_found_exits_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unknown prefix must exit code 2 with a helpful stderr message —
+    not a crash, and not a silent zero-rows response."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    _seed_pricing_cache(tmp_path)
+    (tmp_path / ".claude" / "projects").mkdir(parents=True)
+    runner = CliRunner()
+    result = runner.invoke(main, ["session", "show", "--no-refresh", "nonexistent123"])
+    assert result.exit_code == 2
+    assert "no session matches" in result.stderr
+    assert "nonexistent123" in result.stderr
+
+
+def test_session_show_ambiguous_prefix_exits_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prefix matching multiple sessions must exit code 2 with both ids
+    listed on stderr so the user can disambiguate."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    _seed_pricing_cache(tmp_path)
+    projects = tmp_path / ".claude" / "projects"
+    # Both sessions share the "ambig1" prefix.
+    _write_synthetic_session(
+        projects,
+        session_id="ambig1-aaaa",
+        encoded_dir="-home-test-proj",
+        first_prompt="first",
+    )
+    _write_synthetic_session(
+        projects,
+        session_id="ambig1-bbbb",
+        encoded_dir="-home-test-proj2",
+        first_prompt="second",
+    )
+    runner = CliRunner()
+    rebuild = runner.invoke(main, ["index", "rebuild", "--force", "--yes"])
+    assert rebuild.exit_code == 0, rebuild.output
+
+    result = runner.invoke(main, ["session", "show", "--no-refresh", "ambig1"])
+    assert result.exit_code == 2
+    assert "matches 2 sessions" in result.stderr
+    assert "ambig1-aaaa" in result.stderr
+    assert "ambig1-bbbb" in result.stderr
 
 
 def test_session_list_no_sessions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -414,6 +545,37 @@ def test_session_list_table_renders_summary(
     assert "distinct-marker-xyzzy" in result.output
     # Short UUID prefix appears.
     assert "abc123" in result.output
+
+
+def test_session_list_narrow_terminal_drops_project_column(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """At COLUMNS=80, render_session_list switches to narrow mode and drops
+    the Project column. Covers the _detect_console_width env-variable path.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setenv("COLUMNS", "80")
+    _seed_pricing_cache(tmp_path)
+    projects = tmp_path / ".claude" / "projects"
+    _write_synthetic_session(
+        projects,
+        session_id="narrow1xyz",
+        encoded_dir="-home-test-proj",
+        first_prompt="first prompt",
+    )
+
+    runner = CliRunner()
+    rebuild = runner.invoke(main, ["index", "rebuild", "--force", "--yes"])
+    assert rebuild.exit_code == 0, rebuild.output
+
+    result = runner.invoke(main, ["session", "list", "--no-refresh"])
+    assert result.exit_code == 0, result.output
+    # The Project column is suppressed in narrow mode.
+    assert "Project" not in result.output
+    # Other core columns remain.
+    assert "UUID" in result.output
+    assert "Summary" in result.output
 
 
 def test_session_list_default_refreshes_index(

@@ -42,26 +42,37 @@ def test_first_reconcile_inserts_files_and_messages(tmp_path: Path, pricing_data
     assert msg_count > 0
 
 
-def test_reconcile_unchanged_file_is_noop(tmp_path: Path, pricing_data: dict) -> None:
+def test_reconcile_unchanged_file_is_noop(
+    tmp_path: Path, pricing_data: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unchanged file short-circuits before parse_file. Uses a parse counter
+    rather than wall-clock sleep — the short-circuit fact is what matters,
+    not whether `last_parsed_at` seconds-resolution tick forward.
+    """
+    from ccforensics import index as index_mod
+
     db = tmp_path / "index.sqlite"
     conn = open_connection(db)
     ensure_schema(conn)
     src = FIXTURES / "basic" / "s1.jsonl"
 
+    parse_calls = {"n": 0}
+    real_parse = index_mod.parse_file
+
+    def _counting_parse(path: Path) -> Any:
+        parse_calls["n"] += 1
+        return real_parse(path)
+
+    monkeypatch.setattr(index_mod, "parse_file", _counting_parse)
+
     reconcile_file(conn, src, pricing_data)
     conn.commit()
-    first_last_parsed = conn.execute(
-        "SELECT last_parsed_at FROM files WHERE path=?", (str(src),)
-    ).fetchone()[0]
+    assert parse_calls["n"] == 1
 
-    time.sleep(1.1)
     reconcile_file(conn, src, pricing_data)
     conn.commit()
-    second_last_parsed = conn.execute(
-        "SELECT last_parsed_at FROM files WHERE path=?", (str(src),)
-    ).fetchone()[0]
-
-    assert first_last_parsed == second_last_parsed, "unchanged file should be skipped"
+    # Second call should hit _row_is_unchanged and skip parse_file entirely.
+    assert parse_calls["n"] == 1, "unchanged file should be skipped"
 
 
 def test_subagents_dir_with_malformed_filename_warns(
@@ -537,3 +548,202 @@ def test_subagent_missing_parent_file_writes_null_parent(
     # Warning mentions the parent-file path.
     parent_hint = f"{session_id}.jsonl"
     assert any(parent_hint in r.getMessage() for r in caplog.records)
+
+
+def test_unresolved_pricing_model_emits_warning(
+    tmp_path: Path, pricing_data: dict, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An assistant entry whose model isn't in the pricing table is recorded
+    with NULL cost AND surfaces a warning — otherwise under-reporting totals
+    silently would look indistinguishable from zero-cost sessions."""
+    import logging as _lg
+
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    enc.mkdir(parents=True)
+    _write_jsonl(
+        enc / "s.jsonl",
+        [
+            {
+                "type": "user",
+                "uuid": "u1",
+                "sessionId": "s",
+                "timestamp": "2026-04-22T10:00:00Z",
+                "isSidechain": False,
+                "isMeta": False,
+                "message": {"role": "user", "content": "hi"},
+            },
+            {
+                "type": "assistant",
+                "uuid": "a1",
+                "sessionId": "s",
+                "timestamp": "2026-04-22T10:00:05Z",
+                "isSidechain": False,
+                "isMeta": False,
+                "requestId": "r1",
+                "message": {
+                    "id": "m1",
+                    "role": "assistant",
+                    "model": "unreleased-model-xyz-20300101",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            },
+        ],
+    )
+
+    db = tmp_path / "idx.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    caplog.set_level(_lg.WARNING, logger="ccforensics.index")
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    assert any(
+        "pricing unresolved" in r.getMessage()
+        and "unreleased-model-xyz-20300101" in r.getMessage()
+        for r in caplog.records
+    )
+    # The message row survives with NULL cost.
+    row = conn.execute(
+        "SELECT cost_usd FROM messages WHERE session_id='s' AND type='assistant'"
+    ).fetchone()
+    assert row is not None
+    assert row[0] is None
+
+
+def test_per_session_recompute_propagates_programmer_errors(
+    tmp_path: Path,
+    pricing_data: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A KeyError/AttributeError inside per-session recompute is a real bug
+    and MUST propagate, not get silently swallowed by a broad except.
+
+    The catch in reconcile_projects_dir is narrowed to (OSError, sqlite3.Error)
+    so TOCTOU on session files still gets isolated, but genuine programmer
+    errors surface instead of corrupting attribution silently.
+    """
+    from ccforensics import index as index_mod
+
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    enc.mkdir(parents=True)
+    _write_jsonl(
+        enc / "sess.jsonl",
+        [
+            {
+                "type": "user",
+                "uuid": "u1",
+                "sessionId": "sess",
+                "timestamp": "2026-04-22T10:00:00Z",
+                "isSidechain": False,
+                "isMeta": False,
+                "message": {"role": "user", "content": "hi"},
+            }
+        ],
+    )
+
+    def _boom(*_a: object, **_k: object) -> None:
+        raise KeyError("simulated programmer bug")
+
+    monkeypatch.setattr(index_mod, "recompute_session_summary", _boom)
+
+    db = tmp_path / "idx.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    with pytest.raises(KeyError, match="simulated programmer bug"):
+        reconcile_projects_dir(conn, proj, pricing_data)
+
+
+def test_per_session_recompute_isolates_toctou_oserror(
+    tmp_path: Path,
+    pricing_data: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A FileNotFoundError (TOCTOU: file deleted between walk + recompute)
+    is the documented reason for the catch — it must stay isolated."""
+    import logging as _lg
+
+    from ccforensics import index as index_mod
+
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    enc.mkdir(parents=True)
+    _write_jsonl(
+        enc / "sess.jsonl",
+        [
+            {
+                "type": "user",
+                "uuid": "u1",
+                "sessionId": "sess",
+                "timestamp": "2026-04-22T10:00:00Z",
+                "isSidechain": False,
+                "isMeta": False,
+                "message": {"role": "user", "content": "hi"},
+            }
+        ],
+    )
+
+    def _raise_fnf(*_a: object, **_k: object) -> None:
+        raise FileNotFoundError("simulated rotate")
+
+    monkeypatch.setattr(index_mod, "recompute_session_summary", _raise_fnf)
+
+    db = tmp_path / "idx.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    caplog.set_level(_lg.WARNING, logger="ccforensics.index")
+    # Should NOT raise — isolated by the narrow catch.
+    reconcile_projects_dir(conn, proj, pricing_data)
+    assert any("failed to recompute" in r.getMessage() for r in caplog.records)
+
+
+def test_schema_version_selection_is_deterministic(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """A file containing multiple schema versions must store the minimum.
+
+    Set iteration order is non-deterministic across runs, so picking via
+    ``next(iter(set))`` can stably-but-surprisingly flip. We pin to the
+    numerically lowest version via ``min()``.
+    """
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    sid = "mvs"
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            {
+                "type": "user",
+                "uuid": f"u-{sid}-1",
+                "sessionId": sid,
+                "timestamp": "2026-04-22T10:00:00Z",
+                "isSidechain": False,
+                "isMeta": False,
+                "version": "2.0.70",
+                "message": {"role": "user", "content": "hi"},
+            },
+            {
+                "type": "user",
+                "uuid": f"u-{sid}-2",
+                "sessionId": sid,
+                "timestamp": "2026-04-22T10:00:01Z",
+                "isSidechain": False,
+                "isMeta": False,
+                "version": "1.0.65",
+                "message": {"role": "user", "content": "again"},
+            },
+        ],
+    )
+
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    row = conn.execute(
+        "SELECT schema_version FROM files WHERE session_id=?", (sid,)
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "1.0.65"

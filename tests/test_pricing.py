@@ -40,12 +40,12 @@ def test_substring_fallback_emits_warning(
     import logging
 
     caplog.set_level(logging.WARNING, logger="ccforensics.pricing")
-    # Hypothetical future-version that isn't in any candidate (no
-    # 'claude-{model}' / 'anthropic/{model}' match), so it falls through to
-    # substring matching on something like the Bedrock alias.
-    resolve_pricing("us.anthropic.claude-sonnet", pricing_data)
+    # Wrapped/namespaced model whose tail IS an exact LiteLLM key — substring
+    # fallback (kl-in-lowered direction) must resolve it and emit a warning.
+    resolve_pricing("custom-wrap/claude-sonnet-4-5-20250929", pricing_data)
     assert any(
-        "substring fallback" in rec.message and "us.anthropic.claude-sonnet" in rec.message
+        "substring fallback" in rec.message
+        and "custom-wrap/claude-sonnet-4-5-20250929" in rec.message
         for rec in caplog.records
     )
 
@@ -60,6 +60,29 @@ def test_exact_match_does_not_warn(pricing_data: dict, caplog: pytest.LogCapture
 
 def test_returns_none_for_unknown(pricing_data: dict) -> None:
     assert resolve_pricing("definitely-not-a-real-model", pricing_data) is None
+
+
+def test_short_alias_prefix_returns_none_not_arbitrary_variant(pricing_data: dict) -> None:
+    """A short bedrock/vertex prefix like ``us.anthropic.claude-sonnet`` must
+    NOT silently resolve to one of several specific variants (4-5, 4-6, …)
+    with different prices. Returning None forces the caller to provide a
+    fully-qualified model name — the correct signal for 'unknown pricing'."""
+    assert resolve_pricing("us.anthropic.claude-sonnet", pricing_data) is None
+
+
+def test_substring_fallback_picks_longest_match(pricing_data: dict) -> None:
+    """When multiple LiteLLM keys are substrings of the model name, the
+    LONGEST (most specific) key must win — deterministic across runs."""
+    # Both ``claude-sonnet-4-5`` and ``claude-sonnet-4-5-20250929`` exist as
+    # keys with (possibly) different prices. A wrapper name containing both
+    # must pick the longer, date-suffixed key.
+    p = resolve_pricing("wrap/claude-sonnet-4-5-20250929/v1", pricing_data)
+    assert p is not None
+    # The long key's price matches the exact-entry price.
+    expected = resolve_pricing("claude-sonnet-4-5-20250929", pricing_data)
+    assert expected is not None
+    assert p.input_cost == expected.input_cost
+    assert p.output_cost == expected.output_cost
 
 
 def test_model_price_fills_cache_fields_from_ratio_when_missing() -> None:
@@ -123,6 +146,7 @@ def test_pricing_cache_reads_fresh_snapshot(tmp_path: Path, pricing_data: dict) 
     cache = PricingCache(cache_file=cache_file, ttl_seconds=86400)
     data = cache.load_or_fetch(http_client=_unreachable_client())
     assert "claude-sonnet-4-5-20250929" in data
+    assert cache.last_source == "cached"
 
 
 def test_pricing_cache_falls_back_to_stale_on_fetch_failure(
@@ -133,6 +157,7 @@ def test_pricing_cache_falls_back_to_stale_on_fetch_failure(
     cache = PricingCache(cache_file=cache_file, ttl_seconds=86400)
     data = cache.load_or_fetch(http_client=_failing_client())
     assert "claude-sonnet-4-5-20250929" in data
+    assert cache.last_source == "stale"
 
 
 def test_pricing_cache_falls_back_to_hardcoded_when_empty(tmp_path: Path) -> None:
@@ -140,6 +165,81 @@ def test_pricing_cache_falls_back_to_hardcoded_when_empty(tmp_path: Path) -> Non
     cache = PricingCache(cache_file=cache_file, ttl_seconds=86400)
     data = cache.load_or_fetch(http_client=_failing_client())
     assert "claude-sonnet-4-5-20250929" in data
+    assert cache.last_source == "fallback"
+
+
+def test_pricing_cache_corrupt_json_refetches(tmp_path: Path, pricing_data: dict) -> None:
+    """Malformed cache JSON must not crash — fall through to refetch."""
+    cache_file = tmp_path / "litellm.json"
+    cache_file.write_text("{not valid json")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=pricing_data)
+
+    cache = PricingCache(cache_file=cache_file, ttl_seconds=86400)
+    data = cache.load_or_fetch(http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert cache.last_source == "fresh"
+    assert "claude-sonnet-4-5-20250929" in data
+
+
+def test_pricing_cache_missing_data_key_refetches(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """Cache wrapper with no ``data`` key must refetch, not return empty dict."""
+    cache_file = tmp_path / "litellm.json"
+    cache_file.write_text(json.dumps({"fetched_at": 9999999999}))
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=pricing_data)
+
+    cache = PricingCache(cache_file=cache_file, ttl_seconds=86400)
+    data = cache.load_or_fetch(http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert cache.last_source == "fresh"
+    assert "claude-sonnet-4-5-20250929" in data
+
+
+def test_pricing_cache_string_fetched_at_falls_through(tmp_path: Path) -> None:
+    """``fetched_at`` that can't be coerced to int must trigger refetch path."""
+    cache_file = tmp_path / "litellm.json"
+    cache_file.write_text(json.dumps({"fetched_at": "not-a-number", "data": {"claude": {}}}))
+    cache = PricingCache(cache_file=cache_file, ttl_seconds=86400)
+    data = cache.load_or_fetch(http_client=_failing_client())
+    # Reader raised on int() → outer except → fallback chain.
+    assert cache.last_source == "fallback"
+    assert "claude-sonnet-4-5-20250929" in data
+
+
+def test_pricing_cache_aborts_on_oversize_response(tmp_path: Path) -> None:
+    """A misbehaving CDN returning gigabytes must not OOM the indexer.
+
+    Simulates a huge body; the fetcher must raise before buffering it all
+    and fall back cleanly (via the outer except path) to the hardcoded table.
+    """
+    oversize = b"x" * (11 * 1024 * 1024)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=oversize)
+
+    cache_file = tmp_path / "litellm.json"
+    cache = PricingCache(cache_file=cache_file, ttl_seconds=86400)
+    data = cache.load_or_fetch(
+        http_client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    # Falls back because the fetch aborts at the size cap.
+    assert cache.last_source == "fallback"
+    assert "claude-sonnet-4-5-20250929" in data
+
+
+def test_pricing_cache_fresh_fetch_marks_source(tmp_path: Path, pricing_data: dict) -> None:
+    """A successful network fetch sets last_source='fresh'."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=pricing_data)
+
+    cache_file = tmp_path / "litellm.json"
+    cache = PricingCache(cache_file=cache_file, ttl_seconds=86400)
+    cache.load_or_fetch(http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert cache.last_source == "fresh"
 
 
 def _unreachable_client() -> httpx.Client:

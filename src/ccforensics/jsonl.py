@@ -8,6 +8,8 @@ from typing import Any
 from .models import KNOWN_TYPES, TranscriptEntry, parse_entry
 from .pricing import compute_message_cost, resolve_pricing
 
+_MAX_LINE_BYTES = 16 * 1024 * 1024
+
 
 @dataclass
 class ParseResult:
@@ -20,19 +22,8 @@ class ParseResult:
 
 
 def parse_file(path: Path) -> ParseResult:
-    """Stream-parse a JSONL file with defensive error handling.
-
-    - Non-final line JSON-parse failure: counted + warned, continue.
-    - Final line JSON-parse failure at EOF: silently marked as truncated_tail.
-    - Unknown ``type`` values: recorded in unknown_types, entry kept.
-    - File not found: raises FileNotFoundError.
-
-    Iterates the file line-by-line rather than loading the whole text into
-    memory. Truncation detection: a JSONL file that ends without a trailing
-    newline has potentially-truncated last bytes; if that final partial line
-    fails to parse it's marked ``truncated_tail`` instead of counted as a
-    parse error.
-    """
+    """Stream-parse a JSONL file. A failed final line on a non-newline-
+    terminated file is treated as truncation, not a parse error."""
     if not path.exists():
         raise FileNotFoundError(path)
 
@@ -48,8 +39,27 @@ def parse_file(path: Path) -> ParseResult:
     last_was_blank = True
 
     with path.open("r", encoding="utf-8") as f:
-        for line_num, raw_line in enumerate(f, start=1):
+        line_num = 0
+        while True:
+            raw_line = f.readline(_MAX_LINE_BYTES + 1)
+            if not raw_line:
+                break
+            line_num += 1
             last_line_num = line_num
+            if len(raw_line) > _MAX_LINE_BYTES and not raw_line.endswith("\n"):
+                # Bound memory: a pathologically long line (no newline within
+                # _MAX_LINE_BYTES) is dropped. Drain to the next newline so
+                # subsequent lines parse cleanly.
+                while True:
+                    tail = f.readline(_MAX_LINE_BYTES)
+                    if not tail or tail.endswith("\n"):
+                        break
+                result.parse_errors += 1
+                result.warnings.append(
+                    f"{path}:{line_num}: line exceeded {_MAX_LINE_BYTES} bytes, skipped"
+                )
+                last_was_blank = False
+                continue
             stripped = raw_line.strip()
             if not stripped:
                 last_was_blank = True
@@ -190,19 +200,9 @@ def annotate_cost(
     entries: list[TranscriptEntry],
     pricing_data: dict[str, dict[str, Any]],
 ) -> list[AnnotatedEntry]:
-    """Annotate entries with cost.
-
-    - Non-billable entries (anything that isn't an assistant turn with a
-      ``message.usage``): ``cost_usd = 0.0``.
-    - Assistant turns with a model whose pricing can't be resolved:
-      ``cost_usd = None`` plus ``pricing_unresolved_model`` set.
-
-    The 0.0/None split lets callers distinguish "intentionally zero"
-    (non-billable system events, user prompts) from "we tried but couldn't
-    compute" (LiteLLM didn't have the model).
-    """
+    """Annotate entries with cost. ``cost_usd=0.0`` for non-billable,
+    ``None`` + ``pricing_unresolved_model`` when pricing can't be resolved."""
     out: list[AnnotatedEntry] = []
-    unresolved: set[str] = set()
     for e in entries:
         if e.type != "assistant" or e.message is None or e.message.usage is None:
             out.append(AnnotatedEntry(entry=e, cost_usd=0.0))
@@ -213,7 +213,6 @@ def annotate_cost(
             continue
         price = resolve_pricing(model, pricing_data)
         if price is None:
-            unresolved.add(model)
             out.append(AnnotatedEntry(entry=e, cost_usd=None, pricing_unresolved_model=model))
             continue
         usage = e.message.usage

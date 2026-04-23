@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 import sqlite3
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import click
 from rich.console import Console
@@ -41,12 +43,34 @@ def _open_index() -> sqlite3.Connection:
     return conn
 
 
+def _load_pricing() -> dict[str, dict[str, Any]]:
+    cache = PricingCache(cache_file=ccforensics_cache_dir() / "litellm.json")
+    data = cache.load_or_fetch()
+    if cache.last_source == "fallback":
+        click.echo(
+            "WARNING: pricing fetch failed and no cache available; "
+            "using built-in fallback table — costs may be stale.",
+            err=True,
+        )
+    elif cache.last_source == "stale":
+        click.echo(
+            "WARNING: pricing refresh failed; using last cached pricing.",
+            err=True,
+        )
+    return data
+
+
 @click.group()
 @click.version_option(__version__, prog_name="ccforensics")
 @click.option("-v", "--verbose", is_flag=True, help="Print per-session warnings.")
 @click.pass_context
 def main(ctx: click.Context, verbose: bool) -> None:
     """ccforensics — Claude Code session cost attribution."""
+    logging.basicConfig(
+        level=logging.INFO if verbose else logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
     ctx.ensure_object(dict)
     ctx.obj["verbose"] = verbose
 
@@ -105,7 +129,7 @@ def session_list(
     conn = _open_index()
 
     if not no_refresh:
-        pricing = PricingCache(cache_file=ccforensics_cache_dir() / "litellm.json").load_or_fetch()
+        pricing = _load_pricing()
         reconcile_projects_dir(conn, claude_projects_dir(), pricing)
         conn.commit()
 
@@ -179,7 +203,7 @@ def session_show(
     conn = _open_index()
 
     if not no_refresh:
-        pricing = PricingCache(cache_file=ccforensics_cache_dir() / "litellm.json").load_or_fetch()
+        pricing = _load_pricing()
         reconcile_projects_dir(conn, claude_projects_dir(), pricing)
         conn.commit()
 
@@ -264,7 +288,7 @@ def aggregate(
     conn = _open_index()
 
     if not no_refresh:
-        pricing = PricingCache(cache_file=ccforensics_cache_dir() / "litellm.json").load_or_fetch()
+        pricing = _load_pricing()
         reconcile_projects_dir(conn, claude_projects_dir(), pricing)
         conn.commit()
 
@@ -322,7 +346,7 @@ def plugins(
     conn = _open_index()
 
     if not no_refresh:
-        pricing = PricingCache(cache_file=ccforensics_cache_dir() / "litellm.json").load_or_fetch()
+        pricing = _load_pricing()
         reconcile_projects_dir(conn, claude_projects_dir(), pricing)
         conn.commit()
 
@@ -402,7 +426,7 @@ def index_rebuild(force: bool, yes: bool) -> None:
             db.unlink()
     conn = open_connection(db)
     ensure_schema(conn)
-    pricing = PricingCache(cache_file=ccforensics_cache_dir() / "litellm.json").load_or_fetch()
+    pricing = _load_pricing()
     stats = reconcile_projects_dir(conn, claude_projects_dir(), pricing)
     conn.commit()
     click.echo(

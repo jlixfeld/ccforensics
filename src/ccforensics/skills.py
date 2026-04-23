@@ -1,24 +1,4 @@
-"""Skill activation detection (spec §4.3).
-
-Three channels:
-
-- **A — Skill tool**: assistant ``tool_use`` where ``name == 'Skill'``
-  and ``input.skill`` names the skill.
-- **B — Read of SKILL.md**: assistant ``tool_use`` where
-  ``name == 'Read'`` and ``input.file_path`` ends in ``/SKILL.md``.
-- **C — Hook injection**: ``attachment`` entries with
-  ``hookEvent == 'SessionStart'`` whose ``stdout`` JSON contains
-  ``hookSpecificOutput.additionalContext`` — a SKILL.md payload Claude
-  Code splices into the prompt at session start.
-
-Attribution anchor is the full ``SKILL.md`` path (never the name alone),
-per spec §4.3 — paths unambiguously resolve plugin vs. user-level and
-survive name collisions.
-
-Context-carry ± cost estimation (spec §4.4) is **deferred** to a later
-pass; ``content_size`` is populated so the math can be layered in
-without another schema migration.
-"""
+"""Skill activation detection via three channels (Skill tool, Read, SessionStart hook)."""
 
 from __future__ import annotations
 
@@ -29,20 +9,20 @@ import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 from .models import TranscriptEntry
 
 logger = logging.getLogger("ccforensics.skills")
 
+# Plugin cache layout: ~/.claude/plugins/cache/<market>/<plugin>/<ver>/skills/<name>/SKILL.md
 _SKILL_MD_PATH_RE = re.compile(r"/skills/([^/]+)/SKILL\.md$")
 _PLUGIN_SKILL_PATH_RE = re.compile(
     r"plugins/cache/[^/]+/(?P<plugin>[^/]+)/[^/]+/skills/(?P<skill>[^/]+)/SKILL\.md$"
 )
-_USER_SKILL_PATH_RE = re.compile(
-    r"(?<!plugins/cache/[^/])(?:^|/)skills/(?P<skill>[^/]+)/SKILL\.md$"
-)
 _FRONTMATTER_NAME_RE = re.compile(r"^---\s*\r?\n.*?^name:\s*([^\s]+)", re.MULTILINE | re.DOTALL)
+# Bootstrap payload hints: SessionStart hooks that lack frontmatter but still
+# carry the using-superpowers skill as context.
 _HOOK_SKILL_HINTS = ("using-superpowers", "<session-start-hook>")
 
 Source = Literal["skill-tool", "read", "hook-injection"]
@@ -64,39 +44,45 @@ class SkillActivation:
 
 @dataclass
 class SkillResolver:
-    """Resolve a skill name (e.g. ``superpowers:brainstorming``) to a
-    path on disk using the registry's known plugin skill paths.
-
-    The resolver scans the on-disk layout once at construction time so
-    lookups are O(1) thereafter. If neither plugin nor user-level
-    location has a matching SKILL.md, the lookup returns ``None``.
-    """
+    """Map skill names to SKILL.md paths. Scans on-disk layout at construction."""
 
     claude_home: Path
     plugins_cache: Path
 
     def __post_init__(self) -> None:
+        from .registry import version_sort_key
+
         self._plugin_paths: dict[str, Path] = {}
         self._user_paths: dict[str, Path] = {}
         if self.plugins_cache.is_dir():
+            # Group installs by plugin name so we can pick the highest-version
+            # one deterministically. Filesystem glob order is not stable.
+            by_plugin: dict[str, list[tuple[str | None, Path]]] = {}
             for manifest in self.plugins_cache.glob("*/*/*/.claude-plugin/plugin.json"):
                 try:
                     data = json.loads(manifest.read_text())
-                except (OSError, json.JSONDecodeError):
+                except (OSError, json.JSONDecodeError) as e:
+                    logger.warning(
+                        "skill resolver: skipping unreadable manifest %s (%s)", manifest, e
+                    )
                     continue
                 plugin_name = data.get("name")
                 if not isinstance(plugin_name, str):
+                    logger.warning(
+                        "skill resolver: manifest %s has non-string 'name'; skipping", manifest
+                    )
                     continue
-                install = manifest.parent.parent
+                version = data.get("version")
+                version = str(version) if version is not None else None
+                by_plugin.setdefault(plugin_name, []).append((version, manifest.parent.parent))
+
+            for plugin_name, installs in by_plugin.items():
+                _, install = max(installs, key=lambda t: version_sort_key(t[0]))
                 skills_dir = install / "skills"
                 if not skills_dir.is_dir():
                     continue
                 for skill_md in skills_dir.glob("*/SKILL.md"):
-                    skill_name = skill_md.parent.name
-                    key = f"{plugin_name}:{skill_name}"
-                    # Keep the first (highest-version) encountered; iteration
-                    # order is filesystem-dependent but we ignore duplicates.
-                    self._plugin_paths.setdefault(key, skill_md)
+                    self._plugin_paths[f"{plugin_name}:{skill_md.parent.name}"] = skill_md
         user_skills = self.claude_home / "skills"
         if user_skills.is_dir():
             for skill_md in user_skills.glob("*/SKILL.md"):
@@ -238,7 +224,13 @@ def _detect_channel_c(
         return out
     try:
         stdout_json = json.loads(att.stdout)
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError) as e:
+        logger.warning(
+            "skill detection: SessionStart hook payload in session %s is not valid JSON (%s); "
+            "skipping channel-C",
+            session_id,
+            e,
+        )
         return out
     if not isinstance(stdout_json, dict):
         return out
@@ -319,7 +311,7 @@ def write_activations(
             # (schema requires NOT NULL). Name + source survive in logs
             # for triage; a future refinement can record unresolved
             # activations in a dedicated column or side table.
-            logger.info(
+            logger.warning(
                 "skill activation in session %s has no resolvable path "
                 "(name=%s, source=%s); skipping row",
                 session_id,
@@ -430,7 +422,3 @@ def build_resolver_from_paths() -> SkillResolver:
     from .paths import claude_home, claude_plugins_cache_dir
 
     return SkillResolver(claude_home=claude_home(), plugins_cache=claude_plugins_cache_dir())
-
-
-# Unused-import quiet — Any is used for typing-only contexts in overloads.
-_ = Any

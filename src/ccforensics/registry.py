@@ -1,19 +1,4 @@
-"""Plugin + user-level registry.
-
-Populates ``plugins`` and ``user_level_artifacts`` tables from the
-on-disk Claude Code plugin cache (``~/.claude/plugins/cache/``) and the
-user-level skill/agent directories (``~/.claude/skills/``,
-``~/.claude/agents/``). Exposes ``classify_agent_source`` so reports can
-attribute a ``subagent:<type>`` bucket to its owning plugin.
-
-Resolution order for an agent type (spec §4.2):
-
-- Builtin (``general-purpose``, ``Explore``, ``Plan``, ``statusline-setup``).
-- Plugin-qualified (``<plugin>:<agent>``) when ``<plugin>`` matches a
-  discovered plugin.
-- User-level when the bare name matches a ``~/.claude/agents/*.md``.
-- ``unknown`` otherwise.
-"""
+"""Plugin + user-level registry; classify_agent_source resolves subagent ownership."""
 
 from __future__ import annotations
 
@@ -23,7 +8,9 @@ import re
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+ArtifactKind = Literal["skill", "agent"]
 
 logger = logging.getLogger("ccforensics.registry")
 
@@ -34,7 +21,7 @@ BUILTIN_AGENTS: frozenset[str] = frozenset(
 _VERSION_KEY_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)")
 
 
-def _version_sort_key(v: str | None) -> tuple[int, ...]:
+def version_sort_key(v: str | None) -> tuple[int, ...]:
     """Sort key for version strings — prefers semver ordering, falls back
     to lexicographic for non-semver."""
     if not v:
@@ -58,7 +45,7 @@ class DiscoveredPlugin:
 @dataclass
 class UserLevelArtifact:
     path: Path
-    kind: str  # 'skill' | 'agent'
+    kind: ArtifactKind
     name: str
 
 
@@ -123,7 +110,7 @@ def discover_plugins(plugins_cache_dir: Path) -> list[DiscoveredPlugin]:
 
     out: list[DiscoveredPlugin] = []
     for versions in candidates.values():
-        winner = max(versions, key=lambda p: _version_sort_key(p.version))
+        winner = max(versions, key=lambda p: version_sort_key(p.version))
         out.append(winner)
     out.sort(key=lambda p: p.name)
     return out
@@ -157,12 +144,7 @@ def _detect_collisions(
     plugins: list[DiscoveredPlugin],
     user_level: list[UserLevelArtifact],
 ) -> CollisionReport:
-    """Find skill/agent names that appear in multiple places.
-
-    Only flags names that appear user-level AND in at least one plugin.
-    Spec §4.2: "On duplicate names across locations, tool emits a
-    one-time warning listing the duplicates."
-    """
+    """Flag skill/agent names shared between user-level and any plugin."""
     plugin_skill_map: dict[str, list[str]] = {}
     plugin_agent_map: dict[str, list[str]] = {}
     for p in plugins:
@@ -192,11 +174,7 @@ def populate_registry(
     claude_home: Path,
 ) -> CollisionReport:
     """Discover plugins + user-level artifacts and write them to the DB.
-
-    Idempotent: deletes and re-inserts rows on each call. Emits a
-    warning for every skill/agent name collision between user-level and
-    any plugin.
-    """
+    Idempotent: deletes and re-inserts rows on each call."""
     plugins = discover_plugins(plugins_cache_dir)
     user_level = discover_user_level(claude_home)
 

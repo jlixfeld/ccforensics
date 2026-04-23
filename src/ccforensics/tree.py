@@ -170,18 +170,8 @@ def discover_spawn(
     parent_entries: Iterable[TranscriptEntry],
     meta: SpawnMeta | None,
 ) -> Spawn | None:
-    """Link a subagent file to its parent Agent/Task call.
-
-    Heuristic: nearest Agent|Task before ``ts_spawned``, preferring
-    candidates whose ``input.subagent_type`` matches ``meta.agent_type``
-    when available. Composite rank key ``(type_match, timestamp)``
-    picks max — matches dominate; nearest among matches wins; with no
-    matches, falls back to nearest across all candidates.
-
-    Returns ``None`` only when the child file has no entries. An
-    unresolvable spawn still returns a ``Spawn`` with null parent
-    fields so the caller can record it.
-    """
+    """Link a subagent file to its parent Agent/Task call. Rank key
+    ``(type_match, timestamp)``: matches dominate, nearest wins."""
     child_list = list(child_entries)
     if not child_list:
         return None

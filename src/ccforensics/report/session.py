@@ -1,17 +1,4 @@
-"""Per-session deep report (spec §5.3).
-
-Sections rendered:
-1. Header — project, started/last-active, duration, turns, models, total cost.
-2. Cost-by-bucket — ``session_rollups`` rows rendered as a table.
-3. Cost-by-plugin — ``subagent:<type>`` rolled up via registry mapping,
-   plus ``user-level``, ``builtin``, ``main``, ``auto-compact``,
-   ``unattributed``.
-4. Unattributed detail — when ``include_unattributed``, list the
-   subagent files whose cost landed in the unattributed bucket.
-5. Parse notes — schema versions seen + parse-warning counts.
-
-Skill ledger (spec §5.3 section 4) is M8.
-"""
+"""Per-session deep report: header, buckets, plugin rollup, unattributed detail, notes."""
 
 from __future__ import annotations
 
@@ -367,7 +354,11 @@ def _render_skill_ledger(ledger: list[SkillLedgerEntry]) -> Table:
     for entry in ledger:
         ts = datetime.fromtimestamp(entry.activated_at, tz=UTC).strftime("%m-%d %H:%M")
         size = f"{entry.content_size:,}" if entry.content_size is not None else "-"
-        cost = format_cost(entry.estimated_cost_usd) if entry.estimated_cost_usd else "-"
+        cost = (
+            format_cost(entry.estimated_cost_usd)
+            if entry.estimated_cost_usd is not None
+            else "-"
+        )
         t.add_row(
             ts,
             entry.skill_name,
