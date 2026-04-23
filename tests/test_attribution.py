@@ -472,6 +472,117 @@ def test_rollups_idempotent_on_reconcile(tmp_path: Path, pricing_data: dict) -> 
     assert first == second
 
 
+def test_buckets_have_exact_per_bucket_token_counts(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """Pin exact per-bucket numerics — not just invariant, but that the
+    right tokens land in the right bucket."""
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    sid = "sess-exact"
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            _assistant(
+                "u1",
+                sid,
+                "2026-04-22T10:00:00Z",
+                msg_id="m1",
+                req_id="r1",
+                input_tokens=100,
+                output_tokens=50,
+                cache_read=1000,
+                cache_create=10,
+                content=[
+                    {
+                        "type": "tool_use",
+                        "id": "tu1",
+                        "name": "Agent",
+                        "input": {"subagent_type": "Explore"},
+                    }
+                ],
+                cwd="/home/test",
+            ),
+        ],
+    )
+    sub_dir = enc / sid / "subagents"
+    sub_dir.mkdir(parents=True)
+    _write_jsonl(
+        sub_dir / "agent-abc.jsonl",
+        [
+            {
+                "type": "user",
+                "uuid": "c-u1",
+                "sessionId": sid,
+                "agentId": "abc",
+                "timestamp": "2026-04-22T10:00:05Z",
+                "isSidechain": True,
+                "isMeta": False,
+                "message": {"role": "user", "content": "x"},
+            },
+            _assistant(
+                "c-u2",
+                sid,
+                "2026-04-22T10:00:10Z",
+                msg_id="m2",
+                req_id="r2",
+                input_tokens=2000,
+                output_tokens=800,
+                cache_read=5000,
+                agentId="abc",
+                isSidechain=True,
+            ),
+        ],
+    )
+    (sub_dir / "agent-abc.meta.json").write_text(
+        '{"agentType":"Explore","description":"x"}'
+    )
+    _write_jsonl(
+        sub_dir / "agent-acompact-abcdef.jsonl",
+        [
+            _assistant(
+                "k-u1",
+                sid,
+                "2026-04-22T10:05:00Z",
+                msg_id="km1",
+                req_id="kr1",
+                input_tokens=300,
+                output_tokens=200,
+                agentId="acompact-abcdef",
+                isSidechain=True,
+            ),
+        ],
+    )
+
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    by_bucket = {
+        (row[0], row[1]): {"input": row[2], "output": row[3], "cache_read": row[4]}
+        for row in conn.execute(
+            """SELECT bucket_kind, bucket_name, input_tokens, output_tokens,
+                      cache_read FROM session_rollups WHERE session_id=?""",
+            (sid,),
+        ).fetchall()
+    }
+
+    # Main bucket: only the one assistant message in the main file.
+    assert by_bucket[("main", "main")]["input"] == 100
+    assert by_bucket[("main", "main")]["output"] == 50
+    assert by_bucket[("main", "main")]["cache_read"] == 1000
+
+    # Explore bucket: the subagent's own messages only.
+    assert by_bucket[("subagent", "Explore")]["input"] == 2000
+    assert by_bucket[("subagent", "Explore")]["output"] == 800
+    assert by_bucket[("subagent", "Explore")]["cache_read"] == 5000
+
+    # Auto-compact bucket: just the compaction worker.
+    assert by_bucket[("auto-compact", "auto-compact")]["input"] == 300
+    assert by_bucket[("auto-compact", "auto-compact")]["output"] == 200
+
+
 def test_rollup_helper_can_be_called_standalone(
     tmp_path: Path, pricing_data: dict
 ) -> None:
