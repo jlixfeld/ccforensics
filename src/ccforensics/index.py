@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .attribution import backfill_spawn_totals, recompute_session_rollups
 from .jsonl import _dedup_preference, annotate_cost, dedup_key, parse_file
 from .models import TranscriptEntry, load_meta_json
 from .paths import decode_project_dirname
@@ -731,6 +732,8 @@ def reconcile_projects_dir(
     for sid in stats.sessions_recomputed:
         try:
             recompute_session_summary(conn, sid)
+            recompute_session_rollups(conn, sid)
+            backfill_spawn_totals(conn, sid)
         except Exception:
             # TOCTOU: Claude Code may delete/rotate a main file between the
             # file walk and this pass, so parse_file raises FileNotFoundError.
@@ -739,7 +742,7 @@ def reconcile_projects_dir(
             # recomputes or lose the final commit for sessions already
             # summarized in this pass.
             logger.warning(
-                "failed to recompute session_summaries for session_id=%s; skipping",
+                "failed to recompute per-session aggregates for session_id=%s; skipping",
                 sid,
                 exc_info=True,
             )
