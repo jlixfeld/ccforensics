@@ -30,24 +30,9 @@ def test_version_flag() -> None:
     assert "0.1.0" in result.output
 
 
-@pytest.mark.parametrize(
-    ("argv", "milestone"),
-    [
-        (["aggregate"], "M9"),
-        (["plugins"], "M9"),
-    ],
-)
-def test_stub_commands_echo_not_yet_implemented(argv: list[str], milestone: str) -> None:
-    runner = CliRunner()
-    result = runner.invoke(main, argv)
-    assert result.exit_code == 0
-    assert "not yet implemented" in result.output
-    assert milestone in result.output
-
-
 def test_verbose_flag_is_accepted() -> None:
     runner = CliRunner()
-    result = runner.invoke(main, ["-v", "aggregate"])
+    result = runner.invoke(main, ["-v", "aggregate", "--no-refresh"])
     assert result.exit_code == 0
 
 

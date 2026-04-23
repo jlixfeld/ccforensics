@@ -20,6 +20,8 @@ from .index import (
 from .paths import ccforensics_cache_dir, claude_projects_dir
 from .pricing import PricingCache
 from .report._dates import parse_since, parse_until
+from .report.aggregate import query_aggregate, render_aggregate
+from .report.plugins import query_plugins, render_plugins
 from .report.resolver import AmbiguousPrefix, SessionNotFound, resolve_session_id
 from .report.session import (
     SessionReportNotFound,
@@ -228,15 +230,126 @@ def session_show(
 
 
 @main.command()
-def aggregate() -> None:
-    """Aggregate cost across a date range (not yet implemented)."""
-    click.echo("aggregate: not yet implemented (milestone M9)")
+@click.option("--since", help="Date filter: YYYY-MM-DD | Nd | today | yesterday")
+@click.option("--until", help="Date filter: YYYY-MM-DD | Nd | today | yesterday")
+@click.option("--project", help="Filter by project path substring (case-insensitive).")
+@click.option(
+    "--group-by",
+    "group_by",
+    type=click.Choice(["none", "project", "day", "week", "month", "plugin"]),
+    default="none",
+    show_default=True,
+    help="Group-by key for aggregation.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON to stdout.")
+@click.option("--csv", "as_csv", is_flag=True, help="Emit CSV to stdout.")
+@click.option(
+    "--no-refresh",
+    is_flag=True,
+    help="Skip reconciliation and pricing fetch.",
+)
+def aggregate(
+    since: str | None,
+    until: str | None,
+    project: str | None,
+    group_by: str,
+    as_json: bool,
+    as_csv: bool,
+    no_refresh: bool,
+) -> None:
+    """Aggregate cost across a date range."""
+    if as_json and as_csv:
+        raise click.UsageError("--json and --csv are mutually exclusive")
+
+    conn = _open_index()
+
+    if not no_refresh:
+        pricing = PricingCache(cache_file=ccforensics_cache_dir() / "litellm.json").load_or_fetch()
+        reconcile_projects_dir(conn, claude_projects_dir(), pricing)
+        conn.commit()
+
+    since_dt = parse_since(since) if since else None
+    until_dt = parse_until(until) if until else None
+
+    rows = query_aggregate(
+        conn,
+        since=since_dt,
+        until=until_dt,
+        project=project,
+        group_by=group_by,  # type: ignore[arg-type]
+    )
+
+    if as_json:
+        write_json([dataclasses.asdict(r) for r in rows], sys.stdout)
+        return
+    if as_csv:
+        headers = [
+            "group_key",
+            "total_cost_usd",
+            "session_count",
+            "input_tokens",
+            "output_tokens",
+            "cache_create",
+            "cache_read",
+        ]
+        write_csv((dataclasses.asdict(r) for r in rows), headers, sys.stdout)
+        return
+
+    Console().print(render_aggregate(rows, group_by))
 
 
 @main.command()
-def plugins() -> None:
-    """Per-plugin all-time rollup (not yet implemented)."""
-    click.echo("plugins: not yet implemented (milestone M9)")
+@click.option("--since", help="Date filter: YYYY-MM-DD | Nd | today | yesterday")
+@click.option("--until", help="Date filter: YYYY-MM-DD | Nd | today | yesterday")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON to stdout.")
+@click.option("--csv", "as_csv", is_flag=True, help="Emit CSV to stdout.")
+@click.option(
+    "--no-refresh",
+    is_flag=True,
+    help="Skip reconciliation and pricing fetch.",
+)
+def plugins(
+    since: str | None,
+    until: str | None,
+    as_json: bool,
+    as_csv: bool,
+    no_refresh: bool,
+) -> None:
+    """Per-plugin all-time rollup."""
+    if as_json and as_csv:
+        raise click.UsageError("--json and --csv are mutually exclusive")
+
+    conn = _open_index()
+
+    if not no_refresh:
+        pricing = PricingCache(cache_file=ccforensics_cache_dir() / "litellm.json").load_or_fetch()
+        reconcile_projects_dir(conn, claude_projects_dir(), pricing)
+        conn.commit()
+
+    since_dt = parse_since(since) if since else None
+    until_dt = parse_until(until) if until else None
+
+    rows = query_plugins(conn, since=since_dt, until=until_dt)
+
+    if as_json:
+        write_json([dataclasses.asdict(r) for r in rows], sys.stdout)
+        return
+    if as_csv:
+        headers = [
+            "plugin",
+            "total_cost_usd",
+            "session_count",
+            "most_used_agent_type",
+            "agent_type_count",
+            "most_used_skill",
+            "skill_count",
+            "first_seen",
+            "last_seen",
+        ]
+        write_csv((dataclasses.asdict(r) for r in rows), headers, sys.stdout)
+        return
+
+    Console().print(render_plugins(rows))
 
 
 @main.group()
