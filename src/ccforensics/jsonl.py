@@ -123,11 +123,43 @@ def dedup_key(entry: TranscriptEntry) -> str | None:
     return None
 
 
+def _dedup_preference(entry: TranscriptEntry) -> tuple[int, int, float]:
+    """Ranking key for dedup collision resolution (higher wins).
+
+    Claude Code sometimes writes the same LLM response as two JSONL
+    entries sharing a ``dedup_key`` but with different content (e.g., a
+    streamed text block written first, then a tool_use block written
+    when the tool call resolves). Usage is identical on both so cost is
+    unaffected; but which entry we keep determines whether downstream
+    spawn-linkage can see the tool_use.
+
+    Priority (all higher = preferred):
+    1. Entry has at least one ``tool_use`` block (load-bearing for
+       cross-file spawn discovery in ``tree.py``).
+    2. More non-empty content blocks (richer representation).
+    3. Later timestamp (most recent write of the response).
+    """
+    has_tool_use = 0
+    nonempty_blocks = 0
+    if entry.message and entry.message.content:
+        for b in entry.message.content:
+            if b.type == "tool_use":
+                has_tool_use = 1
+            if b.type == "text":
+                if b.text:
+                    nonempty_blocks += 1
+            elif b.type or b.id or b.name or b.content or b.input:
+                nonempty_blocks += 1
+    return (has_tool_use, nonempty_blocks, entry.timestamp.timestamp())
+
+
 def dedup_entries(entries: list[TranscriptEntry]) -> list[TranscriptEntry]:
-    """Dedup by key; on collision the earliest-timestamped entry wins.
+    """Dedup by key; on collision the content-richest entry wins.
 
     Entries with no dedup_key (e.g., system events) pass through unchanged
     and their order relative to each other is preserved.
+
+    See ``_dedup_preference`` for the collision-resolution rule.
     """
     first_seen: dict[str, TranscriptEntry] = {}
     keyless: list[TranscriptEntry] = []
@@ -138,7 +170,7 @@ def dedup_entries(entries: list[TranscriptEntry]) -> list[TranscriptEntry]:
             keyless.append(entry)
             continue
         prev = first_seen.get(k)
-        if prev is None or entry.timestamp < prev.timestamp:
+        if prev is None or _dedup_preference(entry) > _dedup_preference(prev):
             first_seen[k] = entry
 
     deduped = list(first_seen.values())

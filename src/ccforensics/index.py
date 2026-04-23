@@ -8,12 +8,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .jsonl import annotate_cost, dedup_key, parse_file
-from .models import TranscriptEntry
+from .jsonl import _dedup_preference, annotate_cost, dedup_key, parse_file
+from .models import TranscriptEntry, load_meta_json
 from .paths import decode_project_dirname
+from .tree import discover_spawn
 
 logger = logging.getLogger("ccforensics.index")
 
+_AUTOCOMPACT_FILENAME = re.compile(r"^agent-acompact-([0-9a-f]+)\.jsonl$", re.IGNORECASE)
 _SUBAGENT_FILENAME = re.compile(r"^agent-([0-9a-f]+)\.jsonl$", re.IGNORECASE)
 
 _COMMAND_WRAPPER_RE = re.compile(
@@ -203,18 +205,24 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 def _classify_file(path: Path) -> tuple[str, str | None, str]:
     """Return ``(kind, agent_id, session_id)``.
 
-    - Main session: ``~/.claude/projects/<enc>/<sessionId>.jsonl``
-    - Subagent:     ``~/.claude/projects/<enc>/<sessionId>/subagents/agent-<id>.jsonl``
+    - Main session:  ``<enc>/<sessionId>.jsonl``
+    - Subagent:      ``<enc>/<sessionId>/subagents/agent-<hex>.jsonl``
+    - Auto-compact:  ``<enc>/<sessionId>/subagents/agent-acompact-<hex>.jsonl``
 
-    Files under a ``subagents/`` directory whose name doesn't match the
-    ``agent-<hex>.jsonl`` pattern are classified as ``subagent`` with
-    ``agent_id=None`` and a warning is logged — never silently mislabeled
-    as ``main`` (which would make a future Claude Code rename of the
-    subagent filename convention quietly mis-attribute every subagent
-    file).
+    Auto-compact files are Claude Code's internal context-compaction
+    artifacts (no meta.json, no parent Agent/Task call). They still carry
+    billable cost but don't belong in ``subagent_spawns``; they get their
+    own bucket at attribution time.
+
+    Files under ``subagents/`` that match neither pattern are classified
+    as ``subagent`` with ``agent_id=None`` and a warning is logged — never
+    silently mislabeled as ``main``.
     """
     name = path.name
     if path.parent.name == "subagents":
+        m = _AUTOCOMPACT_FILENAME.match(name)
+        if m:
+            return ("auto-compact", f"acompact-{m.group(1)}", path.parent.parent.name)
         m = _SUBAGENT_FILENAME.match(name)
         if m:
             return ("subagent", m.group(1), path.parent.parent.name)
@@ -225,6 +233,158 @@ def _classify_file(path: Path) -> tuple[str, str | None, str]:
         )
         return ("subagent", None, path.parent.parent.name)
     return ("main", None, path.stem)
+
+
+def _parent_session_path(subagent_path: Path) -> Path:
+    """``<enc>/<sess>/subagents/agent-<id>.jsonl`` → ``<enc>/<sess>.jsonl``."""
+    session_dir = subagent_path.parent.parent
+    return session_dir.parent / f"{session_dir.name}.jsonl"
+
+
+def _load_parent_entries_cached(
+    parent_path: Path,
+    cache: dict[Path, list[TranscriptEntry]],
+) -> list[TranscriptEntry]:
+    """Size-1 cache keyed on ``parent_path``. Missing/unreadable → []."""
+    if parent_path in cache:
+        return cache[parent_path]
+    cache.clear()
+    try:
+        entries = list(parse_file(parent_path).entries)
+    except FileNotFoundError:
+        logger.warning(
+            "parent session file %s not found; spawn will be unresolvable",
+            parent_path,
+        )
+        entries = []
+    except OSError:
+        logger.warning(
+            "failed to read parent session file %s; spawn will be unresolvable",
+            parent_path,
+            exc_info=True,
+        )
+        entries = []
+    cache[parent_path] = entries
+    return entries
+
+
+def _reconcile_spawn(
+    conn: sqlite3.Connection,
+    subagent_path: Path,
+    session_id: str,
+    agent_id: str | None,
+    parent_cache: dict[Path, list[TranscriptEntry]],
+) -> None:
+    """Discover and write the ``subagent_spawns`` row for a subagent JSONL.
+
+    Caller ensures ``reconcile_file`` ran first. On missing parent file
+    or unresolvable linkage, still writes a row with null parent fields
+    so the subagent's cost is represented.
+    """
+    if agent_id is None:
+        logger.warning("subagent %s has no agent_id; skipping spawn discovery", subagent_path)
+        return
+
+    parent_path = _parent_session_path(subagent_path)
+    parent_entries = _load_parent_entries_cached(parent_path, parent_cache)
+
+    try:
+        child_entries = list(parse_file(subagent_path).entries)
+    except (FileNotFoundError, OSError):
+        logger.warning(
+            "subagent file %s vanished mid-reconcile; no spawn row written",
+            subagent_path,
+            exc_info=True,
+        )
+        return
+
+    meta_path = subagent_path.with_suffix(".meta.json")
+    meta = load_meta_json(meta_path)
+
+    spawn = discover_spawn(
+        parent_session_id=session_id,
+        child_agent_id=agent_id,
+        child_file_path=subagent_path,
+        child_entries=child_entries,
+        parent_entries=parent_entries,
+        meta=meta,
+    )
+    if spawn is None:
+        return
+
+    # Resolve parent_message_uuid → dedup_key.
+    #
+    # A single LLM response can stream multiple parallel Agent tool_uses,
+    # each serialized to disk as a separate raw entry sharing the same
+    # (msg.id, requestId) — hence the same dedup_key. Dedup collapses
+    # them to one ``messages`` row; that row's single ``tool_use_id``
+    # column only records one of the N tool_uses.
+    #
+    # So we can't rely on looking up messages by uuid or by
+    # ``tool_use_id``. Instead, compute the dedup_key from the raw parent
+    # entry (still in memory as ``parent_entries``) and look up by that.
+    # Every raw entry that collapses into the same ``messages`` row
+    # computes the same key.
+    parent_dedup_key: str | None = None
+    if spawn.parent_message_uuid is not None:
+        raw_parent = next(
+            (e for e in parent_entries if e.uuid == spawn.parent_message_uuid),
+            None,
+        )
+        if raw_parent is not None:
+            raw_key = dedup_key(raw_parent)
+            if raw_key is not None:
+                row = conn.execute(
+                    "SELECT dedup_key FROM messages WHERE dedup_key=?",
+                    (raw_key,),
+                ).fetchone()
+                if row is not None:
+                    parent_dedup_key = row[0]
+    if parent_dedup_key is None and spawn.parent_tool_use_id is not None:
+        # Fallback: match on the recorded ``tool_use_id`` (useful when the
+        # raw parent entry has no ``message.id`` and thus no dedup_key).
+        row = conn.execute(
+            "SELECT dedup_key FROM messages WHERE session_id=? AND tool_use_id=?",
+            (session_id, spawn.parent_tool_use_id),
+        ).fetchone()
+        if row is not None:
+            parent_dedup_key = row[0]
+    if parent_dedup_key is None and spawn.parent_message_uuid is not None:
+        logger.warning(
+            "spawn parent uuid %s / tool_use_id %s not resolvable to a "
+            "messages row for session %s",
+            spawn.parent_message_uuid,
+            spawn.parent_tool_use_id,
+            session_id,
+        )
+
+    conn.execute(
+        """INSERT OR REPLACE INTO subagent_spawns (
+            spawn_id, parent_session_id, parent_message_dedup_key,
+            child_agent_id, child_file_path,
+            subagent_type, description, model,
+            ts_spawned, ts_returned,
+            total_cost_usd, total_input, total_output,
+            total_cache_create, total_cache_read
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            str(subagent_path),
+            spawn.parent_session_id,
+            parent_dedup_key,
+            spawn.child_agent_id,
+            spawn.child_file_path,
+            spawn.subagent_type,
+            spawn.description,
+            spawn.model_hint,
+            int(spawn.ts_spawned.timestamp()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    )
 
 
 def _row_is_unchanged(conn: sqlite3.Connection, path: Path, mtime_ns: int, size: int) -> bool:
@@ -321,7 +481,7 @@ def reconcile_file(conn: sqlite3.Connection, path: Path, pricing_data: dict[str,
             kept_non_keyed.append((a.entry, a.cost_usd))
             continue
         prev = seen.get(key)
-        if prev is None or a.entry.timestamp < prev[0].timestamp:
+        if prev is None or _dedup_preference(a.entry) > _dedup_preference(prev[0]):
             seen[key] = (a.entry, a.cost_usd)
 
     conn.execute(
@@ -547,14 +707,22 @@ def reconcile_projects_dir(
     if not projects_dir.exists():
         return stats
 
-    for path in sorted(projects_dir.rglob("*.jsonl")):
+    parent_cache: dict[Path, list[TranscriptEntry]] = {}
+
+    # Sort by string form (not Path's part-by-part compare) so that
+    # ``<enc>/<sess>.jsonl`` sorts before ``<enc>/<sess>/subagents/...``.
+    # That ordering guarantees a subagent's spawn discovery sees its
+    # parent main file already indexed.
+    for path in sorted(projects_dir.rglob("*.jsonl"), key=str):
         stats.files_scanned += 1
         stat = path.stat()
         if _row_is_unchanged(conn, path, stat.st_mtime_ns, stat.st_size):
             stats.files_skipped_unchanged += 1
             continue
-        _, _, session_id = _classify_file(path)
+        kind, agent_id, session_id = _classify_file(path)
         reconcile_file(conn, path, pricing_data)
+        if kind == "subagent":
+            _reconcile_spawn(conn, path, session_id, agent_id, parent_cache)
         conn.commit()
         stats.files_indexed += 1
         stats.files_changed += 1

@@ -4,6 +4,7 @@ import json
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -12,6 +13,7 @@ from ccforensics.index import (
     ensure_schema,
     open_connection,
     reconcile_file,
+    reconcile_projects_dir,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -114,3 +116,424 @@ def test_reconcile_changed_file_replaces_messages(tmp_path: Path, pricing_data: 
 
     new_count = count_messages_for_file(conn, src)
     assert new_count == initial_count + 1
+
+
+# ---------- subagent_spawns population (M5.4) ----------
+
+
+def _write_jsonl(path: Path, entries: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        for e in entries:
+            f.write(json.dumps(e))
+            f.write("\n")
+
+
+def test_subagent_file_writes_spawn_row(tmp_path: Path, pricing_data: dict) -> None:
+    """Parent with Agent tool_use + subagent JSONL + meta.json → spawn row
+    with resolved parent linkage."""
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test-proj"
+    session_id = "sess-parent"
+
+    parent_entries = [
+        {
+            "type": "user",
+            "uuid": "p-u1",
+            "sessionId": session_id,
+            "timestamp": "2026-04-22T10:00:00Z",
+            "isSidechain": False,
+            "isMeta": False,
+            "cwd": "/home/test/proj",
+            "message": {"role": "user", "content": "spawn an explorer"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "p-u2",
+            "sessionId": session_id,
+            "timestamp": "2026-04-22T10:00:10Z",
+            "isSidechain": False,
+            "isMeta": False,
+            "requestId": "r1",
+            "message": {
+                "id": "m1",
+                "role": "assistant",
+                "model": "claude-sonnet-4-5-20250929",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "tu-agent-1",
+                        "name": "Agent",
+                        "input": {"subagent_type": "Explore"},
+                    }
+                ],
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            },
+        },
+    ]
+    _write_jsonl(enc / f"{session_id}.jsonl", parent_entries)
+
+    sub_dir = enc / session_id / "subagents"
+    sub_dir.mkdir(parents=True)
+    agent_id = "abc123def456"
+    child_path = sub_dir / f"agent-{agent_id}.jsonl"
+    child_entries = [
+        {
+            "type": "user",
+            "uuid": "c-u1",
+            "sessionId": session_id,
+            "agentId": agent_id,
+            "timestamp": "2026-04-22T10:00:15Z",
+            "isSidechain": True,
+            "isMeta": False,
+            "message": {"role": "user", "content": "walk src"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "c-u2",
+            "sessionId": session_id,
+            "agentId": agent_id,
+            "timestamp": "2026-04-22T10:00:20Z",
+            "isSidechain": True,
+            "isMeta": False,
+            "requestId": "r2",
+            "message": {
+                "id": "m2",
+                "role": "assistant",
+                "model": "claude-opus-4-7",
+                "content": [{"type": "text", "text": "done"}],
+                "usage": {"input_tokens": 50, "output_tokens": 20},
+            },
+        },
+    ]
+    _write_jsonl(child_path, child_entries)
+    (sub_dir / f"agent-{agent_id}.meta.json").write_text(
+        '{"agentType":"Explore","description":"walk src tree"}'
+    )
+
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    row = conn.execute(
+        """SELECT parent_session_id, child_agent_id, child_file_path,
+                  subagent_type, description, model,
+                  parent_message_dedup_key
+             FROM subagent_spawns WHERE child_file_path=?""",
+        (str(child_path),),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == session_id
+    assert row[1] == agent_id
+    assert row[2] == str(child_path)
+    assert row[3] == "Explore"
+    assert row[4] == "walk src tree"
+    assert row[5] == "claude-opus-4-7"
+    parent_key = row[6]
+    assert parent_key is not None
+    parent_msg = conn.execute(
+        "SELECT uuid FROM messages WHERE dedup_key=?", (parent_key,)
+    ).fetchone()
+    assert parent_msg is not None
+    assert parent_msg[0] == "p-u2"
+
+
+def test_subagent_unresolvable_writes_null_parent(tmp_path: Path, pricing_data: dict) -> None:
+    """No parent Agent/Task call before ts_spawned → parent_message_dedup_key=NULL."""
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    session_id = "sess-orphan"
+
+    _write_jsonl(
+        enc / f"{session_id}.jsonl",
+        [
+            {
+                "type": "user",
+                "uuid": "p-u1",
+                "sessionId": session_id,
+                "timestamp": "2026-04-22T10:00:00Z",
+                "isSidechain": False,
+                "isMeta": False,
+                "cwd": "/home/test",
+                "message": {"role": "user", "content": "hi"},
+            }
+        ],
+    )
+    sub_dir = enc / session_id / "subagents"
+    sub_dir.mkdir(parents=True)
+    agent_id = "deadbeef"
+    child_path = sub_dir / f"agent-{agent_id}.jsonl"
+    _write_jsonl(
+        child_path,
+        [
+            {
+                "type": "user",
+                "uuid": "c-u1",
+                "sessionId": session_id,
+                "agentId": agent_id,
+                "timestamp": "2026-04-22T10:00:05Z",
+                "isSidechain": True,
+                "isMeta": False,
+                "message": {"role": "user", "content": "what"},
+            }
+        ],
+    )
+
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    row = conn.execute(
+        "SELECT subagent_type, parent_message_dedup_key FROM subagent_spawns "
+        "WHERE child_file_path=?",
+        (str(child_path),),
+    ).fetchone()
+    assert row is not None
+    assert row[0] is None
+    assert row[1] is None
+
+
+def test_subagent_missing_meta_uses_parent_tool_use_subtype(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    session_id = "sess-nometa"
+
+    _write_jsonl(
+        enc / f"{session_id}.jsonl",
+        [
+            {
+                "type": "assistant",
+                "uuid": "p-u1",
+                "sessionId": session_id,
+                "timestamp": "2026-04-22T10:00:00Z",
+                "isSidechain": False,
+                "isMeta": False,
+                "requestId": "r1",
+                "cwd": "/home/test",
+                "message": {
+                    "id": "m1",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-5-20250929",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tu-a",
+                            "name": "Agent",
+                            "input": {"subagent_type": "general-purpose"},
+                        }
+                    ],
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            }
+        ],
+    )
+    sub_dir = enc / session_id / "subagents"
+    sub_dir.mkdir(parents=True)
+    child_path = sub_dir / "agent-abc.jsonl"
+    _write_jsonl(
+        child_path,
+        [
+            {
+                "type": "user",
+                "uuid": "c-u1",
+                "sessionId": session_id,
+                "agentId": "abc",
+                "timestamp": "2026-04-22T10:00:05Z",
+                "isSidechain": True,
+                "isMeta": False,
+                "message": {"role": "user", "content": "task"},
+            }
+        ],
+    )
+
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    row = conn.execute(
+        "SELECT subagent_type FROM subagent_spawns WHERE child_file_path=?",
+        (str(child_path),),
+    ).fetchone()
+    assert row[0] == "general-purpose"
+
+
+def test_autocompact_file_classified_separately_no_spawn_row(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """agent-acompact-<hex>.jsonl → kind='auto-compact'; no spawn row."""
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    session_id = "sess-compact"
+
+    _write_jsonl(
+        enc / f"{session_id}.jsonl",
+        [
+            {
+                "type": "user",
+                "uuid": "p-u1",
+                "sessionId": session_id,
+                "timestamp": "2026-04-22T10:00:00Z",
+                "isSidechain": False,
+                "isMeta": False,
+                "cwd": "/home/test",
+                "message": {"role": "user", "content": "do stuff"},
+            }
+        ],
+    )
+    sub_dir = enc / session_id / "subagents"
+    sub_dir.mkdir(parents=True)
+    compact_path = sub_dir / "agent-acompact-deadbeef1234.jsonl"
+    _write_jsonl(
+        compact_path,
+        [
+            {
+                "type": "user",
+                "uuid": "k-u1",
+                "sessionId": session_id,
+                "agentId": "acompact-deadbeef1234",
+                "timestamp": "2026-04-22T10:05:00Z",
+                "isSidechain": True,
+                "isMeta": False,
+                "message": {"role": "user", "content": "summarize"},
+            }
+        ],
+    )
+
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    kind_row = conn.execute(
+        "SELECT kind, agent_id FROM files WHERE path=?", (str(compact_path),)
+    ).fetchone()
+    assert kind_row[0] == "auto-compact"
+    assert kind_row[1] == "acompact-deadbeef1234"
+
+    spawn_count = conn.execute(
+        "SELECT COUNT(*) FROM subagent_spawns WHERE child_file_path=?",
+        (str(compact_path),),
+    ).fetchone()[0]
+    assert spawn_count == 0
+
+
+def test_subagent_reconcile_is_idempotent(tmp_path: Path, pricing_data: dict) -> None:
+    """Second reconcile on unchanged corpus → spawn row unchanged."""
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    session_id = "sess-idem"
+
+    _write_jsonl(
+        enc / f"{session_id}.jsonl",
+        [
+            {
+                "type": "assistant",
+                "uuid": "p-u1",
+                "sessionId": session_id,
+                "timestamp": "2026-04-22T10:00:00Z",
+                "isSidechain": False,
+                "isMeta": False,
+                "requestId": "r1",
+                "cwd": "/home/test",
+                "message": {
+                    "id": "m1",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-5-20250929",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tu",
+                            "name": "Agent",
+                            "input": {"subagent_type": "Explore"},
+                        }
+                    ],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            }
+        ],
+    )
+    sub_dir = enc / session_id / "subagents"
+    sub_dir.mkdir(parents=True)
+    child_path = sub_dir / "agent-abc.jsonl"
+    _write_jsonl(
+        child_path,
+        [
+            {
+                "type": "user",
+                "uuid": "c-u1",
+                "sessionId": session_id,
+                "agentId": "abc",
+                "timestamp": "2026-04-22T10:00:05Z",
+                "isSidechain": True,
+                "isMeta": False,
+                "message": {"role": "user", "content": "x"},
+            }
+        ],
+    )
+    (sub_dir / "agent-abc.meta.json").write_text('{"agentType":"Explore","description":"y"}')
+
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+    first = conn.execute(
+        "SELECT * FROM subagent_spawns WHERE child_file_path=?", (str(child_path),)
+    ).fetchall()
+    assert len(first) == 1
+
+    reconcile_projects_dir(conn, proj, pricing_data)
+    second = conn.execute(
+        "SELECT * FROM subagent_spawns WHERE child_file_path=?", (str(child_path),)
+    ).fetchall()
+    assert first == second
+
+
+def test_subagent_missing_parent_file_writes_null_parent(
+    tmp_path: Path,
+    pricing_data: dict,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Parent main JSONL missing → spawn row with null parent + warning."""
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    session_id = "sess-gone"
+
+    sub_dir = enc / session_id / "subagents"
+    sub_dir.mkdir(parents=True)
+    child_path = sub_dir / "agent-abc.jsonl"
+    _write_jsonl(
+        child_path,
+        [
+            {
+                "type": "user",
+                "uuid": "c-u1",
+                "sessionId": session_id,
+                "agentId": "abc",
+                "timestamp": "2026-04-22T10:00:05Z",
+                "isSidechain": True,
+                "isMeta": False,
+                "message": {"role": "user", "content": "x"},
+            }
+        ],
+    )
+
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    caplog.set_level("WARNING", logger="ccforensics.index")
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    row = conn.execute(
+        "SELECT parent_message_dedup_key FROM subagent_spawns WHERE child_file_path=?",
+        (str(child_path),),
+    ).fetchone()
+    assert row is not None
+    assert row[0] is None
+    # Warning mentions the parent-file path.
+    parent_hint = f"{session_id}.jsonl"
+    assert any(parent_hint in r.getMessage() for r in caplog.records)
