@@ -2,30 +2,33 @@
 
 Claude Code session forensics — plugin, skill, and subagent cost attribution.
 
-**Status:** v0.1.0 in flight. See the [plan](docs/plans/2026-04-21-initial-implementation.md) for progress.
+---
 
-## What it does
+## Why this exists
 
-Parses `~/.claude/projects/**/*.jsonl` and attributes every message's cost to exactly one bucket:
+I had a Claude Code session that cost $109. I had no idea where that money went.
 
-- `main` — assistant work in the primary session.
-- `subagent:<type>` — work delegated via the `Agent`/`Task` tool (e.g. `subagent:pr-review-toolkit:code-reviewer`).
-- `auto-compact` — Claude Code's internal context-compaction worker.
-- `unattributed` — subagent files whose parent Agent/Task call can't be resolved.
+The standard cost tools — ccusage, ccost, claude-devtools — gave me a total and a per-session breakdown. What they couldn't tell me was *which of my installed plugins, skills, and subagents were responsible for that $109*, and whether they were worth it.
 
-**Hard invariant:** `sum(buckets) == total session cost` — enforced structurally by SQL, verified at real-corpus scale.
+I run Claude Code with a lot of plugins: Superpowers, auto-review, pr-review-toolkit, feature-dev, and others. When I send one message and ask Claude to "review this PR," what actually happens is a cascade: a parent session spawns a `pr-review-toolkit:code-reviewer` subagent, which spawns a `pr-review-toolkit:code-simplifier`, each loading skills into context and making independent LLM calls. The $109 is the sum of all of that. Existing tools see each subagent's JSONL file as an independent mystery session with no name and no parent.
 
-Subagent buckets roll up further into the owning plugin (from `~/.claude/plugins/cache/*/`), `user-level`, `builtin`, or `unknown`. Skill activations are detected via three channels (the `Skill` tool, `Read` of a `SKILL.md`, and `SessionStart` hook injection) and surfaced in a per-session ledger.
+The closest thing to an answer I could find was ccusage's documentation: *"Per-agent cost attribution is not available from JSONL data."* That turned out to be wrong — but understandably so. They're reading each session file in isolation. The data is there; it's just spread across multiple files and requires walking the parent→child spawn tree to connect them.
 
-Answers: **"which of my installed plugins, skills, and subagents are driving my token costs, and are they worth what they cost?"**
+Claude Code writes each subagent as a **separate JSONL file** in `<session>/subagents/agent-<hex>.jsonl`. That file contains every LLM message the subagent made, with full token counts. The subagent's cost is the sum of its own file. The hard problem isn't counting the cost — it's linking that file back to the parent session's `Agent`/`Task` tool_use call, identifying the subagent type from the call's input or the sibling `meta.json`, and resolving which installed plugin owns that agent type.
+
+Once you have that chain, you can answer the questions that actually matter: **which plugins are driving my spend, are they earning it, and what would I need to change to reduce costs without losing value?**
+
+That's what ccforensics does.
+
+---
 
 ## Install
 
-Not yet published. When v0.1.0 ships:
-
 ```bash
-uv tool install git+https://github.com/jlixfeld/ccforensics@v0.1.0
+uv tool install git+https://github.com/jlixfeld/ccforensics
 ```
+
+Requires Python 3.13+.
 
 ## Quick start
 
@@ -63,14 +66,14 @@ ccforensics session list [--project P] [--since D] [--until D]
 
 ### `session show <spec>`
 
-Deep per-session report: header, cost by bucket, cost by plugin, (optional) unattributed detail, skill activations, parse notes.
+Deep per-session report: cost by bucket, cost by plugin, skill activations, parse notes. Optionally include unattributed spawn detail.
 
 ```
 ccforensics session show <spec> [--include-unattributed]
                                 [--json | --csv] [--no-refresh]
 ```
 
-`<spec>` is a full session id, a prefix of ≥6 characters, or an absolute path to a session JSONL file.
+`<spec>` accepts a full session id, a prefix of ≥6 characters, or an absolute path to a session JSONL file.
 
 ### `aggregate`
 
@@ -93,11 +96,9 @@ ccforensics plugins [--since D] [--until D] [--json | --csv] [--no-refresh]
 ### `index rebuild` / `index stats`
 
 ```
-ccforensics index rebuild [--force] [--yes]   # incremental by default
+ccforensics index rebuild [--force] [--yes]   # incremental by default; --force re-parses everything
 ccforensics index stats                        # row counts + last-refresh
 ```
-
-`--force` drops and re-parses from scratch.
 
 ## Date formats
 
@@ -109,29 +110,35 @@ All `--since` / `--until` accept:
 
 ## How it works
 
-The index lives at `~/.cache/ccforensics/index.sqlite` (or the platform equivalent) and contains:
+The index lives at `~/.cache/ccforensics/index.sqlite` and is incrementally reconciled on each run — only files that have changed since the last run are re-parsed. A no-change reconcile completes in under a second on large histories.
 
-- `files` — one row per JSONL file, reconciled by `(path, mtime, size)`.
-- `messages` — dedup-collapsed per `(message.id, requestId)` with content-richest-wins tiebreak.
-- `subagent_spawns` — one row per subagent JSONL, linked to its parent `Agent`/`Task` tool_use.
-- `session_summaries` — per-session header data (project, total, summary).
-- `session_rollups` — per-(session, bucket) token + cost totals.
-- `skill_activations` — every detected skill load, with source and content size.
-- `plugins` / `user_level_artifacts` — registry of installed plugin versions and user-level skills/agents.
+Every message's cost is attributed to exactly one bucket:
 
-Pricing is pulled from LiteLLM's [model_prices_and_context_window.json](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) once per 24h, cached on disk. Per-token cost = `input + output + cache_creation + cache_read`, matching ccusage within ±1% on overlapping sessions (SC2).
+- `main` — assistant work in the primary session.
+- `subagent:<type>` — work delegated via the `Agent`/`Task` tool (e.g. `subagent:pr-review-toolkit:code-reviewer`).
+- `auto-compact` — Claude Code's internal context-compaction worker.
+- `unattributed` — subagent files whose parent Agent/Task call can't be resolved (~0.5% on real corpus).
+
+`sum(buckets) == total session cost` is a hard invariant enforced structurally by SQL.
+
+Subagent buckets roll up to the owning plugin via a scan of `~/.claude/plugins/cache/*/`. Skill activations are detected via three channels — the `Skill` tool, `Read` of a `SKILL.md`, and `SessionStart` hook injection — and surfaced in a per-session ledger.
+
+### Cross-file subagent linkage
+
+For each subagent JSONL at `<session>/subagents/agent-<hex>.jsonl`:
+
+1. Read the sibling `agent-<hex>.meta.json` for the authoritative `agentType`.
+2. Scan the parent session for `Agent`/`Task` tool_use blocks emitted before the subagent's first message.
+3. Rank candidates by `(type_match, timestamp)` — prefer the nearest-before call whose `input.subagent_type` matches the meta type.
+4. That parent tool_use ID becomes the attribution anchor; the plugin registry resolves which plugin owns it.
+
+Pricing is pulled from LiteLLM's model pricing data once per 24h, cached on disk, with a hardcoded fallback for current Claude models if the network is unavailable.
 
 ## Known limitations
 
-- **Skill context-carry ± band is not yet computed.** Skill activations are detected, content size is measured, but `estimated_cost_usd` in the ledger is `NULL`. Deferred to M8.2.
-- **Plugin-path match requires `/plugins/cache/` in the path.** Non-standard install locations may not classify correctly.
-- **~0.5% of subagent spawns are unresolvable** (parent session rotated or no Agent/Task call before `ts_spawned`). Their cost lands in `unattributed`.
-
-## Design + plan
-
-- [Problem statement](docs/specs/problem-statement.md)
-- [Design specification](docs/specs/design.md)
-- [Initial implementation plan](docs/plans/2026-04-21-initial-implementation.md)
+- **Skill context-carry cost estimates are not yet computed.** Skill activations are detected and content size is measured, but the estimated cost band in the ledger is `NULL`.
+- **Plugin-path matching requires `/plugins/cache/` in the path.** Non-standard install locations may not classify correctly.
+- **~0.5% of subagent spawns are unresolvable** when the parent session rotated or had no `Agent`/`Task` call before the subagent's first message. Their cost lands in `unattributed`.
 
 ## License
 
