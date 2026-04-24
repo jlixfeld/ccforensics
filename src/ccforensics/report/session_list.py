@@ -77,7 +77,12 @@ def query_session_list(
         sql += " WHERE " + " AND ".join(where)
     # NULLs sort last regardless of direction — matches "unresolved cost
     # shouldn't outrank a known $5 session just because you flipped reverse".
-    sql += f" ORDER BY {col} IS NULL, {col} {direction}, session_id"
+    # Within a primary-key tie, order by ``last_active_at DESC`` before
+    # ``session_id``: on a real corpus, sort columns like ``cost`` and
+    # ``turns`` routinely have huge tie-pools (thousands of $0 ingestion
+    # sessions, many 1-turn sessions) and alphabetical-by-id makes ``--limit``
+    # return arbitrary rows. Most-recent-first is the informative tiebreak.
+    sql += f" ORDER BY {col} IS NULL, {col} {direction}, last_active_at DESC, session_id"
     if limit is not None:
         sql += f" LIMIT {int(limit)}"
     cur = conn.execute(sql, params)

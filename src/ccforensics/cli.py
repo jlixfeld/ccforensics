@@ -99,7 +99,15 @@ def session() -> None:
     show_default=True,
     help="Column to sort on.",
 )
-@click.option("--reverse", is_flag=True, help="Reverse the sort order.")
+@click.option(
+    "--reverse",
+    is_flag=True,
+    help=(
+        "Reverse the sort order. Default is descending for every column "
+        "(highest cost, most recent, most turns first), so --reverse gives "
+        "ascending. Within ties, rows are ordered most-recently-active first."
+    ),
+)
 @click.option("--limit", type=int, help="Cap the number of rows.")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON to stdout.")
 @click.option("--csv", "as_csv", is_flag=True, help="Emit CSV to stdout.")

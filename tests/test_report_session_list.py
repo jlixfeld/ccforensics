@@ -138,6 +138,44 @@ def test_query_reverse_keeps_nulls_last(conn: sqlite3.Connection) -> None:
     assert [r.session_id for r in rows] == ["s-lo", "s-hi", "s-null"]
 
 
+def test_query_ties_break_by_last_active_desc_then_session_id(
+    conn: sqlite3.Connection,
+) -> None:
+    """Within a sort-column tie, rows must come back most-recently-active first,
+    not alphabetically by session_id.
+
+    Motivation: on real corpora, ``--sort cost --reverse --limit N`` often has
+    thousands of $0-cost ties (bulk ingestion sessions). Tiebreaking by
+    session_id alphabetically made ``--limit`` return meaningless rows — the
+    first-alphabetically 10 $0 sessions rather than anything useful.
+    Tiebreaking by ``last_active_at DESC`` surfaces the most recent entries in
+    the tie-pool, which is what a user skimming the top-N actually wants.
+    """
+    # Three $0 sessions; session_id alphabetical order is opposite to
+    # last_active_at order so we can distinguish the tiebreakers.
+    _insert_summary(conn, session_id="aaa", total_cost_usd=0.0, last_active_at=100)
+    _insert_summary(conn, session_id="bbb", total_cost_usd=0.0, last_active_at=300)
+    _insert_summary(conn, session_id="ccc", total_cost_usd=0.0, last_active_at=200)
+    conn.commit()
+
+    rows = query_session_list(conn, sort_key="cost", reverse=True)
+    assert [r.session_id for r in rows] == ["bbb", "ccc", "aaa"]
+
+
+def test_query_same_last_active_falls_back_to_session_id(
+    conn: sqlite3.Connection,
+) -> None:
+    """When both the primary key and last_active_at tie, session_id keeps
+    the ordering deterministic so --limit and JSON output are stable."""
+    _insert_summary(conn, session_id="s-c", total_cost_usd=0.0, last_active_at=100)
+    _insert_summary(conn, session_id="s-a", total_cost_usd=0.0, last_active_at=100)
+    _insert_summary(conn, session_id="s-b", total_cost_usd=0.0, last_active_at=100)
+    conn.commit()
+
+    rows = query_session_list(conn, sort_key="cost")
+    assert [r.session_id for r in rows] == ["s-a", "s-b", "s-c"]
+
+
 def test_query_limit_caps_rows(conn: sqlite3.Connection) -> None:
     for i in range(5):
         _insert_summary(conn, session_id=f"s{i}", last_active_at=100 + i)
