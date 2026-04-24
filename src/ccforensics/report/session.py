@@ -44,6 +44,21 @@ class BucketRow:
 
 
 @dataclass
+class ModelRow:
+    """Per-model rollup for a single session. Rows with ``model IS NULL`` in
+    ``messages`` are infrastructure (queue-operation, progress, system) and
+    carry $0 — they're excluded at query time."""
+
+    model: str
+    cost_usd: float
+    message_count: int
+    input_tokens: int
+    output_tokens: int
+    cache_create: int
+    cache_read: int
+
+
+@dataclass
 class PluginRow:
     """Plugin-level rollup.
 
@@ -87,6 +102,7 @@ class SessionReport:
     header: SessionHeader
     buckets: list[BucketRow] = field(default_factory=list)
     plugins: list[PluginRow] = field(default_factory=list)
+    models: list[ModelRow] = field(default_factory=list)
     unattributed_items: list[UnattributedItem] = field(default_factory=list)
     parse_notes: ParseNotes | None = None
     skill_ledger: list[SkillLedgerEntry] = field(default_factory=list)
@@ -127,6 +143,35 @@ def _load_header(conn: sqlite3.Connection, session_id: str) -> SessionHeader:
         summary_text=row[6],
         summary_source=row[7],
     )
+
+
+def _load_models(conn: sqlite3.Connection, session_id: str) -> list[ModelRow]:
+    rows = conn.execute(
+        """SELECT model,
+                  COALESCE(SUM(cost_usd), 0),
+                  COUNT(*),
+                  COALESCE(SUM(input_tokens), 0),
+                  COALESCE(SUM(output_tokens), 0),
+                  COALESCE(SUM(cache_creation), 0),
+                  COALESCE(SUM(cache_read), 0)
+             FROM messages
+            WHERE session_id=? AND model IS NOT NULL
+            GROUP BY model
+            ORDER BY SUM(cost_usd) DESC, model""",
+        (session_id,),
+    ).fetchall()
+    return [
+        ModelRow(
+            model=r[0],
+            cost_usd=float(r[1] or 0.0),
+            message_count=int(r[2] or 0),
+            input_tokens=int(r[3] or 0),
+            output_tokens=int(r[4] or 0),
+            cache_create=int(r[5] or 0),
+            cache_read=int(r[6] or 0),
+        )
+        for r in rows
+    ]
 
 
 def _load_buckets(conn: sqlite3.Connection, session_id: str) -> list[BucketRow]:
@@ -250,6 +295,7 @@ def build_session_report(
     header = _load_header(conn, session_id)
     buckets = _load_buckets(conn, session_id)
     plugins = _rollup_plugins(conn, buckets)
+    models = _load_models(conn, session_id)
     items = _load_unattributed_items(conn, session_id) if include_unattributed else []
     parse_notes = _load_parse_notes(conn, session_id)
     skill_ledger = _load_skill_ledger(conn, session_id)
@@ -257,6 +303,7 @@ def build_session_report(
         header=header,
         buckets=buckets,
         plugins=plugins,
+        models=models,
         unattributed_items=items,
         parse_notes=parse_notes,
         skill_ledger=skill_ledger,
@@ -319,6 +366,28 @@ def _render_buckets(buckets: list[BucketRow]) -> Table:
     return t
 
 
+def _render_models(models: list[ModelRow]) -> Table:
+    t = Table(title="Cost by model", show_edge=False)
+    t.add_column("model", style="yellow")
+    t.add_column("cost", justify="right")
+    t.add_column("msgs", justify="right")
+    t.add_column("in", justify="right")
+    t.add_column("out", justify="right")
+    t.add_column("cache_create", justify="right")
+    t.add_column("cache_read", justify="right")
+    for m in models:
+        t.add_row(
+            m.model,
+            format_cost(m.cost_usd),
+            f"{m.message_count:,}",
+            f"{m.input_tokens:,}",
+            f"{m.output_tokens:,}",
+            f"{m.cache_create:,}",
+            f"{m.cache_read:,}",
+        )
+    return t
+
+
 def _render_plugins(plugins: list[PluginRow]) -> Table:
     t = Table(title="Cost by plugin", show_edge=False)
     t.add_column("source", style="magenta")
@@ -355,9 +424,7 @@ def _render_skill_ledger(ledger: list[SkillLedgerEntry]) -> Table:
         ts = datetime.fromtimestamp(entry.activated_at, tz=UTC).strftime("%m-%d %H:%M")
         size = f"{entry.content_size:,}" if entry.content_size is not None else "-"
         cost = (
-            format_cost(entry.estimated_cost_usd)
-            if entry.estimated_cost_usd is not None
-            else "-"
+            format_cost(entry.estimated_cost_usd) if entry.estimated_cost_usd is not None else "-"
         )
         t.add_row(
             ts,
@@ -387,6 +454,8 @@ def render_session_report(report: SessionReport) -> RenderableType:
         _render_buckets(report.buckets),
         _render_plugins(report.plugins),
     ]
+    if report.models:
+        sections.append(_render_models(report.models))
     if report.unattributed_items:
         sections.append(_render_unattributed(report.unattributed_items))
     if report.skill_ledger:

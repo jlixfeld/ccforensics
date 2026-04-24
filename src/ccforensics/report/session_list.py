@@ -47,6 +47,7 @@ def query_session_list(
     since: datetime | None = None,
     until: datetime | None = None,
     grep: str | None = None,
+    model: str | None = None,
     sort_key: SortKey = "last-active",
     reverse: bool = False,
     limit: int | None = None,
@@ -65,6 +66,17 @@ def query_session_list(
     if grep:
         where.append("LOWER(IFNULL(summary_text,'')) LIKE ?")
         params.append(f"%{grep.lower()}%")
+    if model:
+        # Session-level membership filter: the returned cost column is still
+        # the full session cost, not the per-model slice. Use
+        # ``aggregate --model`` for per-model dollars.
+        where.append(
+            "session_id IN ("
+            "SELECT DISTINCT session_id FROM messages "
+            "WHERE model IS NOT NULL AND LOWER(model) LIKE ?"
+            ")"
+        )
+        params.append(f"%{model.lower()}%")
 
     col = _SORT_COLUMN[sort_key]
     direction = "ASC" if reverse else "DESC"

@@ -34,6 +34,7 @@ def _make_session(
     cwd: str = "/home/test",
     ts: str = "2026-04-22T10:00:00Z",
     subagent_type: str | None = None,
+    model: str = "claude-sonnet-4-5-20250929",
 ) -> None:
     """Build a minimal main-only or main+subagent session."""
     enc = proj / "-home-test"
@@ -71,7 +72,7 @@ def _make_session(
                 "message": {
                     "id": f"m-{sid}",
                     "role": "assistant",
-                    "model": "claude-sonnet-4-5-20250929",
+                    "model": model,
                     "content": main_content,
                     "usage": {"input_tokens": 10, "output_tokens": 5},
                 },
@@ -202,6 +203,163 @@ def test_aggregate_group_by_day_uses_last_active(tmp_path: Path, pricing_data: d
     keys = {r.group_key: r.session_count for r in rows}
     assert keys.get("2026-04-22") == 2
     assert keys.get("2026-04-23") == 1
+
+
+# ---------- aggregate: --group-by model & --model filter ----------
+
+
+def test_aggregate_group_by_model_returns_row_per_model(tmp_path: Path, pricing_data: dict) -> None:
+    """One row per distinct ``messages.model`` (NULL models are
+    non-billable infrastructure rows and must not show up)."""
+    proj = tmp_path / "projects"
+    _make_session(proj, "s-sonnet", model="claude-sonnet-4-5-20250929")
+    _make_session(proj, "s-opus", model="claude-opus-4-7")
+
+    db = tmp_path / "idx.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    rows = query_aggregate(conn, group_by="model")
+    keys = {r.group_key for r in rows}
+    assert "claude-sonnet-4-5-20250929" in keys
+    assert "claude-opus-4-7" in keys
+    # No NULL / '<none>' row leaks into the output.
+    assert "<none>" not in keys
+    assert None not in keys
+
+
+def test_aggregate_model_filter_restricts_cost_to_matching_messages(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """``--model opus`` over a session that used BOTH opus and sonnet returns
+    only the opus cost, not whole-session cost — this is the whole point of
+    adding a message-level model filter."""
+    proj = tmp_path / "projects"
+    enc = proj / "-home-mixed"
+    sid = "mixed"
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            {
+                "type": "user",
+                "uuid": "u1",
+                "sessionId": sid,
+                "timestamp": "2026-04-22T10:00:00Z",
+                "isSidechain": False,
+                "isMeta": False,
+                "cwd": "/home/mixed",
+                "message": {"role": "user", "content": "hi"},
+            },
+            {
+                "type": "assistant",
+                "uuid": "u2",
+                "sessionId": sid,
+                "timestamp": "2026-04-22T10:00:01Z",
+                "isSidechain": False,
+                "isMeta": False,
+                "requestId": "r-sonnet",
+                "message": {
+                    "id": "m-sonnet",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-5-20250929",
+                    "content": [{"type": "text", "text": "a"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            },
+            {
+                "type": "assistant",
+                "uuid": "u3",
+                "sessionId": sid,
+                "timestamp": "2026-04-22T10:00:02Z",
+                "isSidechain": False,
+                "isMeta": False,
+                "requestId": "r-opus",
+                "message": {
+                    "id": "m-opus",
+                    "role": "assistant",
+                    "model": "claude-opus-4-7",
+                    "content": [{"type": "text", "text": "b"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            },
+        ],
+    )
+
+    db = tmp_path / "idx.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    unfiltered = query_aggregate(conn, group_by="none")
+    opus_only = query_aggregate(conn, model="opus", group_by="none")
+
+    # Both are a single '(all)' row; both > 0. Opus-only must be STRICTLY
+    # less than the total (since there's at least one sonnet message).
+    assert unfiltered[0].total_cost_usd > 0
+    assert opus_only[0].total_cost_usd > 0
+    assert opus_only[0].total_cost_usd < unfiltered[0].total_cost_usd
+
+
+def test_aggregate_model_filter_combines_with_project_group(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """``--model X --group-by project`` gives per-project cost for model X only."""
+    proj = tmp_path / "projects"
+    _make_session(proj, "s-a-opus", cwd="/home/proj-a", model="claude-opus-4-7")
+    _make_session(proj, "s-a-sonnet", cwd="/home/proj-a", model="claude-sonnet-4-5-20250929")
+    _make_session(proj, "s-b-opus", cwd="/home/proj-b", model="claude-opus-4-7")
+
+    db = tmp_path / "idx.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    rows = query_aggregate(conn, model="opus", group_by="project")
+    by_proj = {r.group_key: r for r in rows}
+    # Both projects had opus activity → both appear.
+    assert "/home/proj-a" in by_proj
+    assert "/home/proj-b" in by_proj
+    # Sonnet-only projects must not appear; the session_count for proj-a
+    # counts ONLY the opus session, not the sonnet one.
+    assert by_proj["/home/proj-a"].session_count == 1
+    assert by_proj["/home/proj-b"].session_count == 1
+
+
+def test_aggregate_model_filter_is_case_insensitive_substring(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """Mirrors ``--project`` semantics — ``opus`` matches ``claude-opus-4-7``."""
+    proj = tmp_path / "projects"
+    _make_session(proj, "s1", model="claude-opus-4-7")
+
+    db = tmp_path / "idx.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    lower = query_aggregate(conn, model="opus", group_by="none")
+    upper = query_aggregate(conn, model="OPUS", group_by="none")
+    assert lower[0].total_cost_usd > 0
+    assert upper[0].total_cost_usd == lower[0].total_cost_usd
+
+
+def test_aggregate_model_filter_rejects_plugin_group(tmp_path: Path, pricing_data: dict) -> None:
+    """Combining ``--model`` with ``--group-by plugin`` is out of scope for v1:
+    plugin bucketing routes through ``session_rollups``, which has no model
+    dimension. We reject the combo loudly rather than silently returning
+    whole-session cost that ignores the model filter.
+    """
+    proj = tmp_path / "projects"
+    _make_session(proj, "s1", model="claude-opus-4-7")
+
+    db = tmp_path / "idx.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    with pytest.raises(ValueError, match=r"model.*plugin"):
+        query_aggregate(conn, model="opus", group_by="plugin")
 
 
 # ---------- plugins ----------

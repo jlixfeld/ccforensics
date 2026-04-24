@@ -154,6 +154,55 @@ def test_build_session_report_has_header_and_buckets(tmp_path: Path, pricing_dat
     assert ("subagent", "pr-review-toolkit:code-reviewer") in bucket_kinds
 
 
+def test_session_report_includes_per_model_rollup(tmp_path: Path, pricing_data: dict) -> None:
+    """The report surfaces per-``messages.model`` cost + tokens, so a user
+    looking at ``session show`` can see what each model actually cost in that
+    session. Infrastructure rows (model IS NULL) must not leak into the list.
+    """
+    proj = tmp_path / "projects"
+    enc = proj / "-home-mixed"
+    sid = "sess-mixed-models"
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            _user("u1", sid, "2026-04-22T10:00:00Z", "hi", cwd="/home/mixed"),
+            _assistant(
+                "u2",
+                sid,
+                "2026-04-22T10:00:05Z",
+                msg_id="m-sonnet",
+                req_id="r-sonnet",
+                model="claude-sonnet-4-5-20250929",
+            ),
+            _assistant(
+                "u3",
+                sid,
+                "2026-04-22T10:00:10Z",
+                msg_id="m-opus",
+                req_id="r-opus",
+                model="claude-opus-4-7",
+            ),
+        ],
+    )
+
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    report = build_session_report(conn, sid)
+    models = {m.model: m for m in report.models}
+    assert "claude-sonnet-4-5-20250929" in models
+    assert "claude-opus-4-7" in models
+    # Cost per model is populated and > 0 for both.
+    assert models["claude-sonnet-4-5-20250929"].cost_usd > 0
+    assert models["claude-opus-4-7"].cost_usd > 0
+    # Rollup totals across models match the raw messages-level sum.
+    total = sum(m.cost_usd for m in report.models)
+    header_cost = report.header.total_cost_usd or 0.0
+    assert abs(total - header_cost) < 1e-6
+
+
 def test_plugin_rollup_resolves_known_plugin(tmp_path: Path, pricing_data: dict) -> None:
     conn, sid = _reconcile(tmp_path, pricing_data)
     # Seed the plugins table so the pr-review-toolkit namespace resolves.

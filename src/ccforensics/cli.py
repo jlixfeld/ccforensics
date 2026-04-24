@@ -92,6 +92,15 @@ def session() -> None:
     ),
 )
 @click.option(
+    "--model",
+    help=(
+        "Filter to sessions that had at least one message using a model matching "
+        "this substring (case-insensitive, e.g. 'opus'). The displayed cost is "
+        "still the whole-session cost, not the per-model slice — use "
+        "`aggregate --model` for per-model dollars."
+    ),
+)
+@click.option(
     "--sort",
     "sort_key",
     type=click.Choice(["cost", "started", "last-active", "turns"]),
@@ -123,6 +132,7 @@ def session_list(
     since: str | None,
     until: str | None,
     grep: str | None,
+    model: str | None,
     sort_key: str,
     reverse: bool,
     limit: int | None,
@@ -151,6 +161,7 @@ def session_list(
         since=since_dt,
         until=until_dt,
         grep=grep,
+        model=model,
         sort_key=sort_key,  # type: ignore[arg-type]
         reverse=reverse,
         limit=limit,
@@ -266,9 +277,17 @@ def session_show(
 @click.option("--until", help="Date filter: YYYY-MM-DD | Nd | today | yesterday")
 @click.option("--project", help="Filter by project path substring (case-insensitive).")
 @click.option(
+    "--model",
+    help=(
+        "Filter to messages whose model matches this substring (case-insensitive, "
+        "e.g. 'opus'). Cost is the per-model slice, not whole-session cost. "
+        "Not compatible with --group-by plugin."
+    ),
+)
+@click.option(
     "--group-by",
     "group_by",
-    type=click.Choice(["none", "project", "day", "week", "month", "plugin"]),
+    type=click.Choice(["none", "project", "day", "week", "month", "plugin", "model"]),
     default="none",
     show_default=True,
     help="Group-by key for aggregation.",
@@ -284,6 +303,7 @@ def aggregate(
     since: str | None,
     until: str | None,
     project: str | None,
+    model: str | None,
     group_by: str,
     as_json: bool,
     as_csv: bool,
@@ -303,13 +323,17 @@ def aggregate(
     since_dt = parse_since(since) if since else None
     until_dt = parse_until(until) if until else None
 
-    rows = query_aggregate(
-        conn,
-        since=since_dt,
-        until=until_dt,
-        project=project,
-        group_by=group_by,  # type: ignore[arg-type]
-    )
+    try:
+        rows = query_aggregate(
+            conn,
+            since=since_dt,
+            until=until_dt,
+            project=project,
+            model=model,
+            group_by=group_by,  # type: ignore[arg-type]
+        )
+    except ValueError as e:
+        raise click.UsageError(str(e)) from e
 
     if as_json:
         write_json([dataclasses.asdict(r) for r in rows], sys.stdout)

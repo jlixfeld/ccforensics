@@ -226,6 +226,65 @@ def test_query_filter_grep_handles_null_summary(conn: sqlite3.Connection) -> Non
     assert [r.session_id for r in rows] == ["sB"]
 
 
+def _insert_file_and_message(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    model: str | None,
+    dedup_key_suffix: str = "",
+) -> None:
+    """Minimal messages-table seed so ``--model`` filter has data to match.
+
+    Writes a ``files`` row first (FK requirement) then a single assistant
+    message with the given model.
+    """
+    path = f"/fake/{session_id}{dedup_key_suffix}.jsonl"
+    conn.execute(
+        """INSERT OR IGNORE INTO files (path, mtime_ns, size, session_id, kind,
+               agent_id, schema_version, parse_warnings, last_parsed_at)
+           VALUES (?, 0, 0, ?, 'main', NULL, NULL, 0, 0)""",
+        (path, session_id),
+    )
+    conn.execute(
+        """INSERT INTO messages (dedup_key, file_path, session_id, role, type,
+               model, ts, is_sidechain, is_meta)
+           VALUES (?, ?, ?, 'assistant', 'assistant', ?, 0, 0, 0)""",
+        (f"k-{session_id}-{dedup_key_suffix or 'a'}", path, session_id, model),
+    )
+
+
+def test_query_filter_model_case_insensitive_substring(conn: sqlite3.Connection) -> None:
+    """``--model opus`` returns sessions that had at least one message whose
+    model matches the substring (case-insensitive). Mirrors --project shape."""
+    _insert_summary(conn, session_id="s-opus")
+    _insert_file_and_message(conn, session_id="s-opus", model="claude-opus-4-7")
+    _insert_summary(conn, session_id="s-sonnet")
+    _insert_file_and_message(conn, session_id="s-sonnet", model="claude-sonnet-4-5-20250929")
+    _insert_summary(conn, session_id="s-mixed")
+    _insert_file_and_message(conn, session_id="s-mixed", model="claude-opus-4-7")
+    _insert_file_and_message(
+        conn, session_id="s-mixed", model="claude-sonnet-4-5-20250929", dedup_key_suffix="b"
+    )
+    conn.commit()
+
+    rows = query_session_list(conn, model="opus")
+    assert sorted(r.session_id for r in rows) == ["s-mixed", "s-opus"]
+
+    rows = query_session_list(conn, model="OPUS")
+    assert sorted(r.session_id for r in rows) == ["s-mixed", "s-opus"]
+
+
+def test_query_filter_model_ignores_null_model_rows(conn: sqlite3.Connection) -> None:
+    """Sessions whose only messages have ``model IS NULL`` (infra rows —
+    queue-operation, progress, etc.) must not match any model filter."""
+    _insert_summary(conn, session_id="s-infra-only")
+    _insert_file_and_message(conn, session_id="s-infra-only", model=None)
+    conn.commit()
+
+    rows = query_session_list(conn, model="opus")
+    assert rows == []
+
+
 def test_query_filter_since_until(conn: sqlite3.Connection) -> None:
     _insert_summary(conn, session_id="sA", last_active_at=100)
     _insert_summary(conn, session_id="sB", last_active_at=200)
