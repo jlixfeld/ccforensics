@@ -58,7 +58,7 @@ def _is_pure_hook_injection(text: str) -> bool:
     return _HOOK_INJECTION_MARKER in text and len(text) > 500
 
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 MIGRATIONS: list[list[str]] = [
     [
@@ -103,10 +103,16 @@ MIGRATIONS: list[list[str]] = [
         "CREATE INDEX idx_messages_source_tool ON messages(source_tool_use_id)",
         "CREATE INDEX idx_messages_agent ON messages(agent_id)",
         "CREATE INDEX idx_messages_ts ON messages(ts)",
+        # ``parent_message_dedup_key`` uses ``ON DELETE SET NULL`` so that
+        # re-reconciling a main session file (which purges-then-reinserts its
+        # messages) doesn't crash on the FK when a subagent spawn from a prior
+        # run still references one of those messages. The post-walk
+        # orphan-spawn re-resolve pass re-establishes the linkage using the
+        # freshly parsed parent entries — see ``_reresolve_spawns_for_sessions``.
         """CREATE TABLE subagent_spawns (
             spawn_id                  TEXT PRIMARY KEY,
             parent_session_id         TEXT NOT NULL,
-            parent_message_dedup_key  TEXT REFERENCES messages(dedup_key),
+            parent_message_dedup_key  TEXT REFERENCES messages(dedup_key) ON DELETE SET NULL,
             child_agent_id            TEXT,
             child_file_path           TEXT,
             subagent_type             TEXT,
@@ -172,6 +178,35 @@ MIGRATIONS: list[list[str]] = [
             cache_read     INTEGER NOT NULL,
             PRIMARY KEY (session_id, bucket_kind, bucket_name)
         )""",
+    ],
+    # v1 → v2: rebuild ``subagent_spawns`` so its FK to ``messages.dedup_key``
+    # is ``ON DELETE SET NULL`` instead of the default NO ACTION. Existing
+    # rows carry valid dedup_keys (populated by the same code path that still
+    # exists post-migration), so the data copy is safe. Indexes are attached
+    # to the renamed table and get dropped with it; we recreate them.
+    [
+        "ALTER TABLE subagent_spawns RENAME TO _subagent_spawns_v1",
+        """CREATE TABLE subagent_spawns (
+            spawn_id                  TEXT PRIMARY KEY,
+            parent_session_id         TEXT NOT NULL,
+            parent_message_dedup_key  TEXT REFERENCES messages(dedup_key) ON DELETE SET NULL,
+            child_agent_id            TEXT,
+            child_file_path           TEXT,
+            subagent_type             TEXT,
+            description               TEXT,
+            model                     TEXT,
+            ts_spawned                INTEGER NOT NULL,
+            ts_returned               INTEGER,
+            total_cost_usd            REAL,
+            total_input               INTEGER,
+            total_output              INTEGER,
+            total_cache_create        INTEGER,
+            total_cache_read          INTEGER
+        )""",
+        "INSERT INTO subagent_spawns SELECT * FROM _subagent_spawns_v1",
+        "DROP TABLE _subagent_spawns_v1",
+        "CREATE INDEX idx_spawns_session ON subagent_spawns(parent_session_id)",
+        "CREATE INDEX idx_spawns_type ON subagent_spawns(subagent_type)",
     ],
 ]
 
@@ -367,6 +402,36 @@ def _reconcile_spawn(
     )
 
 
+def _reresolve_spawns_for_sessions(
+    conn: sqlite3.Connection,
+    session_ids: set[str],
+    parent_cache: dict[Path, list[TranscriptEntry]],
+) -> None:
+    """Re-run spawn discovery for every subagent in the given sessions.
+
+    Needed because reconciling a main session file DELETEs its ``messages``
+    rows before re-inserting them, which under the v2 ``ON DELETE SET NULL``
+    FK cascades every pointing spawn's ``parent_message_dedup_key`` to NULL.
+    ``_reconcile_spawn`` writes via INSERT OR REPLACE, so re-running it on
+    subagent files whose own mtime didn't change is safe and idempotent.
+    """
+    for sid in session_ids:
+        rows = conn.execute(
+            "SELECT path, agent_id FROM files WHERE session_id=? AND kind='subagent'",
+            (sid,),
+        ).fetchall()
+        for sub_path, agent_id in rows:
+            try:
+                _reconcile_spawn(conn, Path(sub_path), sid, agent_id, parent_cache)
+            except (OSError, sqlite3.Error):
+                logger.warning(
+                    "failed to re-resolve spawn for %s (session %s); leaving prior state",
+                    sub_path,
+                    sid,
+                    exc_info=True,
+                )
+
+
 def _row_is_unchanged(conn: sqlite3.Connection, path: Path, mtime_ns: int, size: int) -> bool:
     cur = conn.execute("SELECT mtime_ns, size FROM files WHERE path=?", (str(path),))
     row = cur.fetchone()
@@ -453,7 +518,9 @@ def reconcile_file(conn: sqlite3.Connection, path: Path, pricing_data: dict[str,
     result = parse_file(path)
     annotated = annotate_cost(result.entries, pricing_data)
 
-    unresolved_models = {a.pricing_unresolved_model for a in annotated if a.pricing_unresolved_model}
+    unresolved_models = {
+        a.pricing_unresolved_model for a in annotated if a.pricing_unresolved_model
+    }
     for model in sorted(unresolved_models):
         logger.warning(
             "pricing unresolved for model %r in %s — messages recorded with NULL cost",
@@ -668,6 +735,12 @@ def reconcile_projects_dir(
         return stats
 
     parent_cache: dict[Path, list[TranscriptEntry]] = {}
+    # Sessions whose main file was re-ingested this pass. The v2 FK on
+    # ``subagent_spawns.parent_message_dedup_key`` cascades to NULL when the
+    # parent message row is DELETEd during the main file's purge, so every
+    # subagent in these sessions needs spawn discovery re-run to restore the
+    # linkage — including subagents whose own files didn't change.
+    main_touched_sessions: set[str] = set()
 
     # Sort by string form (not Path's part-by-part compare) so that
     # ``<enc>/<sess>.jsonl`` sorts before ``<enc>/<sess>/subagents/...``.
@@ -683,10 +756,16 @@ def reconcile_projects_dir(
         reconcile_file(conn, path, pricing_data)
         if kind == "subagent":
             _reconcile_spawn(conn, path, session_id, agent_id, parent_cache)
+        elif kind == "main":
+            main_touched_sessions.add(session_id)
         conn.commit()
         stats.files_indexed += 1
         stats.files_changed += 1
         stats.sessions_recomputed.add(session_id)
+
+    if main_touched_sessions:
+        _reresolve_spawns_for_sessions(conn, main_touched_sessions, parent_cache)
+        conn.commit()
 
     # Refresh the plugin + user-level registry once per reconcile pass.
     # Cheap (~100ms on a real install) and keeps the registry in lockstep

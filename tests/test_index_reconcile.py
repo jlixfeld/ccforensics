@@ -599,8 +599,7 @@ def test_unresolved_pricing_model_emits_warning(
     reconcile_projects_dir(conn, proj, pricing_data)
 
     assert any(
-        "pricing unresolved" in r.getMessage()
-        and "unreleased-model-xyz-20300101" in r.getMessage()
+        "pricing unresolved" in r.getMessage() and "unreleased-model-xyz-20300101" in r.getMessage()
         for r in caplog.records
     )
     # The message row survives with NULL cost.
@@ -699,9 +698,7 @@ def test_per_session_recompute_isolates_toctou_oserror(
     assert any("failed to recompute" in r.getMessage() for r in caplog.records)
 
 
-def test_schema_version_selection_is_deterministic(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_schema_version_selection_is_deterministic(tmp_path: Path, pricing_data: dict) -> None:
     """A file containing multiple schema versions must store the minimum.
 
     Set iteration order is non-deterministic across runs, so picking via
@@ -742,8 +739,143 @@ def test_schema_version_selection_is_deterministic(
     ensure_schema(conn)
     reconcile_projects_dir(conn, proj, pricing_data)
 
-    row = conn.execute(
-        "SELECT schema_version FROM files WHERE session_id=?", (sid,)
-    ).fetchone()
+    row = conn.execute("SELECT schema_version FROM files WHERE session_id=?", (sid,)).fetchone()
     assert row is not None
     assert row[0] == "1.0.65"
+
+
+def test_main_file_modified_after_subagent_indexed_does_not_raise(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """Regression: if a main session file is re-processed after its subagent has
+    been indexed (so ``subagent_spawns.parent_message_dedup_key`` already
+    references a message in the main file), purging the main file's messages
+    used to fail ``FOREIGN KEY constraint failed``. Post-fix, the FK cascades
+    to NULL on delete and a re-resolve pass restores the linkage.
+    """
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test-proj"
+    session_id = "sess-edit"
+
+    parent_entries = [
+        {
+            "type": "user",
+            "uuid": "p-u1",
+            "sessionId": session_id,
+            "timestamp": "2026-04-22T10:00:00Z",
+            "isSidechain": False,
+            "isMeta": False,
+            "cwd": "/home/test/proj",
+            "message": {"role": "user", "content": "spawn an explorer"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "p-u2",
+            "sessionId": session_id,
+            "timestamp": "2026-04-22T10:00:10Z",
+            "isSidechain": False,
+            "isMeta": False,
+            "requestId": "r1",
+            "message": {
+                "id": "m1",
+                "role": "assistant",
+                "model": "claude-sonnet-4-5-20250929",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "tu-agent-1",
+                        "name": "Agent",
+                        "input": {"subagent_type": "Explore"},
+                    }
+                ],
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            },
+        },
+    ]
+    main_path = enc / f"{session_id}.jsonl"
+    _write_jsonl(main_path, parent_entries)
+
+    sub_dir = enc / session_id / "subagents"
+    sub_dir.mkdir(parents=True)
+    agent_id = "abc123def456"
+    child_path = sub_dir / f"agent-{agent_id}.jsonl"
+    _write_jsonl(
+        child_path,
+        [
+            {
+                "type": "user",
+                "uuid": "c-u1",
+                "sessionId": session_id,
+                "agentId": agent_id,
+                "timestamp": "2026-04-22T10:00:15Z",
+                "isSidechain": True,
+                "isMeta": False,
+                "message": {"role": "user", "content": "walk src"},
+            },
+            {
+                "type": "assistant",
+                "uuid": "c-u2",
+                "sessionId": session_id,
+                "agentId": agent_id,
+                "timestamp": "2026-04-22T10:00:20Z",
+                "isSidechain": True,
+                "isMeta": False,
+                "requestId": "r2",
+                "message": {
+                    "id": "m2",
+                    "role": "assistant",
+                    "model": "claude-opus-4-7",
+                    "content": [{"type": "text", "text": "done"}],
+                    "usage": {"input_tokens": 50, "output_tokens": 20},
+                },
+            },
+        ],
+    )
+    (sub_dir / f"agent-{agent_id}.meta.json").write_text(
+        '{"agentType":"Explore","description":"walk src tree"}'
+    )
+
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    parent_key_before = conn.execute(
+        "SELECT parent_message_dedup_key FROM subagent_spawns WHERE child_file_path=?",
+        (str(child_path),),
+    ).fetchone()[0]
+    assert parent_key_before is not None, "first reconcile should resolve spawn parent"
+
+    # Append a new user entry to the main file so mtime + size both change.
+    # The pre-existing ``p-u2`` assistant message (and its dedup_key) is
+    # preserved across the re-parse, so spawn linkage must be restorable.
+    appended = {
+        "type": "user",
+        "uuid": "p-u3",
+        "sessionId": session_id,
+        "timestamp": "2026-04-22T10:05:00Z",
+        "isSidechain": False,
+        "isMeta": False,
+        "message": {"role": "user", "content": "follow up"},
+    }
+    with main_path.open("a") as f:
+        f.write(json.dumps(appended))
+        f.write("\n")
+    # Force a mtime bump even if the clock didn't tick a full second.
+    future = time.time() + 2
+    os.utime(main_path, (future, future))
+
+    # Must not raise ``sqlite3.IntegrityError: FOREIGN KEY constraint failed``.
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    parent_key_after = conn.execute(
+        "SELECT parent_message_dedup_key FROM subagent_spawns WHERE child_file_path=?",
+        (str(child_path),),
+    ).fetchone()[0]
+    assert parent_key_after is not None, (
+        "spawn parent linkage should be re-resolved after main file re-ingest, not left NULL"
+    )
+    assert parent_key_after == parent_key_before, (
+        "dedup_key is stable across re-ingest of the same parent message, so "
+        "the re-resolved linkage should match"
+    )
