@@ -123,10 +123,13 @@ def _load_header(conn: sqlite3.Connection, session_id: str) -> SessionHeader:
     ).fetchone()
     if row is None:
         raise SessionReportNotFound(session_id)
+    # ``NOT LIKE '<%>'`` excludes Claude Code's angle-bracket placeholders
+    # (e.g. ``<synthetic>`` on non-LLM-call assistant stubs).
     models = [
         r[0]
         for r in conn.execute(
-            "SELECT DISTINCT model FROM messages WHERE session_id=? AND model IS NOT NULL "
+            "SELECT DISTINCT model FROM messages "
+            "WHERE session_id=? AND model IS NOT NULL AND model NOT LIKE '<%>' "
             "ORDER BY model",
             (session_id,),
         ).fetchall()
@@ -146,6 +149,9 @@ def _load_header(conn: sqlite3.Connection, session_id: str) -> SessionHeader:
 
 
 def _load_models(conn: sqlite3.Connection, session_id: str) -> list[ModelRow]:
+    # ``NOT LIKE '<%>'`` excludes Claude Code's angle-bracket placeholders
+    # (e.g. ``<synthetic>`` on non-LLM-call assistant stubs) so they don't
+    # appear as their own row in the per-model cost table.
     rows = conn.execute(
         """SELECT model,
                   COALESCE(SUM(cost_usd), 0),
@@ -155,7 +161,7 @@ def _load_models(conn: sqlite3.Connection, session_id: str) -> list[ModelRow]:
                   COALESCE(SUM(cache_creation), 0),
                   COALESCE(SUM(cache_read), 0)
              FROM messages
-            WHERE session_id=? AND model IS NOT NULL
+            WHERE session_id=? AND model IS NOT NULL AND model NOT LIKE '<%>'
             GROUP BY model
             ORDER BY SUM(cost_usd) DESC, model""",
         (session_id,),

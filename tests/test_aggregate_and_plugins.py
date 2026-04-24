@@ -344,6 +344,76 @@ def test_aggregate_model_filter_is_case_insensitive_substring(
     assert upper[0].total_cost_usd == lower[0].total_cost_usd
 
 
+def test_aggregate_group_by_model_excludes_synthetic_placeholder(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """Claude Code writes ``<synthetic>`` as a literal model string on
+    non-LLM-call assistant entries (compaction stubs, continuation markers).
+    Those aren't real models and must not appear as a row in ``--group-by model``.
+    The filter pattern ``NOT LIKE '<%>'`` excludes this and any future
+    angle-bracket placeholders without hardcoding a name list.
+    """
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    sid = "s-synth"
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            {
+                "type": "user",
+                "uuid": "u1",
+                "sessionId": sid,
+                "timestamp": "2026-04-22T10:00:00Z",
+                "isSidechain": False,
+                "isMeta": False,
+                "cwd": "/home/test",
+                "message": {"role": "user", "content": "hi"},
+            },
+            {
+                "type": "assistant",
+                "uuid": "u2",
+                "sessionId": sid,
+                "timestamp": "2026-04-22T10:00:01Z",
+                "isSidechain": False,
+                "isMeta": False,
+                "requestId": "r-real",
+                "message": {
+                    "id": "m-real",
+                    "role": "assistant",
+                    "model": "claude-opus-4-7",
+                    "content": [{"type": "text", "text": "a"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            },
+            {
+                "type": "assistant",
+                "uuid": "u3",
+                "sessionId": sid,
+                "timestamp": "2026-04-22T10:00:02Z",
+                "isSidechain": False,
+                "isMeta": False,
+                "requestId": "r-synth",
+                "message": {
+                    "id": "m-synth",
+                    "role": "assistant",
+                    "model": "<synthetic>",
+                    "content": [{"type": "text", "text": "b"}],
+                },
+            },
+        ],
+    )
+
+    db = tmp_path / "idx.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    rows = query_aggregate(conn, group_by="model")
+    keys = {r.group_key for r in rows}
+    assert "claude-opus-4-7" in keys
+    assert "<synthetic>" not in keys
+
+
 def test_aggregate_model_filter_rejects_plugin_group(tmp_path: Path, pricing_data: dict) -> None:
     """Combining ``--model`` with ``--group-by plugin`` is out of scope for v1:
     plugin bucketing routes through ``session_rollups``, which has no model

@@ -285,6 +285,19 @@ def test_query_filter_model_ignores_null_model_rows(conn: sqlite3.Connection) ->
     assert rows == []
 
 
+def test_query_filter_model_ignores_synthetic_placeholder(conn: sqlite3.Connection) -> None:
+    """A session whose only non-NULL model is Claude Code's ``<synthetic>``
+    placeholder must not match a model filter — those aren't real models."""
+    _insert_summary(conn, session_id="s-synth-only")
+    _insert_file_and_message(conn, session_id="s-synth-only", model="<synthetic>")
+    conn.commit()
+
+    # Substring 'synth' matches the literal placeholder — if the filter
+    # didn't exclude ``<...>`` it would wrongly return this session.
+    rows = query_session_list(conn, model="synth")
+    assert rows == []
+
+
 def test_query_filter_since_until(conn: sqlite3.Connection) -> None:
     _insert_summary(conn, session_id="sA", last_active_at=100)
     _insert_summary(conn, session_id="sB", last_active_at=200)

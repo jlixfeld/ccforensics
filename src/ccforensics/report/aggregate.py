@@ -74,7 +74,11 @@ def _query_messages_aggregate(
     excluded; those have $0 cost anyway.
     """
     where, params = _base_filters(since, until, project)
+    # Exclude NULL (infrastructure rows — queue-operation, progress, system)
+    # and ``<...>`` placeholders (Claude Code writes e.g. ``<synthetic>`` on
+    # non-LLM-call assistant stubs — those aren't real models).
     where.append("m.model IS NOT NULL")
+    where.append("m.model NOT LIKE '<%>'")
     if model:
         where.append("LOWER(m.model) LIKE ?")
         params.append(f"%{model.lower()}%")

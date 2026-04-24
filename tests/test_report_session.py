@@ -154,6 +154,50 @@ def test_build_session_report_has_header_and_buckets(tmp_path: Path, pricing_dat
     assert ("subagent", "pr-review-toolkit:code-reviewer") in bucket_kinds
 
 
+def test_session_report_excludes_synthetic_model_placeholder(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """``<synthetic>`` is Claude Code's literal model string for non-LLM-call
+    placeholder assistant entries. It must not appear in ``models_seen``
+    on the header OR as a row in the per-model rollup — those surfaces are
+    for real models only.
+    """
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    sid = "sess-synth-mix"
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            _user("u1", sid, "2026-04-22T10:00:00Z", "hi", cwd="/home/test"),
+            _assistant(
+                "u2",
+                sid,
+                "2026-04-22T10:00:01Z",
+                msg_id="m-real",
+                req_id="r-real",
+                model="claude-opus-4-7",
+            ),
+            _assistant(
+                "u3",
+                sid,
+                "2026-04-22T10:00:02Z",
+                msg_id="m-synth",
+                req_id="r-synth",
+                model="<synthetic>",
+            ),
+        ],
+    )
+
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    report = build_session_report(conn, sid)
+    assert "<synthetic>" not in report.header.models_seen
+    assert "<synthetic>" not in {m.model for m in report.models}
+
+
 def test_session_report_includes_per_model_rollup(tmp_path: Path, pricing_data: dict) -> None:
     """The report surfaces per-``messages.model`` cost + tokens, so a user
     looking at ``session show`` can see what each model actually cost in that

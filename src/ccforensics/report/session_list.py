@@ -69,11 +69,14 @@ def query_session_list(
     if model:
         # Session-level membership filter: the returned cost column is still
         # the full session cost, not the per-model slice. Use
-        # ``aggregate --model`` for per-model dollars.
+        # ``aggregate --model`` for per-model dollars. ``NOT LIKE '<%>'``
+        # excludes Claude Code's angle-bracket placeholders (e.g.
+        # ``<synthetic>``) so ``--model synth`` doesn't wrongly match them.
         where.append(
             "session_id IN ("
             "SELECT DISTINCT session_id FROM messages "
-            "WHERE model IS NOT NULL AND LOWER(model) LIKE ?"
+            "WHERE model IS NOT NULL AND model NOT LIKE '<%>' "
+            "AND LOWER(model) LIKE ?"
             ")"
         )
         params.append(f"%{model.lower()}%")
