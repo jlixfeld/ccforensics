@@ -107,6 +107,35 @@ def test_query_sort_by_turns_desc(conn: sqlite3.Connection) -> None:
     assert [r.session_id for r in rows] == ["sB", "sC", "sA"]
 
 
+def test_query_sort_by_compact_desc(conn: sqlite3.Connection) -> None:
+    """``--sort compact`` ranks sessions by compaction count, most-compacted
+    first. Tied counts fall back to the standard last-active tiebreak."""
+    _insert_summary(conn, session_id="s-zero", last_active_at=100)
+    _insert_summary(conn, session_id="s-three", last_active_at=200)
+    _insert_summary(conn, session_id="s-one", last_active_at=300)
+    # 3 auto-compact files for s-three, 1 for s-one, 0 for s-zero.
+    rows_to_insert = [
+        ("/fake/s-three-a.jsonl", "auto-compact", "s-three"),
+        ("/fake/s-three-b.jsonl", "auto-compact", "s-three"),
+        ("/fake/s-three-c.jsonl", "auto-compact", "s-three"),
+        ("/fake/s-one-a.jsonl", "auto-compact", "s-one"),
+    ]
+    for path, kind, sid in rows_to_insert:
+        conn.execute(
+            "INSERT INTO files (path, mtime_ns, size, session_id, kind, agent_id, "
+            "schema_version, parse_warnings, last_parsed_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (path, 0, 0, sid, kind, None, None, 0, 0),
+        )
+    conn.commit()
+
+    rows = query_session_list(conn, sort_key="compact")
+    assert [r.session_id for r in rows] == ["s-three", "s-one", "s-zero"]
+
+    # --reverse flips to ascending; ties still break by last_active_at DESC.
+    rows = query_session_list(conn, sort_key="compact", reverse=True)
+    assert [r.session_id for r in rows] == ["s-zero", "s-one", "s-three"]
+
+
 def test_query_reverse_flips_order(conn: sqlite3.Connection) -> None:
     _insert_summary(conn, session_id="sA", last_active_at=100)
     _insert_summary(conn, session_id="sB", last_active_at=300)
@@ -274,6 +303,18 @@ def test_query_filter_model_case_insensitive_substring(conn: sqlite3.Connection)
     assert sorted(r.session_id for r in rows) == ["s-mixed", "s-opus"]
 
 
+def test_query_filter_model_dot_form_matches_dash_in_model(conn: sqlite3.Connection) -> None:
+    """User-friendly ``opus-4.7`` (with a dot) matches the literal on-disk
+    ``claude-opus-4-7`` (with a dash) — the filter substitutes ``.`` → ``-``
+    before building the LIKE pattern."""
+    _insert_summary(conn, session_id="s-opus")
+    _insert_file_and_message(conn, session_id="s-opus", model="claude-opus-4-7")
+    conn.commit()
+
+    rows = query_session_list(conn, model="opus-4.7")
+    assert [r.session_id for r in rows] == ["s-opus"]
+
+
 def test_query_filter_model_ignores_null_model_rows(conn: sqlite3.Connection) -> None:
     """Sessions whose only messages have ``model IS NULL`` (infra rows —
     queue-operation, progress, etc.) must not match any model filter."""
@@ -357,9 +398,36 @@ def test_query_returns_session_list_rows(conn: sqlite3.Connection) -> None:
     assert r.last_active_at == 20
     assert r.duration_s == 10
     assert r.turn_count == 3
+    assert r.compaction_count == 0
     assert r.total_cost_usd == 1.5
     assert r.summary_text == "hi"
     assert r.summary_source == "first-prompt"
+
+
+def test_query_compaction_count_reflects_auto_compact_files(conn: sqlite3.Connection) -> None:
+    """``compaction_count`` is the number of ``agent-acompact-*.jsonl`` files
+    indexed for the session. One row per compaction event."""
+    _insert_summary(conn, session_id="s-with-compacts")
+    _insert_summary(conn, session_id="s-no-compacts")
+    # Two auto-compact files for s-with-compacts; the 'main' / 'subagent'
+    # files don't contribute to the count.
+    for path, kind, sid in [
+        ("/fake/compact-a.jsonl", "auto-compact", "s-with-compacts"),
+        ("/fake/compact-b.jsonl", "auto-compact", "s-with-compacts"),
+        ("/fake/main.jsonl", "main", "s-with-compacts"),
+        ("/fake/sub.jsonl", "subagent", "s-with-compacts"),
+        ("/fake/main2.jsonl", "main", "s-no-compacts"),
+    ]:
+        conn.execute(
+            "INSERT INTO files (path, mtime_ns, size, session_id, kind, agent_id, "
+            "schema_version, parse_warnings, last_parsed_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (path, 0, 0, sid, kind, None, None, 0, 0),
+        )
+    conn.commit()
+
+    rows = {r.session_id: r for r in query_session_list(conn)}
+    assert rows["s-with-compacts"].compaction_count == 2
+    assert rows["s-no-compacts"].compaction_count == 0
 
 
 # ---------- shorten_session_ids ----------
@@ -440,6 +508,7 @@ def _row(
     started_at: int = 1_700_000_000,
     duration_s: int = 60,
     turn_count: int = 3,
+    compaction_count: int = 0,
     total_cost_usd: float | None = 1.23,
     summary_text: str | None = "a short summary",
     summary_source: str | None = "first-prompt",
@@ -452,6 +521,7 @@ def _row(
         last_active_at=started_at + duration_s,
         duration_s=duration_s,
         turn_count=turn_count,
+        compaction_count=compaction_count,
         total_cost_usd=total_cost_usd,
         summary_text=summary_text,
         summary_source=summary_source,
@@ -468,7 +538,16 @@ def test_render_default_columns_in_order() -> None:
     rows = [_row()]
     table = render_session_list(rows)
     headers = [col.header for col in table.columns]
-    assert headers == ["UUID", "Project", "Started", "Dur", "Turns", "Cost", "Summary"]
+    assert headers == [
+        "UUID",
+        "Project",
+        "Started",
+        "Dur",
+        "Turns",
+        "Compact",
+        "Cost",
+        "Summary",
+    ]
 
 
 def test_render_verbose_adds_source_column() -> None:
@@ -481,39 +560,51 @@ def test_render_verbose_adds_source_column() -> None:
         "Started",
         "Dur",
         "Turns",
+        "Compact",
         "Cost",
         "Src",
         "Summary",
     ]
 
 
-def test_render_row_count_matches_input_rows() -> None:
+def test_render_row_count_includes_totals_row() -> None:
+    """Three data rows + one totals row appended below a section divider."""
     rows = [
         _row(session_id="aaaaaa000000"),
         _row(session_id="bbbbbb111111"),
         _row(session_id="cccccc222222"),
     ]
     table = render_session_list(rows)
-    assert table.row_count == 3
+    assert table.row_count == 4
 
 
 def test_render_empty_rows_returns_empty_table() -> None:
+    """No data → no totals row either; column header set is still complete."""
     table = render_session_list([])
     assert table.row_count == 0
-    # Non-verbose still has the default column set.
     headers = [col.header for col in table.columns]
-    assert headers == ["UUID", "Project", "Started", "Dur", "Turns", "Cost", "Summary"]
+    assert headers == [
+        "UUID",
+        "Project",
+        "Started",
+        "Dur",
+        "Turns",
+        "Compact",
+        "Cost",
+        "Summary",
+    ]
 
 
 def test_render_summary_preserved_untruncated() -> None:
     long_summary = "x" * 500
     rows = [_row(summary_text=long_summary)]
     table = render_session_list(rows)
-    # Summary is the last column. Its cell is a rich Text; its plain text
+    # Summary is the last column. The first cell carries the row data; the
+    # second is the totals row's empty Summary placeholder. Its plain text
     # must contain the full summary verbatim (no truncation).
     summary_col = table.columns[-1]
     cells = list(summary_col.cells)
-    assert len(cells) == 1
+    assert len(cells) == 2
     cell = cells[0]
     plain = cell.plain if isinstance(cell, Text) else str(cell)
     assert plain == long_summary
@@ -538,10 +629,12 @@ def test_render_verbose_source_badge_mapping() -> None:
         _row(session_id="dddddd333333", summary_source=None),
     ]
     table = render_session_list(rows, verbose=True)
-    src_col = table.columns[6]  # verbose: UUID, Project, Started, Dur, Turns, Cost, Src, Summary
+    # verbose columns: UUID, Project, Started, Dur, Turns, Compact, Cost, Src, Summary
+    src_col = table.columns[7]
     assert src_col.header == "Src"
     badges = [c.plain if isinstance(c, Text) else str(c) for c in src_col.cells]
-    assert badges == ["[C]", "[F]", "[-]", "[-]"]
+    # Last cell is the totals-row placeholder; data rows are the 4 badges.
+    assert badges[:-1] == ["[C]", "[F]", "[-]", "[-]"]
 
 
 def test_render_uses_shortened_session_ids() -> None:
@@ -552,14 +645,17 @@ def test_render_uses_shortened_session_ids() -> None:
     table = render_session_list(rows)
     uuid_col = table.columns[0]
     cells = [c.plain if isinstance(c, Text) else str(c) for c in uuid_col.cells]
-    # Collisions at 6 chars → extend to 7.
-    assert cells == ["abcdef1", "abcdef2"]
+    # Collisions at 6 chars → extend to 7. Final cell is the bold "Totals"
+    # label from the appended totals row.
+    assert cells[:-1] == ["abcdef1", "abcdef2"]
+    assert cells[-1] == "Totals"
 
 
 def test_render_cost_none_renders_em_dash() -> None:
     rows = [_row(total_cost_usd=None)]
     table = render_session_list(rows)
-    cost_col = table.columns[5]
+    # Cost column is index 6 now (UUID, Project, Started, Dur, Turns, Compact, Cost, ...).
+    cost_col = table.columns[6]
     cell = next(iter(cost_col.cells))
     plain = cell.plain if isinstance(cell, Text) else str(cell)
     assert plain == "$—"
@@ -594,6 +690,48 @@ def test_render_narrow_terminal_drops_project_column() -> None:
     assert "Project" not in headers
     # Summary column still present.
     assert "Summary" in headers
+
+
+def test_render_totals_row_sums_displayed_columns() -> None:
+    """Totals row sums Dur, Turns, Compactions, and priced Cost. Sessions
+    with NULL cost are excluded from the cost sum so the displayed total
+    matches the sum of the ``$`` cells above it."""
+    rows = [
+        _row(session_id="s1", duration_s=60, turn_count=2, compaction_count=1, total_cost_usd=1.0),
+        _row(session_id="s2", duration_s=120, turn_count=3, compaction_count=0, total_cost_usd=2.5),
+        _row(session_id="s3", duration_s=30, turn_count=1, compaction_count=2, total_cost_usd=None),
+    ]
+    table = render_session_list(rows, console_width=180)
+    # Find columns by header. Last cell of each is the totals-row content.
+    by_header = {col.header: list(col.cells) for col in table.columns}
+    # Totals row exists → each column has data_rows + 1 cells.
+    assert len(by_header["UUID"]) == 4
+    totals_uuid = by_header["UUID"][-1]
+    plain_uuid = totals_uuid.plain if isinstance(totals_uuid, Text) else str(totals_uuid)
+    assert plain_uuid == "Totals"
+
+    # Turns column: "2", "3", "1", then totals "6".
+    assert by_header["Turns"][-1] == "6"
+    # Compact column: "1", "0", "2", then totals "3".
+    assert by_header["Compact"][-1] == "3"
+    # Cost column: $1.00, $2.50, $—, then totals $3.50 (NULL excluded).
+    cost_total = by_header["Cost"][-1]
+    plain_cost = cost_total.plain if isinstance(cost_total, Text) else str(cost_total)
+    assert plain_cost == "$3.50"
+
+
+def test_render_totals_row_all_null_cost_renders_em_dash() -> None:
+    """Every row with NULL cost → totals cell is ``$—`` rather than ``$0.00``,
+    because zero would imply a real measurement at $0 instead of "unknown"."""
+    rows = [
+        _row(session_id="s1", total_cost_usd=None),
+        _row(session_id="s2", total_cost_usd=None),
+    ]
+    table = render_session_list(rows, console_width=180)
+    by_header = {col.header: list(col.cells) for col in table.columns}
+    cost_total = by_header["Cost"][-1]
+    plain = cost_total.plain if isinstance(cost_total, Text) else str(cost_total)
+    assert plain == "$—"
 
 
 def test_render_boundary_at_120_is_wide() -> None:

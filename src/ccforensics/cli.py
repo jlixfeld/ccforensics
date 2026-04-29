@@ -103,7 +103,7 @@ def session() -> None:
 @click.option(
     "--sort",
     "sort_key",
-    type=click.Choice(["cost", "started", "last-active", "turns"]),
+    type=click.Choice(["cost", "started", "last-active", "turns", "compact"]),
     default="last-active",
     show_default=True,
     help="Column to sort on.",
@@ -180,6 +180,7 @@ def session_list(
             "last_active_at",
             "duration_s",
             "turn_count",
+            "compaction_count",
             "total_cost_usd",
             "summary_text",
             "summary_source",
@@ -357,6 +358,14 @@ def aggregate(
 @main.command()
 @click.option("--since", help="Date filter: YYYY-MM-DD | Nd | today | yesterday")
 @click.option("--until", help="Date filter: YYYY-MM-DD | Nd | today | yesterday")
+@click.option(
+    "--model",
+    help=(
+        "Filter cost / sessions / top-model to messages whose model matches "
+        "this substring (case-insensitive, e.g. 'opus'). Top-skill counts are "
+        "left unfiltered — skill activations have no model dimension."
+    ),
+)
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON to stdout.")
 @click.option("--csv", "as_csv", is_flag=True, help="Emit CSV to stdout.")
 @click.option(
@@ -367,6 +376,7 @@ def aggregate(
 def plugins(
     since: str | None,
     until: str | None,
+    model: str | None,
     as_json: bool,
     as_csv: bool,
     no_refresh: bool,
@@ -385,7 +395,7 @@ def plugins(
     since_dt = parse_since(since) if since else None
     until_dt = parse_until(until) if until else None
 
-    rows = query_plugins(conn, since=since_dt, until=until_dt)
+    rows = query_plugins(conn, since=since_dt, until=until_dt, model=model)
 
     if as_json:
         write_json([dataclasses.asdict(r) for r in rows], sys.stdout)
@@ -399,6 +409,8 @@ def plugins(
             "agent_type_count",
             "most_used_skill",
             "skill_count",
+            "most_used_model",
+            "model_count",
             "first_seen",
             "last_seen",
         ]

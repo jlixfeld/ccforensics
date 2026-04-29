@@ -5,18 +5,23 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
 
+from rich import box
 from rich.table import Table
 from rich.text import Text
 
 from ._format import format_cost, format_duration
 
-SortKey = Literal["cost", "started", "last-active", "turns"]
+SortKey = Literal["cost", "started", "last-active", "turns", "compact"]
 
+# Each entry is the fully qualified ORDER-BY expression. Most live on
+# ``session_summaries`` (``ss.*``); ``compact`` references the SELECT alias
+# of the joined compaction-count subquery rather than a column on ``ss``.
 _SORT_COLUMN: dict[SortKey, str] = {
-    "cost": "total_cost_usd",
-    "started": "started_at",
-    "last-active": "last_active_at",
-    "turns": "turn_count",
+    "cost": "ss.total_cost_usd",
+    "started": "ss.started_at",
+    "last-active": "ss.last_active_at",
+    "turns": "ss.turn_count",
+    "compact": "compaction_count",
 }
 
 _SOURCE_BADGE: dict[str, str] = {
@@ -35,6 +40,7 @@ class SessionListRow:
     last_active_at: int
     duration_s: int
     turn_count: int
+    compaction_count: int
     total_cost_usd: float | None
     summary_text: str | None
     summary_source: str | None
@@ -55,16 +61,16 @@ def query_session_list(
     where: list[str] = []
     params: list[object] = []
     if project:
-        where.append("LOWER(IFNULL(project_path,'')) LIKE ?")
+        where.append("LOWER(IFNULL(ss.project_path,'')) LIKE ?")
         params.append(f"%{project.lower()}%")
     if since:
-        where.append("last_active_at >= ?")
+        where.append("ss.last_active_at >= ?")
         params.append(int(since.timestamp()))
     if until:
-        where.append("last_active_at <= ?")
+        where.append("ss.last_active_at <= ?")
         params.append(int(until.timestamp()))
     if grep:
-        where.append("LOWER(IFNULL(summary_text,'')) LIKE ?")
+        where.append("LOWER(IFNULL(ss.summary_text,'')) LIKE ?")
         params.append(f"%{grep.lower()}%")
     if model:
         # Session-level membership filter: the returned cost column is still
@@ -72,21 +78,33 @@ def query_session_list(
         # ``aggregate --model`` for per-model dollars. ``NOT LIKE '<%>'``
         # excludes Claude Code's angle-bracket placeholders (e.g.
         # ``<synthetic>``) so ``--model synth`` doesn't wrongly match them.
+        # Normalize ``.`` → ``-`` so user-friendly forms like ``opus-4.7``
+        # match the on-disk ``claude-opus-4-7`` model string.
         where.append(
-            "session_id IN ("
+            "ss.session_id IN ("
             "SELECT DISTINCT session_id FROM messages "
             "WHERE model IS NOT NULL AND model NOT LIKE '<%>' "
             "AND LOWER(model) LIKE ?"
             ")"
         )
-        params.append(f"%{model.lower()}%")
+        params.append(f"%{model.lower().replace('.', '-')}%")
 
     col = _SORT_COLUMN[sort_key]
     direction = "ASC" if reverse else "DESC"
+    # Compaction count joins via a grouped subquery on ``files.kind='auto-compact'``.
+    # Each ``agent-acompact-*.jsonl`` file is one compaction event; its
+    # ``files.session_id`` is the parent session UUID (``_classify_file``
+    # sets it from the path).
     sql = (
-        "SELECT session_id, project_path, project_display, started_at, "
-        "last_active_at, duration_s, turn_count, total_cost_usd, "
-        "summary_text, summary_source FROM session_summaries"
+        "SELECT ss.session_id, ss.project_path, ss.project_display, "
+        "ss.started_at, ss.last_active_at, ss.duration_s, ss.turn_count, "
+        "COALESCE(c.compactions, 0) AS compaction_count, "
+        "ss.total_cost_usd, ss.summary_text, ss.summary_source "
+        "FROM session_summaries ss "
+        "LEFT JOIN ("
+        "SELECT session_id, COUNT(*) AS compactions "
+        "FROM files WHERE kind='auto-compact' GROUP BY session_id"
+        ") c ON c.session_id = ss.session_id"
     )
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -97,7 +115,7 @@ def query_session_list(
     # ``turns`` routinely have huge tie-pools (thousands of $0 ingestion
     # sessions, many 1-turn sessions) and alphabetical-by-id makes ``--limit``
     # return arbitrary rows. Most-recent-first is the informative tiebreak.
-    sql += f" ORDER BY {col} IS NULL, {col} {direction}, last_active_at DESC, session_id"
+    sql += f" ORDER BY {col} IS NULL, {col} {direction}, ss.last_active_at DESC, ss.session_id"
     if limit is not None:
         sql += f" LIMIT {int(limit)}"
     cur = conn.execute(sql, params)
@@ -158,7 +176,17 @@ def render_session_list(
     width = console_width if console_width is not None else _detect_console_width()
     narrow = width < 120
 
-    table = Table(show_lines=False, expand=True, pad_edge=False)
+    table = Table(
+        title="Sessions",
+        title_style="bold",
+        box=box.HEAVY_HEAD,
+        # ``show_lines=True`` draws a horizontal divider between every row.
+        # Without it, multi-line cells (long Summary text wrapped via
+        # ``overflow='fold'``) blend into the next row visually because
+        # there's no rule separating them.
+        show_lines=True,
+        expand=True,
+    )
     short_ids = shorten_session_ids([r.session_id for r in rows])
     table.add_column("UUID", no_wrap=True)
     if not narrow:
@@ -166,6 +194,7 @@ def render_session_list(
     table.add_column("Started", no_wrap=True)
     table.add_column("Dur", no_wrap=True, justify="right")
     table.add_column("Turns", no_wrap=True, justify="right")
+    table.add_column("Compact", no_wrap=True, justify="right")
     table.add_column("Cost", no_wrap=True, justify="right")
     if verbose:
         table.add_column("Src", no_wrap=True)
@@ -181,6 +210,7 @@ def render_session_list(
                 started,
                 format_duration(r.duration_s),
                 str(r.turn_count),
+                str(r.compaction_count),
                 Text(format_cost(r.total_cost_usd)),
             ]
         )
@@ -188,6 +218,35 @@ def render_session_list(
             cells.append(_SOURCE_BADGE.get(r.summary_source or "none", "[-]"))
         cells.append(Text(r.summary_text or "<no summary available>"))
         table.add_row(*cells)
+
+    if rows:
+        # Totals: sum every numeric column displayed. Cost is None for sessions
+        # with unresolved pricing — exclude those from the sum so the totals
+        # cell still reflects the pricing-resolved subtotal rather than
+        # silently coercing NULL to 0.
+        total_dur = sum(r.duration_s for r in rows)
+        total_turns = sum(r.turn_count for r in rows)
+        total_compact = sum(r.compaction_count for r in rows)
+        priced = [r.total_cost_usd for r in rows if r.total_cost_usd is not None]
+        total_cost: float | None = sum(priced) if priced else None
+
+        table.add_section()
+        totals_cells: list[str | Text] = [Text("Totals", style="bold")]
+        if not narrow:
+            totals_cells.append("")
+        totals_cells.extend(
+            [
+                "",
+                format_duration(total_dur),
+                f"{total_turns:,}",
+                f"{total_compact:,}",
+                Text(format_cost(total_cost), style="bold"),
+            ]
+        )
+        if verbose:
+            totals_cells.append("")
+        totals_cells.append("")
+        table.add_row(*totals_cells, style="bold")
     return table
 
 
