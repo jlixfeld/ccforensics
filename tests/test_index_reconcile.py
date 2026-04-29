@@ -698,9 +698,7 @@ def test_per_session_recompute_isolates_toctou_oserror(
     # The decoupled recompute pipeline logs the specific step that failed;
     # this test only proves the FileNotFoundError stays isolated to the
     # summary step rather than aborting the entire session's processing.
-    assert any(
-        "recompute_session_summary failed" in r.getMessage() for r in caplog.records
-    )
+    assert any("recompute_session_summary failed" in r.getMessage() for r in caplog.records)
 
 
 def test_schema_version_selection_is_deterministic(tmp_path: Path, pricing_data: dict) -> None:

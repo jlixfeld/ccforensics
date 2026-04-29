@@ -620,9 +620,7 @@ def test_buckets_have_exact_per_bucket_token_counts(tmp_path: Path, pricing_data
     assert by_bucket[("auto-compact", "auto-compact")]["output"] == 200
 
 
-def test_find_invariant_violators_flags_stale_rollups(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_find_invariant_violators_flags_stale_rollups(tmp_path: Path, pricing_data: dict) -> None:
     """Sessions whose rollup sum drifts from messages sum (pre-existing
     state from a prior failed recompute) are surfaced for self-heal.
 
@@ -660,9 +658,7 @@ def test_find_invariant_violators_flags_stale_rollups(
     assert find_invariant_violators(conn) == [sid]
 
 
-def test_reconcile_self_heals_stale_rollups(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_reconcile_self_heals_stale_rollups(tmp_path: Path, pricing_data: dict) -> None:
     """A subsequent reconcile detects a drifted invariant and rebuilds the
     rollup, even when the file's mtime/size hasn't changed (so the session
     isn't naturally re-queued for recompute by the file walk).

@@ -36,9 +36,7 @@ def test_verbose_flag_is_accepted() -> None:
     assert result.exit_code == 0
 
 
-def test_pricing_fallback_prints_banner(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_pricing_fallback_prints_banner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """When PricingCache lands in the hardcoded-fallback path, the CLI
     surfaces a banner on stderr — otherwise users would see fabricated
     costs with no indication the network lookup failed."""
@@ -57,9 +55,7 @@ def test_pricing_fallback_prints_banner(
     assert "built-in fallback" in result.stderr
 
 
-def test_pricing_stale_prints_banner(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_pricing_stale_prints_banner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Stale cache (refresh failure with cache present) also surfaces a banner."""
     import json as _json
 
@@ -85,9 +81,7 @@ def test_pricing_stale_prints_banner(
     assert "last cached pricing" in result.stderr
 
 
-def test_main_installs_stderr_log_handler(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_main_installs_stderr_log_handler(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """main() must call logging.basicConfig so module warnings reach stderr.
 
     Without this, every ``logger.warning(...)`` in pricing/registry/index/skills

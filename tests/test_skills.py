@@ -421,8 +421,7 @@ def test_channel_c_malformed_stdout_is_ignored(
     # Malformed payload must not disappear silently — a hook-format drift is
     # exactly the condition a forensics tool should flag.
     assert any(
-        "not valid JSON" in r.getMessage() and "sess-1" in r.getMessage()
-        for r in caplog.records
+        "not valid JSON" in r.getMessage() and "sess-1" in r.getMessage() for r in caplog.records
     )
 
 
