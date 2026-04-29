@@ -112,6 +112,46 @@ def backfill_spawn_totals(conn: sqlite3.Connection, session_id: str) -> None:
     )
 
 
+def find_invariant_violators(conn: sqlite3.Connection, tolerance: float = 1e-6) -> list[str]:
+    """Return session_ids where ``sum(messages.cost_usd) != sum(rollups.cost_usd)``.
+
+    A failed recompute (e.g. transient I/O reading the main file during
+    ``recompute_session_summary``) leaves rollups behind the live messages
+    table. Subsequent incremental reconciles don't catch the drift —
+    ``_row_is_unchanged`` sees the file's mtime/size as unchanged so the
+    session never makes it onto ``stats.sessions_recomputed`` again.
+
+    This pre-aggregates both tables into per-session sums in two GROUP BY
+    passes, then reports sessions whose totals differ. Used by the
+    reconcile self-heal pass to identify stale rollups in one shot.
+    """
+    rows = conn.execute(
+        """
+        WITH msg_sums AS (
+          SELECT session_id, COALESCE(SUM(cost_usd), 0.0) AS msg_cost
+            FROM messages
+           GROUP BY session_id
+        ),
+        roll_sums AS (
+          SELECT session_id, COALESCE(SUM(cost_usd), 0.0) AS roll_cost
+            FROM session_rollups
+           GROUP BY session_id
+        )
+        SELECT ms.session_id
+          FROM msg_sums ms
+     LEFT JOIN roll_sums rs ON rs.session_id = ms.session_id
+         WHERE ABS(ms.msg_cost - COALESCE(rs.roll_cost, 0.0)) > ?
+        UNION
+        SELECT rs2.session_id
+          FROM roll_sums rs2
+     LEFT JOIN msg_sums ms2 ON ms2.session_id = rs2.session_id
+         WHERE ms2.session_id IS NULL AND rs2.roll_cost > ?
+        """,
+        (tolerance, tolerance),
+    ).fetchall()
+    return [str(r[0]) for r in rows]
+
+
 def verify_invariant(
     conn: sqlite3.Connection, session_id: str, tolerance: float = 1e-6
 ) -> tuple[bool, float, float]:

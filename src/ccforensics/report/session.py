@@ -6,7 +6,9 @@ import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from rich import box
 from rich.console import Group, RenderableType
+from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
@@ -26,6 +28,7 @@ class SessionHeader:
     last_active_at: int
     duration_s: int
     turn_count: int
+    compaction_count: int
     total_cost_usd: float | None
     models_seen: list[str]
     summary_text: str | None
@@ -134,6 +137,13 @@ def _load_header(conn: sqlite3.Connection, session_id: str) -> SessionHeader:
             (session_id,),
         ).fetchall()
     ]
+    compaction_count = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM files WHERE session_id=? AND kind='auto-compact'",
+            (session_id,),
+        ).fetchone()[0]
+        or 0
+    )
     return SessionHeader(
         session_id=session_id,
         project_path=row[0],
@@ -141,6 +151,7 @@ def _load_header(conn: sqlite3.Connection, session_id: str) -> SessionHeader:
         last_active_at=int(row[2]),
         duration_s=int(row[3]),
         turn_count=int(row[4]),
+        compaction_count=compaction_count,
         total_cost_usd=row[5],
         models_seen=models,
         summary_text=row[6],
@@ -324,34 +335,47 @@ def _format_ts(ts: int) -> str:
 
 
 def _render_header(h: SessionHeader) -> RenderableType:
-    lines = [
-        Text.assemble(("session: ", "bold"), h.session_id),
-        Text.assemble(("project: ", "bold"), h.project_path or "<unknown>"),
-        Text.assemble(
-            ("started: ", "bold"),
-            _format_ts(h.started_at),
-            ("   last-active: ", "bold"),
-            _format_ts(h.last_active_at),
-        ),
-        Text.assemble(
-            ("duration: ", "bold"),
-            format_duration(h.duration_s),
-            ("   turns: ", "bold"),
-            str(h.turn_count),
-        ),
-        Text.assemble(
-            ("models: ", "bold"),
-            ", ".join(h.models_seen) or "<none>",
-        ),
-        Text.assemble(("total cost: ", "bold"), format_cost(h.total_cost_usd)),
-    ]
-    if h.summary_text:
-        lines.append(Text.assemble(("summary: ", "bold"), h.summary_text[:120]))
-    return Group(*lines)
+    """Two-column key/value grid wrapped in a titled panel.
+
+    Each field is on its own line with right-aligned labels so values
+    line up cleanly. Summary moved out to ``_render_summary`` so the
+    header stays scannable at a glance and the summary can show in full.
+    """
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="bold cyan", justify="right", no_wrap=True)
+    grid.add_column(overflow="fold")
+    grid.add_row("session:", h.session_id)
+    grid.add_row("project:", h.project_path or "<unknown>")
+    grid.add_row("started:", _format_ts(h.started_at))
+    grid.add_row("last-active:", _format_ts(h.last_active_at))
+    grid.add_row("duration:", format_duration(h.duration_s))
+    grid.add_row("turns:", f"{h.turn_count:,}")
+    grid.add_row("compactions:", f"{h.compaction_count:,}")
+    grid.add_row("models:", ", ".join(h.models_seen) or "<none>")
+    grid.add_row("total cost:", format_cost(h.total_cost_usd))
+    # ``expand=False`` shrinks the panel to its content width — on a wide
+    # terminal a full-width panel leaves a chasm of whitespace between the
+    # right-aligned label column and the value column, which reads worse
+    # than a snug panel.
+    return Panel(grid, title="Session", border_style="cyan", padding=(0, 1), expand=False)
+
+
+def _render_summary(h: SessionHeader) -> RenderableType | None:
+    """Full summary text in its own panel; suppressed when source='none'.
+
+    Earlier the header truncated the summary at 120 chars and inlined it,
+    which routinely cut off mid-sentence. Showing the full text in a
+    dedicated panel with ``overflow='fold'`` is the readable fix —
+    ``session show`` is the deep report, not the at-a-glance list.
+    """
+    if not h.summary_text or h.summary_source == "none":
+        return None
+    body = Text(h.summary_text, overflow="fold")
+    return Panel(body, title="Summary", border_style="dim", padding=(0, 1))
 
 
 def _render_buckets(buckets: list[BucketRow]) -> Table:
-    t = Table(title="Cost by bucket", show_edge=False)
+    t = Table(title="Cost by bucket", box=box.HEAVY_HEAD, title_style="bold", show_lines=True)
     t.add_column("bucket", style="cyan")
     t.add_column("cost", justify="right")
     t.add_column("in", justify="right")
@@ -369,11 +393,22 @@ def _render_buckets(buckets: list[BucketRow]) -> Table:
             f"{b.cache_create:,}",
             f"{b.cache_read:,}",
         )
+    if buckets:
+        t.add_section()
+        t.add_row(
+            "Totals",
+            format_cost(sum(b.cost_usd for b in buckets)),
+            f"{sum(b.input_tokens for b in buckets):,}",
+            f"{sum(b.output_tokens for b in buckets):,}",
+            f"{sum(b.cache_create for b in buckets):,}",
+            f"{sum(b.cache_read for b in buckets):,}",
+            style="bold",
+        )
     return t
 
 
 def _render_models(models: list[ModelRow]) -> Table:
-    t = Table(title="Cost by model", show_edge=False)
+    t = Table(title="Cost by model", box=box.HEAVY_HEAD, title_style="bold", show_lines=True)
     t.add_column("model", style="yellow")
     t.add_column("cost", justify="right")
     t.add_column("msgs", justify="right")
@@ -391,21 +426,43 @@ def _render_models(models: list[ModelRow]) -> Table:
             f"{m.cache_create:,}",
             f"{m.cache_read:,}",
         )
+    if models:
+        t.add_section()
+        t.add_row(
+            "Totals",
+            format_cost(sum(m.cost_usd for m in models)),
+            f"{sum(m.message_count for m in models):,}",
+            f"{sum(m.input_tokens for m in models):,}",
+            f"{sum(m.output_tokens for m in models):,}",
+            f"{sum(m.cache_create for m in models):,}",
+            f"{sum(m.cache_read for m in models):,}",
+            style="bold",
+        )
     return t
 
 
 def _render_plugins(plugins: list[PluginRow]) -> Table:
-    t = Table(title="Cost by plugin", show_edge=False)
+    t = Table(title="Cost by plugin", box=box.HEAVY_HEAD, title_style="bold", show_lines=True)
     t.add_column("source", style="magenta")
     t.add_column("cost", justify="right")
     t.add_column("buckets", justify="right")
     for p in plugins:
         t.add_row(p.source, format_cost(p.cost_usd), str(p.session_fragment_count))
+    if plugins:
+        t.add_section()
+        t.add_row(
+            "Totals",
+            format_cost(sum(p.cost_usd for p in plugins)),
+            f"{sum(p.session_fragment_count for p in plugins):,}",
+            style="bold",
+        )
     return t
 
 
 def _render_unattributed(items: list[UnattributedItem]) -> Table:
-    t = Table(title="Unattributed subagent files", show_edge=False)
+    t = Table(
+        title="Unattributed subagent files", box=box.HEAVY_HEAD, title_style="bold", show_lines=True
+    )
     t.add_column("subagent_type")
     t.add_column("cost", justify="right")
     t.add_column("path", overflow="fold")
@@ -419,7 +476,7 @@ def _render_unattributed(items: list[UnattributedItem]) -> Table:
 
 
 def _render_skill_ledger(ledger: list[SkillLedgerEntry]) -> Table:
-    t = Table(title="Skill activations", show_edge=False)
+    t = Table(title="Skill activations", box=box.HEAVY_HEAD, title_style="bold", show_lines=True)
     t.add_column("when", style="dim")
     t.add_column("skill", style="green")
     t.add_column("plugin")
@@ -444,6 +501,8 @@ def _render_skill_ledger(ledger: list[SkillLedgerEntry]) -> Table:
 
 
 def _render_parse_notes(notes: ParseNotes) -> RenderableType:
+    """Footer line, dim-styled so it sits below the data without competing
+    with it visually."""
     return Text.assemble(
         ("files: ", "bold"),
         str(notes.files_count),
@@ -451,21 +510,35 @@ def _render_parse_notes(notes: ParseNotes) -> RenderableType:
         ", ".join(notes.schema_versions) or "<none>",
         ("   parse_warnings: ", "bold"),
         str(notes.parse_warnings_total),
+        style="dim",
     )
 
 
 def render_session_report(report: SessionReport) -> RenderableType:
-    sections: list[RenderableType] = [
-        _render_header(report.header),
-        _render_buckets(report.buckets),
-        _render_plugins(report.plugins),
-    ]
+    """Stitch sections with a blank line between each so the rendered tables
+    don't bleed into each other. Order: Session header → Summary → Cost by
+    bucket → Cost by plugin → Cost by model → Unattributed → Skills → notes."""
+    sections: list[RenderableType] = [_render_header(report.header)]
+    summary = _render_summary(report.header)
+    if summary is not None:
+        sections.append(Text(""))
+        sections.append(summary)
+    # Blank ``Text("")`` between each table so consecutive tables don't
+    # blend into one tall block when rendered with ``box.SIMPLE_HEAVY``.
+    sections.append(Text(""))
+    sections.append(_render_buckets(report.buckets))
+    sections.append(Text(""))
+    sections.append(_render_plugins(report.plugins))
     if report.models:
+        sections.append(Text(""))
         sections.append(_render_models(report.models))
     if report.unattributed_items:
+        sections.append(Text(""))
         sections.append(_render_unattributed(report.unattributed_items))
     if report.skill_ledger:
+        sections.append(Text(""))
         sections.append(_render_skill_ledger(report.skill_ledger))
     if report.parse_notes is not None:
+        sections.append(Text(""))
         sections.append(_render_parse_notes(report.parse_notes))
     return Group(*sections)

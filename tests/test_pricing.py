@@ -182,9 +182,7 @@ def test_pricing_cache_corrupt_json_refetches(tmp_path: Path, pricing_data: dict
     assert "claude-sonnet-4-5-20250929" in data
 
 
-def test_pricing_cache_missing_data_key_refetches(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_pricing_cache_missing_data_key_refetches(tmp_path: Path, pricing_data: dict) -> None:
     """Cache wrapper with no ``data`` key must refetch, not return empty dict."""
     cache_file = tmp_path / "litellm.json"
     cache_file.write_text(json.dumps({"fetched_at": 9999999999}))
@@ -222,9 +220,7 @@ def test_pricing_cache_aborts_on_oversize_response(tmp_path: Path) -> None:
 
     cache_file = tmp_path / "litellm.json"
     cache = PricingCache(cache_file=cache_file, ttl_seconds=86400)
-    data = cache.load_or_fetch(
-        http_client=httpx.Client(transport=httpx.MockTransport(handler))
-    )
+    data = cache.load_or_fetch(http_client=httpx.Client(transport=httpx.MockTransport(handler)))
     # Falls back because the fetch aborts at the size cap.
     assert cache.last_source == "fallback"
     assert "claude-sonnet-4-5-20250929" in data

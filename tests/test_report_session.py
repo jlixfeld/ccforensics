@@ -396,6 +396,7 @@ def test_render_handles_zero_cost_and_empty_tables() -> None:
         last_active_at=1_713_600_030,
         duration_s=30,
         turn_count=0,
+        compaction_count=0,
         total_cost_usd=0.0,
         models_seen=[],
         summary_text=None,
@@ -415,6 +416,168 @@ def test_render_handles_zero_cost_and_empty_tables() -> None:
     assert "$0.00" in out
     assert "Cost by bucket" in out
     assert "Cost by plugin" in out
+
+
+def test_session_header_reports_compaction_count(tmp_path: Path, pricing_data: dict) -> None:
+    """``compaction_count`` on the header is the number of
+    ``agent-acompact-*.jsonl`` files indexed under the session."""
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    sid = "sess-cmp"
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            _user("u1", sid, "2026-04-22T10:00:00Z", "hi", cwd="/home/test"),
+            _assistant("u2", sid, "2026-04-22T10:00:01Z", msg_id="m1", req_id="r1"),
+        ],
+    )
+    sub_dir = enc / sid / "subagents"
+    sub_dir.mkdir(parents=True)
+    # Two compaction files. Each agent-acompact-<hex>.jsonl is one event.
+    for hex_id in ("aa11", "bb22"):
+        _write_jsonl(
+            sub_dir / f"agent-acompact-{hex_id}.jsonl",
+            [
+                _assistant(
+                    f"ac-{hex_id}",
+                    sid,
+                    "2026-04-22T10:00:05Z",
+                    msg_id=f"acm-{hex_id}",
+                    req_id=f"acr-{hex_id}",
+                    isSidechain=True,
+                ),
+            ],
+        )
+
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    report = build_session_report(conn, sid)
+    assert report.header.compaction_count == 2
+
+
+def test_render_session_report_shows_compactions_in_header(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """``compactions: N`` appears on the header line so the user sees the
+    figure without needing to drill into the bucket table."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    conn, sid = _reconcile(tmp_path, pricing_data)
+    report = build_session_report(conn, sid)
+    buf = StringIO()
+    Console(file=buf, width=200, force_terminal=False).print(render_session_report(report))
+    out = buf.getvalue()
+    assert "compactions:" in out
+
+
+def test_render_buckets_appends_totals_row(tmp_path: Path, pricing_data: dict) -> None:
+    """The Cost-by-bucket table ends with a bold ``Totals`` row whose dollar
+    figure equals the sum of the bucket cells above it."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    conn, sid = _reconcile(tmp_path, pricing_data)
+    report = build_session_report(conn, sid)
+    buf = StringIO()
+    Console(file=buf, width=200, force_terminal=False).print(render_session_report(report))
+    out = buf.getvalue()
+    assert "Totals" in out
+    # The totals dollar amount must equal the bucket sum.
+    bucket_sum = sum(b.cost_usd for b in report.buckets)
+    assert f"${bucket_sum:.2f}" in out
+
+
+def test_render_session_report_shows_full_summary_in_dedicated_panel(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """Summary text renders in its own panel, full-length, not truncated and
+    not inlined into the Session header. Earlier the header inlined the
+    summary at ``[:120]`` which routinely cut off mid-sentence."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    sid = "sess-long-summary"
+    long_text = (
+        "Long summary that comfortably exceeds the prior 120-char cap so the "
+        "test exercises full-length rendering rather than inline truncation."
+    )
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            _user("u1", sid, "2026-04-22T10:00:00Z", long_text, cwd="/home/test"),
+            _assistant("u2", sid, "2026-04-22T10:00:01Z", msg_id="m1", req_id="r1"),
+        ],
+    )
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+    report = build_session_report(conn, sid)
+
+    buf = StringIO()
+    Console(file=buf, width=200, force_terminal=False).print(render_session_report(report))
+    out = buf.getvalue()
+    # The Summary panel exists as a top-level section.
+    assert "Summary" in out
+    # The full long summary text appears verbatim — not truncated mid-string.
+    assert long_text in out
+    # The Session header no longer inlines a ``summary:`` field.
+    assert "summary:" not in out
+
+
+def test_render_session_report_suppresses_summary_panel_when_source_is_none(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """When summary extraction yields ``source='none'`` the report skips the
+    Summary panel entirely rather than showing a panel with the literal
+    ``<no summary available>`` placeholder."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    from ccforensics.report.session import (
+        ParseNotes,
+        SessionHeader,
+        SessionReport,
+        render_session_report,
+    )
+
+    header = SessionHeader(
+        session_id="empty-sid",
+        project_path="/home/test/proj",
+        started_at=1_713_600_000,
+        last_active_at=1_713_600_030,
+        duration_s=30,
+        turn_count=0,
+        compaction_count=0,
+        total_cost_usd=0.0,
+        models_seen=[],
+        summary_text="<no summary available>",
+        summary_source="none",
+    )
+    report = SessionReport(
+        header=header,
+        buckets=[],
+        plugins=[],
+        unattributed_items=[],
+        parse_notes=ParseNotes(schema_versions=[], parse_warnings_total=0, files_count=0),
+    )
+    buf = StringIO()
+    Console(file=buf, width=120, force_terminal=False).print(render_session_report(report))
+    out = buf.getvalue()
+    # No Summary section header — only the Session panel mentions a session
+    # title. The placeholder string itself must not leak through either.
+    assert "<no summary available>" not in out
+    assert "Summary" not in out
 
 
 def test_skill_ledger_zero_cost_renders_dollar_zero() -> None:

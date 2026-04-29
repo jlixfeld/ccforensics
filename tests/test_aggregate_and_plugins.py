@@ -469,6 +469,223 @@ def test_plugins_since_until_filters(tmp_path: Path, pricing_data: dict) -> None
     assert main_rollup.session_count == 1
 
 
+def test_plugins_reports_top_model(tmp_path: Path, pricing_data: dict) -> None:
+    """Each plugin source surfaces its highest-cost model — the model that
+    drove the most spend in that bucket. Lets a user spot e.g. opus dominating
+    a particular plugin without flipping to ``aggregate --group-by model``."""
+    proj = tmp_path / "projects"
+    _make_session(proj, "s1", model="claude-opus-4-7")
+    _make_session(proj, "s2", model="claude-sonnet-4-5-20250929")
+
+    db = tmp_path / "idx.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    rows = query_plugins(conn)
+    main = next((r for r in rows if r.plugin == "main"), None)
+    assert main is not None
+    # Opus is more expensive per token, so opus should be the top model
+    # despite having the same usage volume as sonnet.
+    assert main.most_used_model == "claude-opus-4-7"
+    assert main.model_count == 2  # two distinct models contributed
+
+
+def test_plugins_model_filter_restricts_cost(tmp_path: Path, pricing_data: dict) -> None:
+    """``--model opus`` returns only opus cost, mirroring ``aggregate --model``.
+    Sessions whose only matches are sonnet drop out."""
+    proj = tmp_path / "projects"
+    _make_session(proj, "s-opus", model="claude-opus-4-7")
+    _make_session(proj, "s-sonnet", model="claude-sonnet-4-5-20250929")
+
+    db = tmp_path / "idx.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    unfiltered = query_plugins(conn)
+    opus_only = query_plugins(conn, model="opus")
+
+    main_unfiltered = next(r for r in unfiltered if r.plugin == "main")
+    main_opus = next(r for r in opus_only if r.plugin == "main")
+    # Opus-only cost is strictly less than the all-models total (sonnet
+    # contributed too) and the filtered top-model is opus only.
+    assert main_opus.total_cost_usd < main_unfiltered.total_cost_usd
+    assert main_opus.most_used_model == "claude-opus-4-7"
+    assert main_opus.model_count == 1
+
+
+def test_plugins_model_filter_dot_form_matches_dash_in_model(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """User-friendly ``opus-4.7`` matches the literal ``claude-opus-4-7``.
+
+    On disk Claude writes models as ``claude-opus-4-7`` with dashes. The
+    user-facing version notation is ``4.7``. Without normalization the
+    filter would silently miss; with normalization the dot is rewritten
+    to a dash before the LIKE pattern is built.
+    """
+    proj = tmp_path / "projects"
+    _make_session(proj, "s-opus", model="claude-opus-4-7")
+
+    db = tmp_path / "idx.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    rows = query_plugins(conn, model="opus-4.7")
+    main = next((r for r in rows if r.plugin == "main"), None)
+    assert main is not None
+    assert main.total_cost_usd > 0
+
+
+def test_aggregate_model_filter_dot_form_matches_dash_in_model(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """Same dot-tolerant behaviour applies to ``aggregate --model`` so
+    `--model opus-4.7` works consistently across commands."""
+    proj = tmp_path / "projects"
+    _make_session(proj, "s-opus", model="claude-opus-4-7")
+
+    db = tmp_path / "idx.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    rows = query_aggregate(conn, model="opus-4.7", group_by="none")
+    assert rows[0].total_cost_usd > 0
+
+
+def test_plugins_model_filter_excludes_synthetic_placeholder(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """``<synthetic>`` is Claude Code's literal model string for non-LLM-call
+    placeholder entries. ``--model synth`` must NOT match it — the angle-bracket
+    placeholders never contribute to cost or top-model rankings."""
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    sid = "s-synth"
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            {
+                "type": "user",
+                "uuid": "u1",
+                "sessionId": sid,
+                "timestamp": "2026-04-22T10:00:00Z",
+                "isSidechain": False,
+                "isMeta": False,
+                "cwd": "/home/test",
+                "message": {"role": "user", "content": "hi"},
+            },
+            {
+                "type": "assistant",
+                "uuid": "u2",
+                "sessionId": sid,
+                "timestamp": "2026-04-22T10:00:01Z",
+                "isSidechain": False,
+                "isMeta": False,
+                "requestId": "r-synth",
+                "message": {
+                    "id": "m-synth",
+                    "role": "assistant",
+                    "model": "<synthetic>",
+                    "content": [{"type": "text", "text": "x"}],
+                },
+            },
+        ],
+    )
+
+    db = tmp_path / "idx.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    rows = query_plugins(conn, model="synth")
+    # The only message is ``<synthetic>``; it must not match a model filter.
+    assert rows == []
+
+
+def test_render_plugins_appends_totals_row() -> None:
+    """The plugin rollup table ends with a bold ``Totals`` row summing cost
+    and the per-row session count."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    rollups = [
+        PluginRollup(
+            plugin="main",
+            total_cost_usd=2.50,
+            session_count=3,
+            most_used_agent_type=None,
+            agent_type_count=0,
+            most_used_skill=None,
+            skill_count=0,
+            most_used_model="claude-opus-4-7",
+            model_count=1,
+            first_seen=1_700_000_000,
+            last_seen=1_700_000_100,
+        ),
+        PluginRollup(
+            plugin="builtin",
+            total_cost_usd=1.25,
+            session_count=2,
+            most_used_agent_type="Explore",
+            agent_type_count=1,
+            most_used_skill=None,
+            skill_count=0,
+            most_used_model="claude-sonnet-4-5-20250929",
+            model_count=1,
+            first_seen=1_700_000_000,
+            last_seen=1_700_000_100,
+        ),
+    ]
+    buf = StringIO()
+    Console(file=buf, width=200, force_terminal=False).print(render_plugins(rollups))
+    out = buf.getvalue()
+    assert "Totals" in out
+    # Cost total: $3.75. Sessions total: 5.
+    assert "$3.75" in out
+
+
+def test_render_aggregate_appends_totals_row() -> None:
+    """``aggregate``'s rendered table ends with a bold ``Totals`` row."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    from ccforensics.report.aggregate import AggregateRow, render_aggregate
+
+    rows = [
+        AggregateRow(
+            group_key="proj-a",
+            total_cost_usd=1.00,
+            session_count=2,
+            input_tokens=100,
+            output_tokens=50,
+            cache_create=10,
+            cache_read=20,
+        ),
+        AggregateRow(
+            group_key="proj-b",
+            total_cost_usd=2.50,
+            session_count=3,
+            input_tokens=200,
+            output_tokens=80,
+            cache_create=15,
+            cache_read=30,
+        ),
+    ]
+    buf = StringIO()
+    Console(file=buf, width=200, force_terminal=False).print(render_aggregate(rows, "project"))
+    out = buf.getvalue()
+    assert "Totals" in out
+    assert "$3.50" in out
+    # in tokens: 300 (formatted with comma at >=1000 — here just compare digits)
+    assert "300" in out
+
+
 def test_render_plugins_preserves_epoch_zero_seen() -> None:
     """first_seen=0 / last_seen=0 must render as 1970-01-01, not '-'.
 
@@ -487,6 +704,8 @@ def test_render_plugins_preserves_epoch_zero_seen() -> None:
         agent_type_count=0,
         most_used_skill=None,
         skill_count=0,
+        most_used_model=None,
+        model_count=0,
         first_seen=0,
         last_seen=0,
     )

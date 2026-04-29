@@ -172,5 +172,3 @@ def test_write_csv_injects_guard_into_summary_column() -> None:
     write_csv(rows, headers=["summary"], out=buf)
     parsed = list(csv.reader(io.StringIO(buf.getvalue())))
     assert parsed == [["summary"], ["'=cmd|'/C calc'!A1"]]
-
-

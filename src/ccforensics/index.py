@@ -8,7 +8,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .attribution import backfill_spawn_totals, recompute_session_rollups
+from .attribution import (
+    backfill_spawn_totals,
+    find_invariant_violators,
+    recompute_session_rollups,
+)
 from .jsonl import _dedup_preference, annotate_cost, dedup_key, parse_file
 from .models import TranscriptEntry, load_meta_json
 from .paths import claude_home, claude_plugins_cache_dir, decode_project_dirname
@@ -779,26 +783,75 @@ def reconcile_projects_dir(
     skill_resolver = build_resolver_from_paths()
 
     for sid in stats.sessions_recomputed:
-        try:
-            recompute_session_summary(conn, sid)
-            recompute_session_rollups(conn, sid)
-            backfill_spawn_totals(conn, sid)
-            populate_from_session_files(conn, sid, skill_resolver)
-        except (OSError, sqlite3.Error):
-            # TOCTOU: Claude Code may delete/rotate a main file between the
-            # file walk and this pass, so parse_file raises FileNotFoundError
-            # (an OSError subclass). Other I/O errors (permissions, disk read)
-            # and sqlite3 transient errors are similarly isolated so one bad
-            # session can't abort the remaining recomputes. Programmer errors
-            # (KeyError, AttributeError, ValueError) deliberately propagate —
-            # they indicate real bugs and should not be silently swallowed.
-            logger.warning(
-                "failed to recompute per-session aggregates for session_id=%s; skipping",
-                sid,
-                exc_info=True,
-            )
+        _recompute_session_aggregates(conn, sid, skill_resolver)
+
+    # Self-heal: any session whose rollup sum disagrees with messages sum
+    # (typically because a prior reconcile's recompute hit a transient I/O
+    # error reading the main file and bailed before rollups got refreshed).
+    # Subsequent incremental reconciles can't catch this — the file's
+    # mtime/size hasn't changed so the session never re-enters
+    # ``sessions_recomputed``. Sweep them up here in one pass.
+    healed = set(find_invariant_violators(conn)) - stats.sessions_recomputed
+    for sid in healed:
+        _recompute_session_aggregates(conn, sid, skill_resolver)
+    if healed:
+        logger.info("self-healed %d session(s) with stale rollups", len(healed))
+
     conn.commit()
     return stats
+
+
+def _recompute_session_aggregates(
+    conn: sqlite3.Connection,
+    sid: str,
+    skill_resolver: Any,
+) -> None:
+    """Run the four per-session recompute steps with isolated error handling.
+
+    Each step is in its own try/except so a transient failure in one
+    (notably ``recompute_session_summary`` reading the main file) doesn't
+    skip the purely-SQL steps below it. ``recompute_session_rollups`` and
+    ``backfill_spawn_totals`` operate only on tables already in the DB and
+    can heal stale state even when the on-disk JSONL is unreachable.
+
+    TOCTOU: Claude Code may delete/rotate a main file between the file
+    walk and this pass, so ``parse_file`` raises ``FileNotFoundError``
+    (an OSError subclass). Programmer errors (KeyError, AttributeError,
+    ValueError) deliberately propagate — they indicate real bugs and
+    should not be silently swallowed.
+    """
+    try:
+        recompute_session_summary(conn, sid)
+    except (OSError, sqlite3.Error):
+        logger.warning(
+            "recompute_session_summary failed for session_id=%s; skipping",
+            sid,
+            exc_info=True,
+        )
+    try:
+        recompute_session_rollups(conn, sid)
+    except sqlite3.Error:
+        logger.warning(
+            "recompute_session_rollups failed for session_id=%s; skipping",
+            sid,
+            exc_info=True,
+        )
+    try:
+        backfill_spawn_totals(conn, sid)
+    except sqlite3.Error:
+        logger.warning(
+            "backfill_spawn_totals failed for session_id=%s; skipping",
+            sid,
+            exc_info=True,
+        )
+    try:
+        populate_from_session_files(conn, sid, skill_resolver)
+    except (OSError, sqlite3.Error):
+        logger.warning(
+            "populate_from_session_files failed for session_id=%s; skipping",
+            sid,
+            exc_info=True,
+        )
 
 
 @dataclass

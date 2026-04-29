@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
+from rich import box
 from rich.table import Table
 
 from ..registry import (
@@ -80,8 +81,11 @@ def _query_messages_aggregate(
     where.append("m.model IS NOT NULL")
     where.append("m.model NOT LIKE '<%>'")
     if model:
+        # Normalize ``.`` → ``-`` so ``opus-4.7`` matches the on-disk
+        # ``claude-opus-4-7`` model string. ``opus`` / ``haiku`` are
+        # unaffected since they have no dot to substitute.
         where.append("LOWER(m.model) LIKE ?")
-        params.append(f"%{model.lower()}%")
+        params.append(f"%{model.lower().replace('.', '-')}%")
     sql = f"""
         SELECT {group_expr} AS group_key,
                COALESCE(SUM(m.cost_usd), 0) AS cost,
@@ -291,7 +295,12 @@ def query_aggregate(
 
 
 def render_aggregate(rows: list[AggregateRow], group_by: str) -> Table:
-    t = Table(title=f"Aggregate (group-by: {group_by})", show_edge=False)
+    t = Table(
+        title=f"Aggregate (group-by: {group_by})",
+        title_style="bold",
+        box=box.HEAVY_HEAD,
+        show_lines=True,
+    )
     t.add_column("group", style="cyan")
     t.add_column("cost", justify="right")
     t.add_column("sessions", justify="right")
@@ -308,5 +317,22 @@ def render_aggregate(rows: list[AggregateRow], group_by: str) -> Table:
             f"{r.output_tokens:,}",
             f"{r.cache_create:,}",
             f"{r.cache_read:,}",
+        )
+    if rows:
+        # ``sessions`` totals the per-group session_count column rather than
+        # the count of distinct sessions across groups — a session can land
+        # in multiple groups (e.g. ``--group-by model``) so the column is
+        # already a per-row count, not a deduped global. Summing the column
+        # is the consistent definition of "what's displayed".
+        t.add_section()
+        t.add_row(
+            "Totals",
+            format_cost(sum(r.total_cost_usd for r in rows)),
+            f"{sum(r.session_count for r in rows):,}",
+            f"{sum(r.input_tokens for r in rows):,}",
+            f"{sum(r.output_tokens for r in rows):,}",
+            f"{sum(r.cache_create for r in rows):,}",
+            f"{sum(r.cache_read for r in rows):,}",
+            style="bold",
         )
     return t

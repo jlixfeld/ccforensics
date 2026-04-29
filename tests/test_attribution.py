@@ -8,6 +8,7 @@ import pytest
 
 from ccforensics.attribution import (
     backfill_spawn_totals,
+    find_invariant_violators,
     recompute_session_rollups,
     verify_invariant,
 )
@@ -617,6 +618,88 @@ def test_buckets_have_exact_per_bucket_token_counts(tmp_path: Path, pricing_data
     # Auto-compact bucket: just the compaction worker.
     assert by_bucket[("auto-compact", "auto-compact")]["input"] == 300
     assert by_bucket[("auto-compact", "auto-compact")]["output"] == 200
+
+
+def test_find_invariant_violators_flags_stale_rollups(tmp_path: Path, pricing_data: dict) -> None:
+    """Sessions whose rollup sum drifts from messages sum (pre-existing
+    state from a prior failed recompute) are surfaced for self-heal.
+
+    Reproduces the user-reported scenario where ``aggregate group-by=none``
+    showed a different total from ``aggregate group-by=model`` because the
+    rollup-based path read stale data while the messages-based path read live
+    data. We simulate the drift by manually editing a rollup row.
+    """
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    sid = "sess-stale"
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            _user("u1", sid, "2026-04-22T10:00:00Z", "hi", cwd="/home/test"),
+            _assistant("u2", sid, "2026-04-22T10:00:01Z", msg_id="m1", req_id="r1"),
+        ],
+    )
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+    conn.commit()
+
+    # Sanity: invariant holds right after reconcile.
+    assert find_invariant_violators(conn) == []
+
+    # Tamper: pretend a prior reconcile wrote a smaller cost into the rollup
+    # (simulating a recompute that ran before more messages arrived).
+    conn.execute(
+        "UPDATE session_rollups SET cost_usd = cost_usd / 2 WHERE session_id=?",
+        (sid,),
+    )
+    conn.commit()
+    assert find_invariant_violators(conn) == [sid]
+
+
+def test_reconcile_self_heals_stale_rollups(tmp_path: Path, pricing_data: dict) -> None:
+    """A subsequent reconcile detects a drifted invariant and rebuilds the
+    rollup, even when the file's mtime/size hasn't changed (so the session
+    isn't naturally re-queued for recompute by the file walk).
+
+    Without the self-heal, this is the user's bug: incremental reconciles
+    can never fix stale rollups left behind by a prior failed recompute.
+    """
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    sid = "sess-self-heal"
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            _user("u1", sid, "2026-04-22T10:00:00Z", "hi", cwd="/home/test"),
+            _assistant("u2", sid, "2026-04-22T10:00:01Z", msg_id="m1", req_id="r1"),
+        ],
+    )
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+    conn.commit()
+
+    # Tamper to simulate a stale rollup from a prior failed recompute.
+    conn.execute(
+        "UPDATE session_rollups SET cost_usd = cost_usd + 99.99 WHERE session_id=?",
+        (sid,),
+    )
+    conn.commit()
+    passed_before, _, _ = verify_invariant(conn, sid)
+    assert not passed_before
+
+    # Re-reconcile. The file's mtime/size didn't change, so the file walk
+    # won't re-process it — the self-heal pass is the only mechanism that
+    # can fix this.
+    reconcile_projects_dir(conn, proj, pricing_data)
+    conn.commit()
+
+    passed_after, msg_total, roll_total = verify_invariant(conn, sid)
+    assert passed_after, f"invariant still broken: messages={msg_total} rollups={roll_total}"
+    assert find_invariant_violators(conn) == []
 
 
 def test_rollup_helper_can_be_called_standalone(tmp_path: Path, pricing_data: dict) -> None:
