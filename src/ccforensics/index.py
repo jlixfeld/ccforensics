@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 import sqlite3
@@ -486,20 +487,23 @@ def _insert_message(
     usage = msg.usage if msg else None
     tool_use_id = None
     tool_name = None
+    tool_uses_for_aux: list[tuple[int, str, str, object]] = []
     if msg and msg.content:
-        for block in msg.content:
+        for ordinal, block in enumerate(msg.content):
             if block.type == "tool_use":
-                tool_use_id = block.id
-                tool_name = block.name
-                break
+                if tool_use_id is None:
+                    tool_use_id = block.id
+                    tool_name = block.name
+                tool_uses_for_aux.append((ordinal, block.id, block.name, block.input))
     conn.execute(
         """INSERT OR REPLACE INTO messages (
             dedup_key, file_path, session_id, uuid, parent_uuid,
             source_tool_use_id, source_tool_assistant_uuid,
             tool_use_id, tool_name, agent_id, role, type, model, ts,
             is_sidechain, is_meta,
-            input_tokens, output_tokens, cache_creation, cache_read, cost_usd
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            input_tokens, output_tokens, cache_creation, cache_read, cost_usd,
+            service_tier
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             key,
             file_path,
@@ -522,8 +526,27 @@ def _insert_message(
             usage.cache_creation_input_tokens if usage else None,
             usage.cache_read_input_tokens if usage else None,
             cost_usd,
+            usage.service_tier if usage else None,
         ),
     )
+    for ordinal, tu_id, tu_name, tu_input in tool_uses_for_aux:
+        mcp_server = (
+            tu_name.split("__", 2)[1]
+            if tu_name.startswith("mcp__") and tu_name.count("__") >= 2
+            else None
+        )
+        try:
+            args_size = len(
+                json.dumps(tu_input, sort_keys=True, separators=(",", ":")).encode()
+            )
+        except (TypeError, ValueError):
+            args_size = 0
+        conn.execute(
+            """INSERT OR REPLACE INTO message_tool_uses
+               (message_dedup_key, ordinal, tool_use_id, tool_name, mcp_server, args_size_bytes)
+               VALUES (?,?,?,?,?,?)""",
+            (key, ordinal, tu_id, tu_name, mcp_server, args_size),
+        )
 
 
 def reconcile_file(conn: sqlite3.Connection, path: Path, pricing_data: dict[str, Any]) -> None:
