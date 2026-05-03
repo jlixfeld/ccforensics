@@ -22,7 +22,11 @@ from .index import (
 from .paths import ccforensics_cache_dir, claude_projects_dir
 from .pricing import PricingCache
 from .report._dates import parse_since, parse_until
-from .report.aggregate import query_aggregate, render_aggregate
+from .report.aggregate import (
+    query_aggregate_report,
+    render_aggregate,
+    render_aggregate_footer,
+)
 from .report.plugins import query_plugins, render_plugins
 from .report.resolver import AmbiguousPrefix, SessionNotFound, resolve_session_id
 from .report.session import (
@@ -325,8 +329,12 @@ def aggregate(
 
     conn = _open_index()
 
+    # ``_load_pricing()`` is hoisted out of the ``not no_refresh`` branch so
+    # the cache cost-savings + efficiency math has pricing data to work with
+    # even when reconciliation is skipped. Skipping the refresh shouldn't
+    # silently zero out the Cache: footer.
+    pricing = _load_pricing()
     if not no_refresh:
-        pricing = _load_pricing()
         reconcile_projects_dir(conn, claude_projects_dir(), pricing)
         conn.commit()
 
@@ -334,21 +342,39 @@ def aggregate(
     until_dt = parse_until(until) if until else None
 
     try:
-        rows = query_aggregate(
+        report = query_aggregate_report(
             conn,
             since=since_dt,
             until=until_dt,
             project=project,
             model=model,
             group_by=group_by,  # type: ignore[arg-type]
+            pricing_data=pricing,
         )
     except ValueError as e:
         raise click.UsageError(str(e)) from e
 
     if as_json:
-        write_json([dataclasses.asdict(r) for r in rows], sys.stdout)
+        # Envelope dict per spec — top-level keys ``cache_eff_pct``,
+        # ``cache_savings_usd``, ``cache_read_tokens``,
+        # ``cache_creation_tokens``, ``service_tier_breakdown`` sit
+        # alongside ``rows``. Breaking change for JSON consumers vs. the
+        # earlier flat list, but spec mandates this shape.
+        payload = {
+            "rows": [dataclasses.asdict(r) for r in report.rows],
+            "cache_read_tokens": report.cache_read_tokens,
+            "cache_creation_tokens": report.cache_creation_tokens,
+            "cache_eff_pct": report.cache_eff_pct,
+            "cache_savings_usd": report.cache_savings_usd,
+            "cache_excluded_unknown_models": report.cache_excluded_unknown_models,
+            "service_tier_breakdown": report.service_tier_breakdown,
+        }
+        write_json(payload, sys.stdout)
         return
     if as_csv:
+        # CSV stays row-shaped — cache + tier metrics are scalar / dict and
+        # don't fit the row schema. JSON is the right format for callers
+        # that want the footer values programmatically.
         headers = [
             "group_key",
             "total_cost_usd",
@@ -358,10 +384,15 @@ def aggregate(
             "cache_create",
             "cache_read",
         ]
-        write_csv((dataclasses.asdict(r) for r in rows), headers, sys.stdout)
+        write_csv((dataclasses.asdict(r) for r in report.rows), headers, sys.stdout)
         return
 
-    Console().print(render_aggregate(rows, group_by))
+    console = Console()
+    console.print(render_aggregate(report.rows, group_by))
+    footer = render_aggregate_footer(report)
+    if footer is not None:
+        console.print("")
+        console.print(footer)
 
 
 @main.command()

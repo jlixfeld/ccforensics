@@ -8,7 +8,12 @@ from typing import Any
 import pytest
 
 from ccforensics.index import ensure_schema, open_connection, reconcile_projects_dir
-from ccforensics.report.aggregate import query_aggregate
+from ccforensics.report.aggregate import (
+    AggregateReport,
+    query_aggregate,
+    query_aggregate_report,
+    render_aggregate_footer,
+)
 from ccforensics.report.plugins import PluginRollup, query_plugins, render_plugins
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -714,3 +719,297 @@ def test_render_plugins_preserves_epoch_zero_seen() -> None:
     out = buf.getvalue()
     # Exactly two date cells: first_seen + last_seen both render as 1970-01-01.
     assert out.count("1970-01-01") == 2
+
+
+# ---------- query_aggregate_report (cache + service-tier envelope) ----------
+
+
+def _assistant_with_cache_tier(
+    uuid: str,
+    sid: str,
+    ts: str,
+    *,
+    msg_id: str,
+    req_id: str,
+    model: str = "claude-sonnet-4-5-20250929",
+    input_tokens: int = 10,
+    output_tokens: int = 5,
+    cache_creation: int = 0,
+    cache_read: int = 0,
+    service_tier: str | None = None,
+) -> dict[str, Any]:
+    """Assistant entry with explicit usage / service_tier knobs — the
+    aggregate cache + tier tests need to plant cache and tier values that
+    ``_make_session`` doesn't expose, and a local helper keeps the broad
+    existing aggregate tests untouched."""
+    usage: dict[str, Any] = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_creation,
+    }
+    if service_tier is not None:
+        usage["service_tier"] = service_tier
+    return {
+        "type": "assistant",
+        "uuid": uuid,
+        "sessionId": sid,
+        "timestamp": ts,
+        "isSidechain": False,
+        "isMeta": False,
+        "requestId": req_id,
+        "message": {
+            "id": msg_id,
+            "role": "assistant",
+            "model": model,
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": usage,
+        },
+    }
+
+
+def _user_entry(uuid: str, sid: str, ts: str, *, cwd: str = "/home/test") -> dict[str, Any]:
+    return {
+        "type": "user",
+        "uuid": uuid,
+        "sessionId": sid,
+        "timestamp": ts,
+        "isSidechain": False,
+        "isMeta": False,
+        "cwd": cwd,
+        "message": {"role": "user", "content": "hi"},
+    }
+
+
+def test_aggregate_report_includes_cache_totals(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """query_aggregate_report exposes cache_read_tokens, cache_creation_tokens,
+    cache_eff_pct, cache_savings_usd at the top level, computed from the same
+    rows the table aggregates over.
+
+    Asserts exact computed values from the fixture pricing so the math is
+    locked in: efficiency is cost-weighted (``num = cache_read * read_price``,
+    ``den = num + cache_create * create_price + input * input_price``);
+    savings is ``cache_read * (input_price - read_price)``."""
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    sid = "sess-cache"
+    input_tokens = 1000
+    cache_creation = 2000
+    cache_read = 8000
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            _user_entry("u1", sid, "2026-04-22T10:00:00Z"),
+            _assistant_with_cache_tier(
+                "u2",
+                sid,
+                "2026-04-22T10:00:05Z",
+                msg_id="m1",
+                req_id="r1",
+                input_tokens=input_tokens,
+                output_tokens=50,
+                cache_creation=cache_creation,
+                cache_read=cache_read,
+                service_tier="standard",
+            ),
+        ],
+    )
+    db = tmp_path / "i.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    report = query_aggregate_report(conn, group_by="none", pricing_data=pricing_data)
+
+    sonnet = pricing_data["claude-sonnet-4-5-20250929"]
+    input_price = sonnet["input_cost_per_token"]
+    create_price = sonnet["cache_creation_input_token_cost"]
+    read_price = sonnet["cache_read_input_token_cost"]
+    expected_savings = cache_read * (input_price - read_price)
+    num = cache_read * read_price
+    den = num + cache_creation * create_price + input_tokens * input_price
+    expected_eff_pct = num / den * 100.0
+
+    assert isinstance(report, AggregateReport)
+    assert report.cache_read_tokens == cache_read
+    assert report.cache_creation_tokens == cache_creation
+    assert report.cache_eff_pct == pytest.approx(expected_eff_pct)
+    assert report.cache_savings_usd == pytest.approx(expected_savings)
+    assert report.cache_excluded_unknown_models == 0
+    # Rows from query_aggregate are intact in the envelope.
+    assert len(report.rows) == 1
+    assert report.rows[0].group_key == "(all)"
+
+
+def test_aggregate_report_service_tier_breakdown(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """Mixed standard + priority assistant rows surface in the breakdown
+    dict; user-role rows are excluded (no service_tier on user messages)."""
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    sid = "sess-tiers"
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            _user_entry("u1", sid, "2026-04-22T10:00:00Z"),
+            _assistant_with_cache_tier(
+                "u2", sid, "2026-04-22T10:00:05Z",
+                msg_id="m1", req_id="r1", service_tier="standard",
+            ),
+            _assistant_with_cache_tier(
+                "u3", sid, "2026-04-22T10:00:10Z",
+                msg_id="m2", req_id="r2", service_tier="priority",
+            ),
+            _assistant_with_cache_tier(
+                "u4", sid, "2026-04-22T10:00:15Z",
+                msg_id="m3", req_id="r3", service_tier="priority",
+            ),
+        ],
+    )
+    db = tmp_path / "i.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    report = query_aggregate_report(conn, group_by="none", pricing_data=pricing_data)
+
+    assert report.service_tier_breakdown == {"standard": 1, "priority": 2}
+
+
+def test_aggregate_report_no_cache_activity(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """Zero cache_read AND zero cache_creation → cache fields all zero; no
+    division-by-zero in the cost-weighted efficiency calc."""
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    sid = "sess-nocache"
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            _user_entry("u1", sid, "2026-04-22T10:00:00Z"),
+            _assistant_with_cache_tier(
+                "u2", sid, "2026-04-22T10:00:05Z",
+                msg_id="m1", req_id="r1",
+                input_tokens=1000, output_tokens=50,
+                cache_creation=0, cache_read=0,
+            ),
+        ],
+    )
+    db = tmp_path / "i.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    report = query_aggregate_report(conn, group_by="none", pricing_data=pricing_data)
+
+    assert report.cache_read_tokens == 0
+    assert report.cache_creation_tokens == 0
+    assert report.cache_eff_pct == 0.0
+    assert report.cache_savings_usd == 0.0
+    assert report.cache_excluded_unknown_models == 0
+
+
+def test_aggregate_report_model_filter_scopes_cache_metrics(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """The cache + tier metrics must honour the same ``--model`` filter as
+    the row aggregation. A session with mixed models filtered to one should
+    only count that model's cache / tier rows."""
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    sid = "sess-mixed"
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            _user_entry("u1", sid, "2026-04-22T10:00:00Z"),
+            _assistant_with_cache_tier(
+                "u2", sid, "2026-04-22T10:00:05Z",
+                msg_id="m1", req_id="r1",
+                model="claude-sonnet-4-5-20250929",
+                input_tokens=1000, output_tokens=50,
+                cache_creation=2000, cache_read=8000,
+                service_tier="priority",
+            ),
+            _assistant_with_cache_tier(
+                "u3", sid, "2026-04-22T10:00:10Z",
+                msg_id="m2", req_id="r2",
+                model="claude-haiku-4-5-20251001",
+                input_tokens=500, output_tokens=20,
+                cache_creation=1000, cache_read=4000,
+                service_tier="standard",
+            ),
+        ],
+    )
+    db = tmp_path / "i.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    # Filter to the sonnet rows only — cache metrics + tier should reflect
+    # only the priority+sonnet message.
+    report = query_aggregate_report(
+        conn, group_by="none", model="sonnet", pricing_data=pricing_data
+    )
+
+    assert report.cache_read_tokens == 8000
+    assert report.cache_creation_tokens == 2000
+    assert report.service_tier_breakdown == {"priority": 1}
+
+
+def test_render_aggregate_footer_includes_cache_line(
+    pricing_data: dict,
+) -> None:
+    """render_aggregate_footer emits the Cache: line when there is cache
+    activity, and the Service tiers: line only for non-standard tiers."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    sonnet = pricing_data["claude-sonnet-4-5-20250929"]
+    expected_savings = 8000 * (
+        sonnet["input_cost_per_token"] - sonnet["cache_read_input_token_cost"]
+    )
+    report = AggregateReport(
+        rows=[],
+        cache_read_tokens=8000,
+        cache_creation_tokens=2000,
+        cache_eff_pct=42.5,
+        cache_savings_usd=expected_savings,
+        cache_excluded_unknown_models=0,
+        service_tier_breakdown={"standard": 3, "priority": 2},
+    )
+
+    footer = render_aggregate_footer(report)
+    assert footer is not None
+
+    buf = StringIO()
+    Console(file=buf, width=200, force_terminal=False, color_system=None).print(footer)
+    out = buf.getvalue()
+
+    assert "Cache:" in out
+    assert "8.0K read" in out
+    assert "2.0K created" in out
+    assert "42.5% efficiency" in out
+    assert f"saved ${expected_savings:.2f}" in out
+    # Non-standard tier present ⇒ Service tiers: line should appear.
+    assert "Service tiers:" in out
+    assert "priority 2 msgs" in out
+
+
+def test_render_aggregate_footer_returns_none_when_idle() -> None:
+    """No cache activity AND only standard/unknown tiers → no footer at
+    all. Suppressing the empty footer keeps the report clean for vanilla
+    sessions; same rule as ``session show``."""
+    report = AggregateReport(
+        rows=[],
+        cache_read_tokens=0,
+        cache_creation_tokens=0,
+        cache_eff_pct=0.0,
+        cache_savings_usd=0.0,
+        service_tier_breakdown={"standard": 5, "unknown": 1},
+    )
+    assert render_aggregate_footer(report) is None

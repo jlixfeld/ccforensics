@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from rich import box
+from rich.console import Group, RenderableType
 from rich.table import Table
+from rich.text import Text
 
+from ..pricing import resolve_pricing
 from ..registry import (
     classify_agent_source,
     load_plugin_names,
     load_user_level_agent_names,
 )
+from ._cache import CacheRow, cache_metrics
 from ._format import format_cost
 
 GroupBy = Literal["none", "project", "day", "week", "month", "plugin", "model"]
@@ -294,6 +298,160 @@ def query_aggregate(
     ]
 
 
+@dataclass
+class AggregateReport:
+    """Envelope for the ``aggregate`` command — the existing per-group rows
+    plus scoped cache + service-tier metrics. The cache fields and
+    ``service_tier_breakdown`` sit at the top level per spec
+    (``docs/specs/design.md``); JSON output emits them as flat keys
+    alongside ``rows``."""
+
+    rows: list[AggregateRow]
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cache_eff_pct: float = 0.0
+    cache_savings_usd: float = 0.0
+    cache_excluded_unknown_models: int = 0
+    service_tier_breakdown: dict[str, int] = field(default_factory=dict)
+
+
+def _aggregate_cache_metrics(
+    conn: sqlite3.Connection,
+    *,
+    since: datetime | None,
+    until: datetime | None,
+    project: str | None,
+    model: str | None,
+    pricing_data: dict[str, Any] | None,
+) -> tuple[int, int, float, float, int]:
+    """Cache token totals + cost-derived metrics over the same scope as
+    ``query_aggregate``. Joins ``messages`` to ``session_summaries`` for the
+    date / project filters and re-applies the ``--model`` filter when set,
+    so the metrics line up with whichever rows the table already shows.
+    Excludes ``model IS NULL`` (infrastructure rows) and Claude Code's
+    ``<...>`` placeholders for the same reasons as the per-message
+    aggregation in ``_query_messages_aggregate``.
+    """
+    where, params = _base_filters(since, until, project)
+    where.append("m.model IS NOT NULL")
+    where.append("m.model NOT LIKE '<%>'")
+    if model:
+        where.append("LOWER(m.model) LIKE ?")
+        params.append(f"%{model.lower().replace('.', '-')}%")
+    sql = f"""
+        SELECT m.model,
+               COALESCE(SUM(m.input_tokens), 0),
+               COALESCE(SUM(m.cache_creation), 0),
+               COALESCE(SUM(m.cache_read), 0)
+          FROM messages m
+          JOIN session_summaries ss ON ss.session_id = m.session_id
+         WHERE {" AND ".join(where)}
+         GROUP BY m.model
+    """
+    rows_data = conn.execute(sql, params).fetchall()
+    rows = [
+        CacheRow(
+            model=str(m),
+            input_tokens=int(i or 0),
+            cache_creation=int(cc or 0),
+            cache_read=int(cr or 0),
+        )
+        for (m, i, cc, cr) in rows_data
+    ]
+    cache_read_total = sum(r.cache_read for r in rows)
+    cache_create_total = sum(r.cache_creation for r in rows)
+    if pricing_data is None:
+        return (cache_read_total, cache_create_total, 0.0, 0.0, 0)
+    metrics = cache_metrics(rows, lambda mdl: resolve_pricing(mdl, pricing_data))
+    return (
+        cache_read_total,
+        cache_create_total,
+        metrics.eff_pct,
+        metrics.savings_usd,
+        metrics.rows_excluded_for_unknown_model,
+    )
+
+
+def _aggregate_service_tier_breakdown(
+    conn: sqlite3.Connection,
+    *,
+    since: datetime | None,
+    until: datetime | None,
+    project: str | None,
+    model: str | None,
+) -> dict[str, int]:
+    """Assistant-only service_tier counts. ``role='assistant'`` because
+    user / tool_result messages don't carry a tier and inflating the
+    count with them would mislead. NULL → 'unknown'."""
+    where, params = _base_filters(since, until, project)
+    where.append("m.role='assistant'")
+    if model:
+        where.append("m.model IS NOT NULL")
+        where.append("LOWER(m.model) LIKE ?")
+        params.append(f"%{model.lower().replace('.', '-')}%")
+    sql = f"""
+        SELECT COALESCE(m.service_tier, 'unknown') AS tier, COUNT(*)
+          FROM messages m
+          JOIN session_summaries ss ON ss.session_id = m.session_id
+         WHERE {" AND ".join(where)}
+         GROUP BY tier
+         ORDER BY tier
+    """
+    rows = conn.execute(sql, params).fetchall()
+    return {str(t): int(c) for t, c in rows}
+
+
+def query_aggregate_report(
+    conn: sqlite3.Connection,
+    *,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    project: str | None = None,
+    model: str | None = None,
+    group_by: GroupBy = "none",
+    pricing_data: dict[str, Any] | None = None,
+) -> AggregateReport:
+    """Wraps ``query_aggregate`` and adds scoped cache + tier metrics.
+
+    The same date / project / model filters apply to all three queries so
+    the footer always describes the same rows the table shows. The
+    ``--model`` + ``--group-by plugin`` rejection in ``query_aggregate``
+    surfaces here unchanged — the wrapper does no extra validation.
+    """
+    rows = query_aggregate(
+        conn,
+        since=since,
+        until=until,
+        project=project,
+        model=model,
+        group_by=group_by,
+    )
+    cache_read, cache_create, eff_pct, savings, excluded = _aggregate_cache_metrics(
+        conn,
+        since=since,
+        until=until,
+        project=project,
+        model=model,
+        pricing_data=pricing_data,
+    )
+    tier_breakdown = _aggregate_service_tier_breakdown(
+        conn,
+        since=since,
+        until=until,
+        project=project,
+        model=model,
+    )
+    return AggregateReport(
+        rows=rows,
+        cache_read_tokens=cache_read,
+        cache_creation_tokens=cache_create,
+        cache_eff_pct=eff_pct,
+        cache_savings_usd=savings,
+        cache_excluded_unknown_models=excluded,
+        service_tier_breakdown=tier_breakdown,
+    )
+
+
 def render_aggregate(rows: list[AggregateRow], group_by: str) -> Table:
     t = Table(
         title=f"Aggregate (group-by: {group_by})",
@@ -336,3 +494,56 @@ def render_aggregate(rows: list[AggregateRow], group_by: str) -> Table:
             style="bold",
         )
     return t
+
+
+def _human_count(n: int) -> str:
+    """Compact integer formatting for the cache footer line. Mirrors
+    ``session.py`` so the two reports use the same K/M presentation."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def render_aggregate_footer(report: AggregateReport) -> RenderableType | None:
+    """Cache + service-tier footer lines below the aggregate table.
+
+    Returns ``None`` when neither line applies — no cache activity AND no
+    non-standard service tier — so callers can skip the blank-line spacer
+    entirely. Suppressing 0% efficiency / standard-only tier output keeps
+    the report from showing misleading footers on uncached / vanilla
+    sessions; same rule as ``session show``.
+    """
+    pieces: list[RenderableType] = []
+    if report.cache_read_tokens or report.cache_creation_tokens:
+        eff_str = f"{report.cache_eff_pct:.1f}%" if report.cache_eff_pct else "—"
+        line = (
+            f"Cache: {_human_count(report.cache_read_tokens)} read · "
+            f"{_human_count(report.cache_creation_tokens)} created · "
+            f"{eff_str} efficiency · saved ${report.cache_savings_usd:.2f}"
+        )
+        if report.cache_excluded_unknown_models:
+            line += (
+                f"  (excluded {report.cache_excluded_unknown_models} model(s) "
+                "with no resolvable pricing)"
+            )
+        pieces.append(Text(line, style="dim"))
+    non_standard = any(
+        t not in ("standard", "unknown") for t in report.service_tier_breakdown
+    )
+    if non_standard:
+        parts = [
+            f"{t} {c:,} msgs"
+            for t, c in sorted(report.service_tier_breakdown.items())
+        ]
+        pieces.append(
+            Text(
+                f"Service tiers: {' · '.join(parts)}  "
+                "(non-standard pricing not yet applied)",
+                style="dim",
+            )
+        )
+    if not pieces:
+        return None
+    return Group(*pieces)
