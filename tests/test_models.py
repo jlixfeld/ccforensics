@@ -243,3 +243,23 @@ def test_spawn_meta_directly_constructible() -> None:
     meta = SpawnMeta(agentType="Plan", description="plan the refactor")
     assert meta.agent_type == "Plan"
     assert meta.description == "plan the refactor"
+
+
+def test_usage_stats_captures_service_tier() -> None:
+    from ccforensics.models import UsageStats
+
+    block = UsageStats.model_validate(
+        {
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "service_tier": "priority",
+        }
+    )
+    assert block.service_tier == "priority"
+
+
+def test_usage_stats_service_tier_optional() -> None:
+    from ccforensics.models import UsageStats
+
+    block = UsageStats.model_validate({"input_tokens": 100, "output_tokens": 50})
+    assert block.service_tier is None

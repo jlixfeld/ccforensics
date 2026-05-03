@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 import sqlite3
@@ -62,7 +63,7 @@ def _is_pure_hook_injection(text: str) -> bool:
     return _HOOK_INJECTION_MARKER in text and len(text) > 500
 
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 MIGRATIONS: list[list[str]] = [
     [
@@ -211,6 +212,25 @@ MIGRATIONS: list[list[str]] = [
         "DROP TABLE _subagent_spawns_v1",
         "CREATE INDEX idx_spawns_session ON subagent_spawns(parent_session_id)",
         "CREATE INDEX idx_spawns_type ON subagent_spawns(subagent_type)",
+    ],
+    # v2 → v3: add messages.service_tier column and new message_tool_uses
+    # table (one row per tool_use block on an assistant message — the writer
+    # currently stores only the first). Trailing UPDATE forces cold backfill
+    # on next reconcile so existing data populates.
+    [
+        "ALTER TABLE messages ADD COLUMN service_tier TEXT",
+        """CREATE TABLE message_tool_uses (
+            message_dedup_key  TEXT NOT NULL REFERENCES messages(dedup_key) ON DELETE CASCADE,
+            ordinal            INTEGER NOT NULL,
+            tool_use_id        TEXT NOT NULL,
+            tool_name          TEXT NOT NULL,
+            mcp_server         TEXT,
+            args_size_bytes    INTEGER NOT NULL,
+            PRIMARY KEY (message_dedup_key, ordinal)
+        )""",
+        "CREATE INDEX idx_mtu_tool_name ON message_tool_uses(tool_name)",
+        "CREATE INDEX idx_mtu_mcp_server ON message_tool_uses(mcp_server) WHERE mcp_server IS NOT NULL",
+        "UPDATE files SET mtime_ns = 0",
     ],
 ]
 
@@ -467,20 +487,23 @@ def _insert_message(
     usage = msg.usage if msg else None
     tool_use_id = None
     tool_name = None
+    tool_uses_for_aux: list[tuple[int, str, str, object]] = []
     if msg and msg.content:
-        for block in msg.content:
-            if block.type == "tool_use":
-                tool_use_id = block.id
-                tool_name = block.name
-                break
+        for ordinal, block in enumerate(msg.content):
+            if block.type == "tool_use" and block.id is not None and block.name is not None:
+                if tool_use_id is None:
+                    tool_use_id = block.id
+                    tool_name = block.name
+                tool_uses_for_aux.append((ordinal, block.id, block.name, block.input))
     conn.execute(
         """INSERT OR REPLACE INTO messages (
             dedup_key, file_path, session_id, uuid, parent_uuid,
             source_tool_use_id, source_tool_assistant_uuid,
             tool_use_id, tool_name, agent_id, role, type, model, ts,
             is_sidechain, is_meta,
-            input_tokens, output_tokens, cache_creation, cache_read, cost_usd
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            input_tokens, output_tokens, cache_creation, cache_read, cost_usd,
+            service_tier
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             key,
             file_path,
@@ -503,8 +526,25 @@ def _insert_message(
             usage.cache_creation_input_tokens if usage else None,
             usage.cache_read_input_tokens if usage else None,
             cost_usd,
+            usage.service_tier if usage else None,
         ),
     )
+    for ordinal, tu_id, tu_name, tu_input in tool_uses_for_aux:
+        mcp_server = (
+            tu_name.split("__", 2)[1]
+            if tu_name.startswith("mcp__") and tu_name.count("__") >= 2
+            else None
+        )
+        try:
+            args_size = len(json.dumps(tu_input))
+        except (TypeError, ValueError):
+            args_size = 0
+        conn.execute(
+            """INSERT OR REPLACE INTO message_tool_uses
+               (message_dedup_key, ordinal, tool_use_id, tool_name, mcp_server, args_size_bytes)
+               VALUES (?,?,?,?,?,?)""",
+            (key, ordinal, tu_id, tu_name, mcp_server, args_size),
+        )
 
 
 def reconcile_file(conn: sqlite3.Connection, path: Path, pricing_data: dict[str, Any]) -> None:

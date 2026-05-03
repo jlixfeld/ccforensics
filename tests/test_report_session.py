@@ -580,6 +580,370 @@ def test_render_session_report_suppresses_summary_panel_when_source_is_none(
     assert "Summary" not in out
 
 
+def _assistant_with_usage(
+    uuid: str,
+    sid: str,
+    ts: str,
+    *,
+    msg_id: str,
+    req_id: str,
+    model: str = "claude-sonnet-4-5-20250929",
+    input_tokens: int = 10,
+    output_tokens: int = 5,
+    cache_creation: int = 0,
+    cache_read: int = 0,
+    service_tier: str | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Assistant entry with explicit usage / service_tier knobs.
+
+    Adding via a separate helper rather than expanding ``_assistant`` keeps
+    the broad existing test surface untouched. Knobs map directly onto the
+    ``message.usage`` block written to the JSONL.
+    """
+    usage: dict[str, Any] = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_creation,
+    }
+    if service_tier is not None:
+        usage["service_tier"] = service_tier
+    return {
+        "type": "assistant",
+        "uuid": uuid,
+        "sessionId": sid,
+        "timestamp": ts,
+        "isSidechain": False,
+        "isMeta": False,
+        "requestId": req_id,
+        "message": {
+            "id": msg_id,
+            "role": "assistant",
+            "model": model,
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": usage,
+        },
+        **extra,
+    }
+
+
+def test_session_report_includes_cache_summary(tmp_path: Path, pricing_data: dict) -> None:
+    """A session with cache_read + cache_creation activity surfaces token
+    totals AND cost-derived efficiency / savings on the report.
+
+    Asserts exact computed values (not just ``> 0``) so the math is
+    locked in: efficiency is cost-weighted per spec
+    (``num = cache_read * read_price``,
+    ``den = num + cache_create * create_price + input * input_price``);
+    savings is ``cache_read * (input_price - read_price)``. Pricing is
+    read live from the fixture so the assertion tracks LiteLLM updates.
+    """
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    sid = "sess-cache"
+    input_tokens = 1000
+    cache_creation = 2000
+    cache_read = 8000
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            _user("u1", sid, "2026-04-22T10:00:00Z", "hi", cwd="/home/test"),
+            _assistant_with_usage(
+                "u2",
+                sid,
+                "2026-04-22T10:00:05Z",
+                msg_id="m1",
+                req_id="r1",
+                input_tokens=input_tokens,
+                output_tokens=50,
+                cache_creation=cache_creation,
+                cache_read=cache_read,
+                service_tier="standard",
+            ),
+        ],
+    )
+    db = tmp_path / "i.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    report = build_session_report(conn, sid, pricing_data=pricing_data)
+
+    # Compute expected values directly from the fixture pricing so the test
+    # tracks LiteLLM updates rather than baking in stale magic numbers.
+    sonnet = pricing_data["claude-sonnet-4-5-20250929"]
+    input_price = sonnet["input_cost_per_token"]
+    create_price = sonnet["cache_creation_input_token_cost"]
+    read_price = sonnet["cache_read_input_token_cost"]
+    expected_savings = cache_read * (input_price - read_price)
+    num = cache_read * read_price
+    den = num + cache_creation * create_price + input_tokens * input_price
+    expected_eff_pct = num / den * 100.0
+
+    assert report.cache_read_tokens == cache_read
+    assert report.cache_creation_tokens == cache_creation
+    assert report.cache_eff_pct == pytest.approx(expected_eff_pct)
+    assert report.cache_savings_usd == pytest.approx(expected_savings)
+    assert report.cache_excluded_unknown_models == 0
+
+
+def test_session_report_no_cache_activity(tmp_path: Path, pricing_data: dict) -> None:
+    """Zero cache_read AND zero cache_creation → cache fields all zero, no
+    division-by-zero in efficiency calc."""
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    sid = "sess-nocache"
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            _user("u1", sid, "2026-04-22T10:00:00Z", "hi", cwd="/home/test"),
+            _assistant_with_usage(
+                "u2",
+                sid,
+                "2026-04-22T10:00:05Z",
+                msg_id="m1",
+                req_id="r1",
+                input_tokens=1000,
+                output_tokens=50,
+                cache_creation=0,
+                cache_read=0,
+            ),
+        ],
+    )
+    db = tmp_path / "i.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    report = build_session_report(conn, sid, pricing_data=pricing_data)
+
+    assert report.cache_read_tokens == 0
+    assert report.cache_creation_tokens == 0
+    assert report.cache_eff_pct == 0.0
+    assert report.cache_savings_usd == 0.0
+    assert report.cache_excluded_unknown_models == 0
+
+
+def test_session_report_service_tier_breakdown_present(tmp_path: Path, pricing_data: dict) -> None:
+    """Mixed standard + priority should both appear; user role excluded —
+    only assistant messages carry a service_tier and inflating with user
+    rows would mislead."""
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    sid = "sess-tiers"
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            _user("u1", sid, "2026-04-22T10:00:00Z", "hi", cwd="/home/test"),
+            _assistant_with_usage(
+                "u2",
+                sid,
+                "2026-04-22T10:00:05Z",
+                msg_id="m1",
+                req_id="r1",
+                service_tier="standard",
+            ),
+            _assistant_with_usage(
+                "u3",
+                sid,
+                "2026-04-22T10:00:10Z",
+                msg_id="m2",
+                req_id="r2",
+                service_tier="priority",
+            ),
+        ],
+    )
+    db = tmp_path / "i.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    report = build_session_report(conn, sid, pricing_data=pricing_data)
+
+    assert report.service_tier_breakdown == {"standard": 1, "priority": 1}
+
+
+def test_render_session_report_includes_cache_text(tmp_path: Path, pricing_data: dict) -> None:
+    """Rich-rendered output contains the ``Cache:`` footer line when there
+    is cache activity in the session — the visible payoff of the metric."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    sid = "sess-cache-render"
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            _user("u1", sid, "2026-04-22T10:00:00Z", "hi", cwd="/home/test"),
+            _assistant_with_usage(
+                "u2",
+                sid,
+                "2026-04-22T10:00:05Z",
+                msg_id="m1",
+                req_id="r1",
+                input_tokens=1000,
+                output_tokens=50,
+                cache_creation=2000,
+                cache_read=8000,
+            ),
+        ],
+    )
+    db = tmp_path / "i.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    report = build_session_report(conn, sid, pricing_data=pricing_data)
+
+    buf = StringIO()
+    Console(file=buf, force_terminal=False, width=200, color_system=None).print(
+        render_session_report(report)
+    )
+    out = buf.getvalue()
+    assert "Cache:" in out
+    assert "efficiency" in out
+    # Token totals render in compact K/M form — 8000 cache_read → ``8.0K``.
+    assert "8.0K read" in out
+    assert "2.0K created" in out
+    # Savings number must look like a real dollar figure, not ``$0.00``.
+    sonnet = pricing_data["claude-sonnet-4-5-20250929"]
+    expected_savings = 8000 * (
+        sonnet["input_cost_per_token"] - sonnet["cache_read_input_token_cost"]
+    )
+    assert f"saved ${expected_savings:.2f}" in out
+
+
+def test_render_session_report_omits_cache_line_when_no_activity(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """Sessions with no cache reads/creations must not render the Cache:
+    footer — a 0% efficiency line on a session that didn't use caching is
+    misleading noise."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    sid = "sess-no-cache-render"
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            _user("u1", sid, "2026-04-22T10:00:00Z", "hi", cwd="/home/test"),
+            _assistant_with_usage(
+                "u2",
+                sid,
+                "2026-04-22T10:00:05Z",
+                msg_id="m1",
+                req_id="r1",
+                cache_creation=0,
+                cache_read=0,
+            ),
+        ],
+    )
+    db = tmp_path / "i.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    report = build_session_report(conn, sid, pricing_data=pricing_data)
+
+    buf = StringIO()
+    Console(file=buf, force_terminal=False, width=200, color_system=None).print(
+        render_session_report(report)
+    )
+    out = buf.getvalue()
+    assert "Cache:" not in out
+
+
+def test_render_session_report_shows_service_tier_line_for_non_standard(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """When a session has a non-standard tier (e.g. priority), the
+    ``Service tiers:`` footer must appear so the user sees that the
+    standard pricing model doesn't fully apply."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    sid = "sess-priority"
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            _user("u1", sid, "2026-04-22T10:00:00Z", "hi", cwd="/home/test"),
+            _assistant_with_usage(
+                "u2",
+                sid,
+                "2026-04-22T10:00:05Z",
+                msg_id="m1",
+                req_id="r1",
+                service_tier="priority",
+            ),
+        ],
+    )
+    db = tmp_path / "i.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    report = build_session_report(conn, sid, pricing_data=pricing_data)
+
+    buf = StringIO()
+    Console(file=buf, force_terminal=False, width=200, color_system=None).print(
+        render_session_report(report)
+    )
+    out = buf.getvalue()
+    assert "Service tiers:" in out
+    assert "priority" in out
+
+
+def test_render_session_report_omits_service_tier_line_for_standard_only(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """Sessions with only standard/unknown tiers must not render the
+    Service tiers: footer — that's the boring case and showing it on every
+    session would be visual noise."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    sid = "sess-standard"
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            _user("u1", sid, "2026-04-22T10:00:00Z", "hi", cwd="/home/test"),
+            _assistant_with_usage(
+                "u2",
+                sid,
+                "2026-04-22T10:00:05Z",
+                msg_id="m1",
+                req_id="r1",
+                service_tier="standard",
+            ),
+        ],
+    )
+    db = tmp_path / "i.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    report = build_session_report(conn, sid, pricing_data=pricing_data)
+
+    buf = StringIO()
+    Console(file=buf, force_terminal=False, width=200, color_system=None).print(
+        render_session_report(report)
+    )
+    out = buf.getvalue()
+    assert "Service tiers:" not in out
+
+
 def test_skill_ledger_zero_cost_renders_dollar_zero() -> None:
     """estimated_cost_usd=0.0 must render as $0.00, not '-'.
 

@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `ccforensics tools` — per-tool / per-MCP-server spend with honest isolated/shared accounting. `--detail` drills into individual MCP tools; `--top` clamps; `--sort {isolated_cost,invocations,shared_exposure}` sorts. Isolated cost is exact; shared exposure is an upper bound and labeled as such.
+- Cache efficiency + cache savings on `session show` and `aggregate` — cost-weighted ratio plus `saved $X.XX` line, both exact arithmetic over stored values.
+- `service_tier` capture on every message (precursor to fast-mode pricing). `session show` and `aggregate` render a breakdown line only when a non-standard tier is present.
+
+### Changed
+
+- Schema migrated v2 → v3 (adds `messages.service_tier` and a new `message_tool_uses` table). First command after upgrade triggers a one-shot full re-reconcile to cold-backfill the new columns/table.
+- `aggregate --json` output is now an envelope `{rows: [...], cache_*: ..., service_tier_breakdown: {...}}` rather than a bare list of rows. Existing JSON consumers must read `payload["rows"]` instead of indexing the top-level array.
+
 ## [0.1.0] — unreleased
 
 First public release.

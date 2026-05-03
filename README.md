@@ -93,6 +93,20 @@ Per-plugin rollup with top subagent type, top skill, and first/last seen.
 ccforensics plugins [--since D] [--until D] [--json | --csv] [--no-refresh]
 ```
 
+### `tools`
+
+Per-tool / per-MCP-server spend with honest isolated/shared accounting.
+
+```
+ccforensics tools [--session SPEC] [--since D] [--until D] [--project P]
+                  [--detail] [--top N] [--sort isolated_cost|invocations|shared_exposure]
+                  [--json | --csv] [--no-refresh]
+```
+
+Default render is server-rolled — every `mcp__<server>__*` tool collapses to a single row per server. Pass `--detail` to expand to per-tool rows.
+
+`Isolated $` is exact (turns where this tool was the only one emitted). `Shared $≤` is an upper bound (turns where this tool ran alongside others; the same turn's cost appears under each sibling — never sum across rows).
+
 ### `index rebuild` / `index stats`
 
 ```
@@ -134,11 +148,22 @@ For each subagent JSONL at `<session>/subagents/agent-<hex>.jsonl`:
 
 Pricing is pulled from LiteLLM's model pricing data once per 24h, cached on disk, with a hardcoded fallback for current Claude models if the network is unavailable.
 
+### Cache efficiency
+
+`session show` and `aggregate` surface a cache footer line in scope:
+
+```
+Cache: 12.4M read · 1.2M created · 87.3% efficiency · saved $3.42
+```
+
+Both numbers are exact arithmetic over stored token counts and per-model pricing. `efficiency` is **cost-weighted** — `cache_read` tokens cost ~10× less than `input` tokens, so a token-ratio efficiency overstates dollar savings. `saved` is `cache_read × (input_price − read_price)` summed per model.
+
 ## Known limitations
 
 - **Skill context-carry cost estimates are not yet computed.** Skill activations are detected and content size is measured, but the estimated cost band in the ledger is `NULL`.
 - **Plugin-path matching requires `/plugins/cache/` in the path.** Non-standard install locations may not classify correctly.
 - **~0.5% of subagent spawns are unresolvable** when the parent session rotated or had no `Agent`/`Task` call before the subagent's first message. Their cost lands in `unattributed`.
+- **Fast-mode pricing not yet applied.** `service_tier` (`standard | priority | batch`) is captured from every assistant message and surfaced as a breakdown line on `session show` / `aggregate` when a non-standard tier is present. Per-tier pricing is deferred until a real fast-mode session is verifiable end-to-end.
 
 ## License
 

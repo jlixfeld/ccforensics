@@ -22,7 +22,11 @@ from .index import (
 from .paths import ccforensics_cache_dir, claude_projects_dir
 from .pricing import PricingCache
 from .report._dates import parse_since, parse_until
-from .report.aggregate import query_aggregate, render_aggregate
+from .report.aggregate import (
+    query_aggregate_report,
+    render_aggregate,
+    render_aggregate_footer,
+)
 from .report.plugins import query_plugins, render_plugins
 from .report.resolver import AmbiguousPrefix, SessionNotFound, resolve_session_id
 from .report.session import (
@@ -41,6 +45,16 @@ def _open_index() -> sqlite3.Connection:
     conn = open_connection(_index_db_path())
     ensure_schema(conn)
     return conn
+
+
+def _resolve_session_id_or_exit(spec: str, conn: sqlite3.Connection) -> str:
+    """Resolve ``spec`` to a session_id, converting both lookup errors
+    (ambiguous prefix, not found) into a click ``UsageError`` so the CLI
+    surfaces a clean message instead of a Python traceback."""
+    try:
+        return resolve_session_id(spec, conn)
+    except (AmbiguousPrefix, SessionNotFound) as e:
+        raise click.UsageError(str(e)) from e
 
 
 def _load_pricing() -> dict[str, dict[str, Any]]:
@@ -222,20 +236,24 @@ def session_show(
 
     conn = _open_index()
 
+    # Pricing is needed for both reconcile (when refreshing) and the cache
+    # cost-savings/efficiency figures in the report — load it once and pass
+    # to both. Even with --no-refresh the report still needs pricing.
+    pricing = _load_pricing()
+
     if not no_refresh:
-        pricing = _load_pricing()
         reconcile_projects_dir(conn, claude_projects_dir(), pricing)
         conn.commit()
 
-    try:
-        session_id = resolve_session_id(spec, conn)
-    except AmbiguousPrefix as e:
-        raise click.UsageError(str(e)) from e
-    except SessionNotFound as e:
-        raise click.UsageError(str(e)) from e
+    session_id = _resolve_session_id_or_exit(spec, conn)
 
     try:
-        report = build_session_report(conn, session_id, include_unattributed=include_unattributed)
+        report = build_session_report(
+            conn,
+            session_id,
+            include_unattributed=include_unattributed,
+            pricing_data=pricing,
+        )
     except SessionReportNotFound as e:
         raise click.UsageError(str(e)) from e
 
@@ -316,8 +334,12 @@ def aggregate(
 
     conn = _open_index()
 
+    # ``_load_pricing()`` is hoisted out of the ``not no_refresh`` branch so
+    # the cache cost-savings + efficiency math has pricing data to work with
+    # even when reconciliation is skipped. Skipping the refresh shouldn't
+    # silently zero out the Cache: footer.
+    pricing = _load_pricing()
     if not no_refresh:
-        pricing = _load_pricing()
         reconcile_projects_dir(conn, claude_projects_dir(), pricing)
         conn.commit()
 
@@ -325,21 +347,39 @@ def aggregate(
     until_dt = parse_until(until) if until else None
 
     try:
-        rows = query_aggregate(
+        report = query_aggregate_report(
             conn,
             since=since_dt,
             until=until_dt,
             project=project,
             model=model,
             group_by=group_by,  # type: ignore[arg-type]
+            pricing_data=pricing,
         )
     except ValueError as e:
         raise click.UsageError(str(e)) from e
 
     if as_json:
-        write_json([dataclasses.asdict(r) for r in rows], sys.stdout)
+        # Envelope dict per spec — top-level keys ``cache_eff_pct``,
+        # ``cache_savings_usd``, ``cache_read_tokens``,
+        # ``cache_creation_tokens``, ``service_tier_breakdown`` sit
+        # alongside ``rows``. Breaking change for JSON consumers vs. the
+        # earlier flat list, but spec mandates this shape.
+        payload = {
+            "rows": [dataclasses.asdict(r) for r in report.rows],
+            "cache_read_tokens": report.cache_read_tokens,
+            "cache_creation_tokens": report.cache_creation_tokens,
+            "cache_eff_pct": report.cache_eff_pct,
+            "cache_savings_usd": report.cache_savings_usd,
+            "cache_excluded_unknown_models": report.cache_excluded_unknown_models,
+            "service_tier_breakdown": report.service_tier_breakdown,
+        }
+        write_json(payload, sys.stdout)
         return
     if as_csv:
+        # CSV stays row-shaped — cache + tier metrics are scalar / dict and
+        # don't fit the row schema. JSON is the right format for callers
+        # that want the footer values programmatically.
         headers = [
             "group_key",
             "total_cost_usd",
@@ -349,10 +389,15 @@ def aggregate(
             "cache_create",
             "cache_read",
         ]
-        write_csv((dataclasses.asdict(r) for r in rows), headers, sys.stdout)
+        write_csv((dataclasses.asdict(r) for r in report.rows), headers, sys.stdout)
         return
 
-    Console().print(render_aggregate(rows, group_by))
+    console = Console()
+    console.print(render_aggregate(report.rows, group_by))
+    footer = render_aggregate_footer(report)
+    if footer is not None:
+        console.print("")
+        console.print(footer)
 
 
 @main.command()
@@ -418,6 +463,115 @@ def plugins(
         return
 
     Console().print(render_plugins(rows))
+
+
+@main.command()
+@click.option(
+    "--session",
+    "session_spec",
+    default=None,
+    help="Scope to one session (id, prefix, or path).",
+)
+@click.option("--since", help="Date filter: YYYY-MM-DD | Nd | today | yesterday")
+@click.option("--until", help="Date filter: YYYY-MM-DD | Nd | today | yesterday")
+@click.option(
+    "--project",
+    help="Filter by project path substring (case-insensitive).",
+)
+@click.option(
+    "--detail",
+    is_flag=True,
+    help="Expand mcp_server rows into per-tool rows.",
+)
+@click.option(
+    "--top",
+    type=int,
+    default=50,
+    show_default=True,
+    help="Keep top N rows.",
+)
+@click.option(
+    "--sort",
+    type=click.Choice(["isolated_cost", "invocations", "shared_exposure"]),
+    default="isolated_cost",
+    show_default=True,
+    help="Sort key for the result rows.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON to stdout.")
+@click.option("--csv", "as_csv", is_flag=True, help="Emit CSV to stdout.")
+@click.option(
+    "--no-refresh",
+    is_flag=True,
+    help="Skip reconciliation and pricing fetch.",
+)
+def tools(
+    session_spec: str | None,
+    since: str | None,
+    until: str | None,
+    project: str | None,
+    detail: bool,
+    top: int,
+    sort: str,
+    as_json: bool,
+    as_csv: bool,
+    no_refresh: bool,
+) -> None:
+    """Per-tool / per-MCP spend (isolated cost exact, shared exposure upper bound)."""
+    if as_json and as_csv:
+        raise click.UsageError("--json and --csv are mutually exclusive")
+
+    # Local imports: ``render_csv`` and ``render_json`` already exist at
+    # module scope from ``.export``; re-importing them here scopes the
+    # tools-report renderers to this function so they don't shadow the
+    # module-level names.
+    from .report.tools import query_tool_costs, render_csv, render_json, render_text
+
+    conn = _open_index()
+    # Pricing is only needed for reconciliation (cost annotation); the
+    # tools report itself reads pre-annotated costs from the index, so
+    # skip the network fetch when --no-refresh is set.
+    if not no_refresh:
+        pricing = _load_pricing()
+        reconcile_projects_dir(conn, claude_projects_dir(), pricing)
+        conn.commit()
+
+    # Resolve scope to a list of session_ids.
+    if session_spec:
+        session_ids = [_resolve_session_id_or_exit(session_spec, conn)]
+    else:
+        since_dt = parse_since(since) if since else None
+        until_dt = parse_until(until) if until else None
+        where: list[str] = []
+        params: list[object] = []
+        if since_dt:
+            where.append("last_active_at >= ?")
+            params.append(int(since_dt.timestamp()))
+        if until_dt:
+            where.append("last_active_at <= ?")
+            params.append(int(until_dt.timestamp()))
+        if project:
+            where.append("LOWER(IFNULL(project_path,'')) LIKE ?")
+            params.append(f"%{project.lower()}%")
+        sql = "SELECT session_id FROM session_summaries"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        session_ids = [str(r[0]) for r in conn.execute(sql, params).fetchall()]
+
+    rows = query_tool_costs(
+        conn,
+        session_ids=session_ids,
+        detail=detail,
+        top=top,
+        sort=sort,  # type: ignore[arg-type]
+    )
+
+    if as_json:
+        write_json(render_json(rows), sys.stdout)
+        return
+    if as_csv:
+        click.echo(render_csv(rows), nl=False)
+        return
+    click.echo(render_text(rows), nl=False)
 
 
 @main.group()
