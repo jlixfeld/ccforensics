@@ -527,8 +527,11 @@ def tools(
     from .report.tools import query_tool_costs, render_csv, render_json, render_text
 
     conn = _open_index()
-    pricing = _load_pricing()
+    # Pricing is only needed for reconciliation (cost annotation); the
+    # tools report itself reads pre-annotated costs from the index, so
+    # skip the network fetch when --no-refresh is set.
     if not no_refresh:
+        pricing = _load_pricing()
         reconcile_projects_dir(conn, claude_projects_dir(), pricing)
         conn.commit()
 
@@ -563,9 +566,7 @@ def tools(
     )
 
     if as_json:
-        import json as _json
-
-        click.echo(_json.dumps(render_json(rows), indent=2))
+        write_json(render_json(rows), sys.stdout)
         return
     if as_csv:
         click.echo(render_csv(rows), nl=False)
