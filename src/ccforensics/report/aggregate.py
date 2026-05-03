@@ -381,11 +381,17 @@ def _aggregate_service_tier_breakdown(
 ) -> dict[str, int]:
     """Assistant-only service_tier counts. ``role='assistant'`` because
     user / tool_result messages don't carry a tier and inflating the
-    count with them would mislead. NULL → 'unknown'."""
+    count with them would mislead. NULL → 'unknown'.
+
+    Excludes ``model IS NULL`` (infrastructure rows) and Claude Code's
+    ``<...>`` placeholders for symmetry with ``_aggregate_cache_metrics``;
+    those rows carry no real tier and would inflate the ``unknown`` count.
+    """
     where, params = _base_filters(since, until, project)
     where.append("m.role='assistant'")
+    where.append("m.model IS NOT NULL")
+    where.append("m.model NOT LIKE '<%>'")
     if model:
-        where.append("m.model IS NOT NULL")
         where.append("LOWER(m.model) LIKE ?")
         params.append(f"%{model.lower().replace('.', '-')}%")
     sql = f"""

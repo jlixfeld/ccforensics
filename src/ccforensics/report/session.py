@@ -372,13 +372,18 @@ def _load_service_tier_breakdown(conn: sqlite3.Connection, session_id: str) -> d
     """Count of assistant messages per ``service_tier`` (NULL → 'unknown').
 
     Assistant role only — user/tool_result messages don't carry a tier and
-    inflating the count with them would mislead. Returns insertion-order
-    dict keyed by tier.
+    inflating the count with them would mislead. Excludes ``model IS NULL``
+    (infrastructure rows) and Claude Code's ``<...>`` placeholders for
+    symmetry with ``_load_cache_metrics``; those rows carry no real tier
+    and would inflate the ``unknown`` count. Returns insertion-order dict
+    keyed by tier.
     """
     rows = conn.execute(
         """SELECT COALESCE(service_tier, 'unknown') AS tier, COUNT(*)
              FROM messages
             WHERE session_id=? AND role='assistant'
+              AND model IS NOT NULL
+              AND model NOT LIKE '<%>'
             GROUP BY tier
             ORDER BY tier""",
         (session_id,),
