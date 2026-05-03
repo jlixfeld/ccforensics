@@ -20,7 +20,12 @@ from ..registry import (
     load_user_level_agent_names,
 )
 from ._cache import CacheRow, cache_metrics
-from ._format import format_cost, format_duration
+from ._format import (
+    format_cost,
+    format_duration,
+    render_cache_line,
+    render_service_tier_line,
+)
 
 
 @dataclass
@@ -599,55 +604,6 @@ def _render_skill_ledger(ledger: list[SkillLedgerEntry]) -> Table:
     return t
 
 
-def _human_count(n: int) -> str:
-    """Compact integer formatting for the cache footer line.
-
-    Token totals routinely run into the millions; the full grouped form
-    crowds the line. Single decimal in K/M is plenty of precision for a
-    summary.
-    """
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}K"
-    return str(n)
-
-
-def _render_cache_summary(report: SessionReport) -> RenderableType | None:
-    """Footer-style cache line; suppressed when the session had no cache
-    activity at all (clean signal that caching wasn't in play vs. a
-    misleading ``0.0% efficiency`` message)."""
-    if report.cache_read_tokens == 0 and report.cache_creation_tokens == 0:
-        return None
-    eff_str = f"{report.cache_eff_pct:.1f}%" if report.cache_eff_pct else "—"
-    line = (
-        f"Cache: {_human_count(report.cache_read_tokens)} read · "
-        f"{_human_count(report.cache_creation_tokens)} created · "
-        f"{eff_str} efficiency · saved ${report.cache_savings_usd:.2f}"
-    )
-    if report.cache_excluded_unknown_models:
-        line += (
-            f"  (excluded {report.cache_excluded_unknown_models} model(s) "
-            "with no resolvable pricing)"
-        )
-    return Text(line, style="dim")
-
-
-def _render_service_tier_line(breakdown: dict[str, int]) -> RenderableType | None:
-    """One-line service-tier breakdown, only when something non-standard
-    appears. ``standard`` and ``unknown`` are the boring case — surfacing
-    them on every report would be noise. Anything else (priority, batch)
-    is worth flagging because pricing isn't tier-aware yet."""
-    non_standard = any(t not in ("standard", "unknown") for t in breakdown)
-    if not non_standard:
-        return None
-    parts = [f"{t} {c:,} msgs" for t, c in sorted(breakdown.items())]
-    return Text(
-        f"Service tiers: {' · '.join(parts)}  (non-standard pricing not yet applied)",
-        style="dim",
-    )
-
-
 def _render_parse_notes(notes: ParseNotes) -> RenderableType:
     """Footer line, dim-styled so it sits below the data without competing
     with it visually."""
@@ -675,11 +631,17 @@ def render_session_report(report: SessionReport) -> RenderableType:
     # blend into one tall block when rendered with ``box.SIMPLE_HEAVY``.
     sections.append(Text(""))
     sections.append(_render_buckets(report.buckets))
-    cache_text = _render_cache_summary(report)
+    cache_text = render_cache_line(
+        report.cache_read_tokens,
+        report.cache_creation_tokens,
+        report.cache_eff_pct,
+        report.cache_savings_usd,
+        report.cache_excluded_unknown_models,
+    )
     if cache_text is not None:
         sections.append(Text(""))
         sections.append(cache_text)
-    tier_text = _render_service_tier_line(report.service_tier_breakdown)
+    tier_text = render_service_tier_line(report.service_tier_breakdown)
     if tier_text is not None:
         sections.append(Text(""))
         sections.append(tier_text)

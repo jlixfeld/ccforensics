@@ -10,7 +10,6 @@ from typing import Any, Literal
 from rich import box
 from rich.console import Group, RenderableType
 from rich.table import Table
-from rich.text import Text
 
 from ..pricing import resolve_pricing
 from ..registry import (
@@ -19,7 +18,7 @@ from ..registry import (
     load_user_level_agent_names,
 )
 from ._cache import CacheRow, cache_metrics
-from ._format import format_cost
+from ._format import format_cost, render_cache_line, render_service_tier_line
 
 GroupBy = Literal["none", "project", "day", "week", "month", "plugin", "model"]
 
@@ -496,16 +495,6 @@ def render_aggregate(rows: list[AggregateRow], group_by: str) -> Table:
     return t
 
 
-def _human_count(n: int) -> str:
-    """Compact integer formatting for the cache footer line. Mirrors
-    ``session.py`` so the two reports use the same K/M presentation."""
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}K"
-    return str(n)
-
-
 def render_aggregate_footer(report: AggregateReport) -> RenderableType | None:
     """Cache + service-tier footer lines below the aggregate table.
 
@@ -516,28 +505,18 @@ def render_aggregate_footer(report: AggregateReport) -> RenderableType | None:
     sessions; same rule as ``session show``.
     """
     pieces: list[RenderableType] = []
-    if report.cache_read_tokens or report.cache_creation_tokens:
-        eff_str = f"{report.cache_eff_pct:.1f}%" if report.cache_eff_pct else "—"
-        line = (
-            f"Cache: {_human_count(report.cache_read_tokens)} read · "
-            f"{_human_count(report.cache_creation_tokens)} created · "
-            f"{eff_str} efficiency · saved ${report.cache_savings_usd:.2f}"
-        )
-        if report.cache_excluded_unknown_models:
-            line += (
-                f"  (excluded {report.cache_excluded_unknown_models} model(s) "
-                "with no resolvable pricing)"
-            )
-        pieces.append(Text(line, style="dim"))
-    non_standard = any(t not in ("standard", "unknown") for t in report.service_tier_breakdown)
-    if non_standard:
-        parts = [f"{t} {c:,} msgs" for t, c in sorted(report.service_tier_breakdown.items())]
-        pieces.append(
-            Text(
-                f"Service tiers: {' · '.join(parts)}  (non-standard pricing not yet applied)",
-                style="dim",
-            )
-        )
+    cache_line = render_cache_line(
+        report.cache_read_tokens,
+        report.cache_creation_tokens,
+        report.cache_eff_pct,
+        report.cache_savings_usd,
+        report.cache_excluded_unknown_models,
+    )
+    if cache_line is not None:
+        pieces.append(cache_line)
+    tier_line = render_service_tier_line(report.service_tier_breakdown)
+    if tier_line is not None:
+        pieces.append(tier_line)
     if not pieces:
         return None
     return Group(*pieces)
