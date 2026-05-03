@@ -740,13 +740,14 @@ def test_invariant_holds_after_v3_migration(tmp_path: Path, pricing_data: dict) 
         [
             _user("u1", sid, "2026-04-22T10:00:00Z", "go", cwd="/home/test"),
             _assistant(
-                "u2", sid, "2026-04-22T10:00:05Z",
-                msg_id="m1", req_id="r1",
+                "u2",
+                sid,
+                "2026-04-22T10:00:05Z",
+                msg_id="m1",
+                req_id="r1",
                 content=[
-                    {"type": "tool_use", "id": "tu1", "name": "Edit",
-                     "input": {"x": 1}},
-                    {"type": "tool_use", "id": "tu2", "name": "Read",
-                     "input": {"y": 2}},
+                    {"type": "tool_use", "id": "tu1", "name": "Edit", "input": {"x": 1}},
+                    {"type": "tool_use", "id": "tu2", "name": "Read", "input": {"y": 2}},
                 ],
                 input_tokens=100,
                 output_tokens=50,

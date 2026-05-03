@@ -529,18 +529,12 @@ def render_aggregate_footer(report: AggregateReport) -> RenderableType | None:
                 "with no resolvable pricing)"
             )
         pieces.append(Text(line, style="dim"))
-    non_standard = any(
-        t not in ("standard", "unknown") for t in report.service_tier_breakdown
-    )
+    non_standard = any(t not in ("standard", "unknown") for t in report.service_tier_breakdown)
     if non_standard:
-        parts = [
-            f"{t} {c:,} msgs"
-            for t, c in sorted(report.service_tier_breakdown.items())
-        ]
+        parts = [f"{t} {c:,} msgs" for t, c in sorted(report.service_tier_breakdown.items())]
         pieces.append(
             Text(
-                f"Service tiers: {' · '.join(parts)}  "
-                "(non-standard pricing not yet applied)",
+                f"Service tiers: {' · '.join(parts)}  (non-standard pricing not yet applied)",
                 style="dim",
             )
         )

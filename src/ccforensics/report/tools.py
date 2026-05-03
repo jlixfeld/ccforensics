@@ -54,9 +54,7 @@ def query_tool_costs(
     if sort not in _SORT_TO_SQL:
         raise ValueError(f"invalid sort key: {sort!r}")
 
-    group_key_expr = (
-        "mtu.tool_name" if detail else "COALESCE(mtu.mcp_server, mtu.tool_name)"
-    )
+    group_key_expr = "mtu.tool_name" if detail else "COALESCE(mtu.mcp_server, mtu.tool_name)"
     group_kind_expr = (
         "CASE WHEN mtu.mcp_server IS NOT NULL THEN 'mcp_tool' ELSE 'native' END"
         if detail

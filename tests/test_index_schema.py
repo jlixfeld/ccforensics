@@ -60,7 +60,7 @@ def test_downgrade_refuses_newer_schema(tmp_path: Path) -> None:
 
 
 def test_schema_v3_creates_message_tool_uses_and_service_tier(tmp_path: Path) -> None:
-    from ccforensics.index import ensure_schema, open_connection, CURRENT_SCHEMA_VERSION
+    from ccforensics.index import CURRENT_SCHEMA_VERSION, ensure_schema, open_connection
 
     db = tmp_path / "v3.sqlite"
     conn = open_connection(db)
@@ -73,15 +73,11 @@ def test_schema_v3_creates_message_tool_uses_and_service_tier(tmp_path: Path) ->
 
     tables = {
         row[0]
-        for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     }
     assert "message_tool_uses" in tables
 
-    mtu_cols = {
-        row[1] for row in conn.execute("PRAGMA table_info(message_tool_uses)").fetchall()
-    }
+    mtu_cols = {row[1] for row in conn.execute("PRAGMA table_info(message_tool_uses)").fetchall()}
     assert mtu_cols == {
         "message_dedup_key",
         "ordinal",
@@ -95,7 +91,7 @@ def test_schema_v3_creates_message_tool_uses_and_service_tier(tmp_path: Path) ->
 def test_schema_v3_cold_backfill_resets_file_mtime(tmp_path: Path) -> None:
     """v2 → v3 migration MUST reset files.mtime_ns to force re-reconcile so
     message_tool_uses and service_tier populate from existing files."""
-    from ccforensics.index import open_connection, ensure_schema
+    from ccforensics.index import ensure_schema, open_connection
 
     # Build a v2 db manually then migrate.
     db = tmp_path / "v2.sqlite"

@@ -663,15 +663,13 @@ def _write_tools_session(
     for i, (req_id, tools) in enumerate(tool_specs, start=1):
         content: list[dict[str, Any]] = [{"type": "text", "text": "ok"}]
         for tu_id, tu_name in tools:
-            content.append(
-                {"type": "tool_use", "id": tu_id, "name": tu_name, "input": {"x": 1}}
-            )
+            content.append({"type": "tool_use", "id": tu_id, "name": tu_name, "input": {"x": 1}})
         entries.append(
             {
                 "type": "assistant",
                 "uuid": f"{session_id}-a{i}",
                 "sessionId": session_id,
-                "timestamp": "2026-04-22T10:00:0{}Z".format(i),
+                "timestamp": f"2026-04-22T10:00:0{i}Z",
                 "isSidechain": False,
                 "isMeta": False,
                 "requestId": req_id,
@@ -725,9 +723,7 @@ def test_tools_command_json_csv_mutually_exclusive() -> None:
     assert "mutually exclusive" in result.output.lower()
 
 
-def test_tools_command_detail_expands_mcp(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_tools_command_detail_expands_mcp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """--detail expands mcp_server rows into per-tool rows."""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
@@ -756,9 +752,7 @@ def test_tools_command_detail_expands_mcp(
     assert "(server)" not in with_detail.output
 
 
-def test_tools_command_json_output(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_tools_command_json_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """--json emits envelope with rows + _meta.footer."""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))

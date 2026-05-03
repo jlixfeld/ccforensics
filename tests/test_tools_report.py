@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from ccforensics.index import ensure_schema, open_connection, reconcile_projects_dir
-from ccforensics.report.tools import ToolRow, query_tool_costs
+from ccforensics.report.tools import query_tool_costs
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -54,9 +54,7 @@ def _assistant(
 ) -> dict[str, Any]:
     content: list[dict[str, Any]] = [{"type": "text", "text": "ok"}]
     for tu_id, tu_name in tools:
-        content.append(
-            {"type": "tool_use", "id": tu_id, "name": tu_name, "input": {"x": 1}}
-        )
+        content.append({"type": "tool_use", "id": tu_id, "name": tu_name, "input": {"x": 1}})
     return {
         "type": "assistant",
         "uuid": uuid,
@@ -91,23 +89,35 @@ def _build_corpus(tmp_path: Path, pricing_data: dict) -> tuple[Any, list[str]]:
         [
             _user("u1", sid, "2026-04-22T10:00:00Z", cwd="/home/test"),
             _assistant(  # single Edit
-                "u2", sid, "2026-04-22T10:00:01Z",
-                msg_id="m1", req_id="r1",
+                "u2",
+                sid,
+                "2026-04-22T10:00:01Z",
+                msg_id="m1",
+                req_id="r1",
                 tools=[("tu1", "Edit")],
             ),
             _assistant(  # single Read
-                "u3", sid, "2026-04-22T10:00:02Z",
-                msg_id="m2", req_id="r2",
+                "u3",
+                sid,
+                "2026-04-22T10:00:02Z",
+                msg_id="m2",
+                req_id="r2",
                 tools=[("tu2", "Read")],
             ),
             _assistant(  # single MCP
-                "u4", sid, "2026-04-22T10:00:03Z",
-                msg_id="m3", req_id="r3",
+                "u4",
+                sid,
+                "2026-04-22T10:00:03Z",
+                msg_id="m3",
+                req_id="r3",
                 tools=[("tu3", "mcp__stratplaybook__query")],
             ),
             _assistant(  # multi-tool: Edit + MCP
-                "u5", sid, "2026-04-22T10:00:04Z",
-                msg_id="m4", req_id="r4",
+                "u5",
+                sid,
+                "2026-04-22T10:00:04Z",
+                msg_id="m4",
+                req_id="r4",
                 tools=[
                     ("tu4", "Edit"),
                     ("tu5", "mcp__stratplaybook__build"),
@@ -122,11 +132,11 @@ def _build_corpus(tmp_path: Path, pricing_data: dict) -> tuple[Any, list[str]]:
     return conn, [sid]
 
 
-def test_query_tool_costs_isolated_and_shared(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_query_tool_costs_isolated_and_shared(tmp_path: Path, pricing_data: dict) -> None:
     conn, session_ids = _build_corpus(tmp_path, pricing_data)
-    rows = query_tool_costs(conn, session_ids=session_ids, detail=False, top=50, sort="isolated_cost")
+    rows = query_tool_costs(
+        conn, session_ids=session_ids, detail=False, top=50, sort="isolated_cost"
+    )
     by_key = {r.group_key: r for r in rows}
 
     # Edit: 1 isolated turn (m1), 1 shared turn (m4)
@@ -151,7 +161,9 @@ def test_isolated_cost_sum_equals_single_tool_turn_cost_sum(
     """Spec invariant: sum(isolated_cost across all tools) == sum of cost
     of single-tool turns in messages. Exact equality."""
     conn, session_ids = _build_corpus(tmp_path, pricing_data)
-    rows = query_tool_costs(conn, session_ids=session_ids, detail=False, top=50, sort="isolated_cost")
+    rows = query_tool_costs(
+        conn, session_ids=session_ids, detail=False, top=50, sort="isolated_cost"
+    )
 
     isolated_total = sum(r.isolated_cost_usd for r in rows)
 
@@ -173,13 +185,13 @@ def test_isolated_cost_sum_equals_single_tool_turn_cost_sum(
 
 def test_query_tool_costs_top_clamps(tmp_path: Path, pricing_data: dict) -> None:
     conn, session_ids = _build_corpus(tmp_path, pricing_data)
-    rows = query_tool_costs(conn, session_ids=session_ids, detail=False, top=2, sort="isolated_cost")
+    rows = query_tool_costs(
+        conn, session_ids=session_ids, detail=False, top=2, sort="isolated_cost"
+    )
     assert len(rows) <= 2
 
 
-def test_query_tool_costs_sort_by_invocations(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_query_tool_costs_sort_by_invocations(tmp_path: Path, pricing_data: dict) -> None:
     conn, session_ids = _build_corpus(tmp_path, pricing_data)
     rows = query_tool_costs(conn, session_ids=session_ids, detail=False, top=50, sort="invocations")
     invocations = [r.invocations for r in rows]

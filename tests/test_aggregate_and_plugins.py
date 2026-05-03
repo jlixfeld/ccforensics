@@ -781,9 +781,7 @@ def _user_entry(uuid: str, sid: str, ts: str, *, cwd: str = "/home/test") -> dic
     }
 
 
-def test_aggregate_report_includes_cache_totals(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_aggregate_report_includes_cache_totals(tmp_path: Path, pricing_data: dict) -> None:
     """query_aggregate_report exposes cache_read_tokens, cache_creation_tokens,
     cache_eff_pct, cache_savings_usd at the top level, computed from the same
     rows the table aggregates over.
@@ -843,9 +841,7 @@ def test_aggregate_report_includes_cache_totals(
     assert report.rows[0].group_key == "(all)"
 
 
-def test_aggregate_report_service_tier_breakdown(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_aggregate_report_service_tier_breakdown(tmp_path: Path, pricing_data: dict) -> None:
     """Mixed standard + priority assistant rows surface in the breakdown
     dict; user-role rows are excluded (no service_tier on user messages)."""
     proj = tmp_path / "projects"
@@ -856,16 +852,28 @@ def test_aggregate_report_service_tier_breakdown(
         [
             _user_entry("u1", sid, "2026-04-22T10:00:00Z"),
             _assistant_with_cache_tier(
-                "u2", sid, "2026-04-22T10:00:05Z",
-                msg_id="m1", req_id="r1", service_tier="standard",
+                "u2",
+                sid,
+                "2026-04-22T10:00:05Z",
+                msg_id="m1",
+                req_id="r1",
+                service_tier="standard",
             ),
             _assistant_with_cache_tier(
-                "u3", sid, "2026-04-22T10:00:10Z",
-                msg_id="m2", req_id="r2", service_tier="priority",
+                "u3",
+                sid,
+                "2026-04-22T10:00:10Z",
+                msg_id="m2",
+                req_id="r2",
+                service_tier="priority",
             ),
             _assistant_with_cache_tier(
-                "u4", sid, "2026-04-22T10:00:15Z",
-                msg_id="m3", req_id="r3", service_tier="priority",
+                "u4",
+                sid,
+                "2026-04-22T10:00:15Z",
+                msg_id="m3",
+                req_id="r3",
+                service_tier="priority",
             ),
         ],
     )
@@ -879,9 +887,7 @@ def test_aggregate_report_service_tier_breakdown(
     assert report.service_tier_breakdown == {"standard": 1, "priority": 2}
 
 
-def test_aggregate_report_no_cache_activity(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_aggregate_report_no_cache_activity(tmp_path: Path, pricing_data: dict) -> None:
     """Zero cache_read AND zero cache_creation → cache fields all zero; no
     division-by-zero in the cost-weighted efficiency calc."""
     proj = tmp_path / "projects"
@@ -892,10 +898,15 @@ def test_aggregate_report_no_cache_activity(
         [
             _user_entry("u1", sid, "2026-04-22T10:00:00Z"),
             _assistant_with_cache_tier(
-                "u2", sid, "2026-04-22T10:00:05Z",
-                msg_id="m1", req_id="r1",
-                input_tokens=1000, output_tokens=50,
-                cache_creation=0, cache_read=0,
+                "u2",
+                sid,
+                "2026-04-22T10:00:05Z",
+                msg_id="m1",
+                req_id="r1",
+                input_tokens=1000,
+                output_tokens=50,
+                cache_creation=0,
+                cache_read=0,
             ),
         ],
     )
@@ -927,19 +938,29 @@ def test_aggregate_report_model_filter_scopes_cache_metrics(
         [
             _user_entry("u1", sid, "2026-04-22T10:00:00Z"),
             _assistant_with_cache_tier(
-                "u2", sid, "2026-04-22T10:00:05Z",
-                msg_id="m1", req_id="r1",
+                "u2",
+                sid,
+                "2026-04-22T10:00:05Z",
+                msg_id="m1",
+                req_id="r1",
                 model="claude-sonnet-4-5-20250929",
-                input_tokens=1000, output_tokens=50,
-                cache_creation=2000, cache_read=8000,
+                input_tokens=1000,
+                output_tokens=50,
+                cache_creation=2000,
+                cache_read=8000,
                 service_tier="priority",
             ),
             _assistant_with_cache_tier(
-                "u3", sid, "2026-04-22T10:00:10Z",
-                msg_id="m2", req_id="r2",
+                "u3",
+                sid,
+                "2026-04-22T10:00:10Z",
+                msg_id="m2",
+                req_id="r2",
                 model="claude-haiku-4-5-20251001",
-                input_tokens=500, output_tokens=20,
-                cache_creation=1000, cache_read=4000,
+                input_tokens=500,
+                output_tokens=20,
+                cache_creation=1000,
+                cache_read=4000,
                 service_tier="standard",
             ),
         ],

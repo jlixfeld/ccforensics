@@ -490,7 +490,7 @@ def _insert_message(
     tool_uses_for_aux: list[tuple[int, str, str, object]] = []
     if msg and msg.content:
         for ordinal, block in enumerate(msg.content):
-            if block.type == "tool_use":
+            if block.type == "tool_use" and block.id is not None and block.name is not None:
                 if tool_use_id is None:
                     tool_use_id = block.id
                     tool_name = block.name
@@ -536,9 +536,7 @@ def _insert_message(
             else None
         )
         try:
-            args_size = len(
-                json.dumps(tu_input, sort_keys=True, separators=(",", ":")).encode()
-            )
+            args_size = len(json.dumps(tu_input, sort_keys=True, separators=(",", ":")).encode())
         except (TypeError, ValueError):
             args_size = 0
         conn.execute(

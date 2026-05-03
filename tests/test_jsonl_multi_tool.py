@@ -91,9 +91,7 @@ def _assistant_multi_tool(
     }
 
 
-def test_multi_tool_turn_writes_all_tool_use_rows(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_multi_tool_turn_writes_all_tool_use_rows(tmp_path: Path, pricing_data: dict) -> None:
     proj = tmp_path / "projects"
     enc = proj / "-home-test"
     sid = "sess-multi"
@@ -101,9 +99,7 @@ def test_multi_tool_turn_writes_all_tool_use_rows(
         enc / f"{sid}.jsonl",
         [
             _user("u1", sid, "2026-04-22T10:00:00Z", "go", cwd="/home/test"),
-            _assistant_multi_tool(
-                "u2", sid, "2026-04-22T10:00:05Z", msg_id="m1", req_id="r1"
-            ),
+            _assistant_multi_tool("u2", sid, "2026-04-22T10:00:05Z", msg_id="m1", req_id="r1"),
         ],
     )
     db = tmp_path / "index.sqlite"
@@ -140,9 +136,7 @@ def test_multi_tool_turn_writes_all_tool_use_rows(
         assert r[4] > 0
 
 
-def test_multi_tool_messages_tool_name_unchanged(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_multi_tool_messages_tool_name_unchanged(tmp_path: Path, pricing_data: dict) -> None:
     """Regression guard: messages.tool_name must still equal the FIRST tool_use's
     name. tree.discover_spawn relies on this."""
     proj = tmp_path / "projects"
@@ -152,9 +146,7 @@ def test_multi_tool_messages_tool_name_unchanged(
         enc / f"{sid}.jsonl",
         [
             _user("u1", sid, "2026-04-22T10:00:00Z", "go", cwd="/home/test"),
-            _assistant_multi_tool(
-                "u2", sid, "2026-04-22T10:00:05Z", msg_id="m1", req_id="r1"
-            ),
+            _assistant_multi_tool("u2", sid, "2026-04-22T10:00:05Z", msg_id="m1", req_id="r1"),
         ],
     )
     db = tmp_path / "index.sqlite"
@@ -162,16 +154,12 @@ def test_multi_tool_messages_tool_name_unchanged(
     ensure_schema(conn)
     reconcile_projects_dir(conn, proj, pricing_data)
 
-    row = conn.execute(
-        "SELECT tool_name, tool_use_id FROM messages WHERE uuid='u2'"
-    ).fetchone()
+    row = conn.execute("SELECT tool_name, tool_use_id FROM messages WHERE uuid='u2'").fetchone()
     assert row[0] == "Edit"
     assert row[1] == "tu_native"
 
 
-def test_service_tier_persisted_on_message(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_service_tier_persisted_on_message(tmp_path: Path, pricing_data: dict) -> None:
     proj = tmp_path / "projects"
     enc = proj / "-home-test"
     sid = "sess-tier"
@@ -179,9 +167,7 @@ def test_service_tier_persisted_on_message(
         enc / f"{sid}.jsonl",
         [
             _user("u1", sid, "2026-04-22T10:00:00Z", "go", cwd="/home/test"),
-            _assistant_multi_tool(
-                "u2", sid, "2026-04-22T10:00:05Z", msg_id="m1", req_id="r1"
-            ),
+            _assistant_multi_tool("u2", sid, "2026-04-22T10:00:05Z", msg_id="m1", req_id="r1"),
         ],
     )
     db = tmp_path / "index.sqlite"
@@ -189,7 +175,5 @@ def test_service_tier_persisted_on_message(
     ensure_schema(conn)
     reconcile_projects_dir(conn, proj, pricing_data)
 
-    row = conn.execute(
-        "SELECT service_tier FROM messages WHERE uuid='u2'"
-    ).fetchone()
+    row = conn.execute("SELECT service_tier FROM messages WHERE uuid='u2'").fetchone()
     assert row[0] == "standard"

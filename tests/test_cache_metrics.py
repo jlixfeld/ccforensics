@@ -75,9 +75,7 @@ def test_cache_metrics_unknown_model_excluded_and_counted() -> None:
         CacheRow(model="unknown-x", input_tokens=500, cache_creation=0, cache_read=500),
     ]
     pricing = {
-        "known": FakePricing(
-            input_cost=3e-6, cache_creation_cost=3.75e-6, cache_read_cost=0.3e-6
-        )
+        "known": FakePricing(input_cost=3e-6, cache_creation_cost=3.75e-6, cache_read_cost=0.3e-6)
     }
     m = cache_metrics(rows, _resolver(pricing))
 
