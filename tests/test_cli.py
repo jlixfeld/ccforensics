@@ -5,6 +5,7 @@ import io
 import json
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 from click.testing import CliRunner
@@ -20,6 +21,7 @@ def test_help_prints_command_tree() -> None:
     assert "session" in result.output
     assert "aggregate" in result.output
     assert "plugins" in result.output
+    assert "tools" in result.output
     assert "index" in result.output
 
 
@@ -624,3 +626,156 @@ def test_session_list_no_refresh_skips_pricing_fetch(
     result = runner.invoke(main, ["session", "list", "--no-refresh"])
     assert result.exit_code == 0
     assert calls == []
+
+
+# ---------- tools command: integration ----------
+
+
+def _write_tools_session(
+    projects_dir: Path,
+    *,
+    session_id: str,
+    encoded_dir: str,
+    tool_specs: list[tuple[str, list[tuple[str, str]]]],
+    started_ts: str = "2026-04-22T10:00:00Z",
+) -> Path:
+    """Write a JSONL with one user turn + N assistant turns, each turn
+    emitting the given list of (tool_use_id, tool_name) pairs.
+
+    ``tool_specs`` is a list of (request_id, tools) tuples — one assistant
+    message per entry.
+    """
+    enc = projects_dir / encoded_dir
+    enc.mkdir(parents=True, exist_ok=True)
+    path = enc / f"{session_id}.jsonl"
+    entries: list[dict[str, Any]] = [
+        {
+            "type": "user",
+            "uuid": f"{session_id}-u1",
+            "sessionId": session_id,
+            "timestamp": started_ts,
+            "isSidechain": False,
+            "isMeta": False,
+            "cwd": "/home/test/proj",
+            "message": {"role": "user", "content": "go"},
+        }
+    ]
+    for i, (req_id, tools) in enumerate(tool_specs, start=1):
+        content: list[dict[str, Any]] = [{"type": "text", "text": "ok"}]
+        for tu_id, tu_name in tools:
+            content.append(
+                {"type": "tool_use", "id": tu_id, "name": tu_name, "input": {"x": 1}}
+            )
+        entries.append(
+            {
+                "type": "assistant",
+                "uuid": f"{session_id}-a{i}",
+                "sessionId": session_id,
+                "timestamp": "2026-04-22T10:00:0{}Z".format(i),
+                "isSidechain": False,
+                "isMeta": False,
+                "requestId": req_id,
+                "message": {
+                    "id": f"{session_id}-m{i}",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-5-20250929",
+                    "content": content,
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 50,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "service_tier": "standard",
+                    },
+                },
+            }
+        )
+    with path.open("w") as f:
+        for e in entries:
+            f.write(json.dumps(e))
+            f.write("\n")
+    return path
+
+
+def test_tools_command_default_render(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default tools render: header + footer present, exit 0."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    _seed_pricing_cache(tmp_path)
+    projects = tmp_path / ".claude" / "projects"
+    _write_tools_session(
+        projects,
+        session_id="tools-cli1",
+        encoded_dir="-home-test-proj",
+        tool_specs=[("r1", [("tu1", "Edit")])],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["tools"])
+    assert result.exit_code == 0, result.output
+    assert "TOOL / MCP SERVER" in result.output
+    assert "Isolated $ is exact" in result.output
+    assert "Edit" in result.output
+
+
+def test_tools_command_json_csv_mutually_exclusive() -> None:
+    runner = CliRunner()
+    result = runner.invoke(main, ["tools", "--json", "--csv"])
+    assert result.exit_code != 0
+    assert "mutually exclusive" in result.output.lower()
+
+
+def test_tools_command_detail_expands_mcp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--detail expands mcp_server rows into per-tool rows."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    _seed_pricing_cache(tmp_path)
+    projects = tmp_path / ".claude" / "projects"
+    _write_tools_session(
+        projects,
+        session_id="tools-cli2",
+        encoded_dir="-home-test-proj",
+        tool_specs=[
+            ("r1", [("tu1", "mcp__stratplaybook__query")]),
+            ("r2", [("tu2", "mcp__stratplaybook__build")]),
+        ],
+    )
+
+    runner = CliRunner()
+    no_detail = runner.invoke(main, ["tools"])
+    assert no_detail.exit_code == 0, no_detail.output
+    assert "(server)" in no_detail.output
+    assert "stratplaybook" in no_detail.output
+
+    with_detail = runner.invoke(main, ["tools", "--detail"])
+    assert with_detail.exit_code == 0, with_detail.output
+    assert "mcp__stratplaybook__query" in with_detail.output
+    assert "mcp__stratplaybook__build" in with_detail.output
+    assert "(server)" not in with_detail.output
+
+
+def test_tools_command_json_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--json emits envelope with rows + _meta.footer."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    _seed_pricing_cache(tmp_path)
+    projects = tmp_path / ".claude" / "projects"
+    _write_tools_session(
+        projects,
+        session_id="tools-cli3",
+        encoded_dir="-home-test-proj",
+        tool_specs=[("r1", [("tu1", "Edit")])],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["tools", "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert "rows" in payload
+    assert "_meta" in payload
+    assert payload["_meta"]["footer"]
+    assert any(r["group_key"] == "Edit" for r in payload["rows"])

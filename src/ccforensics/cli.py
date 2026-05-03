@@ -460,6 +460,119 @@ def plugins(
     Console().print(render_plugins(rows))
 
 
+@main.command()
+@click.option(
+    "--session",
+    "session_spec",
+    default=None,
+    help="Scope to one session (id, prefix, or path).",
+)
+@click.option("--since", help="Date filter: YYYY-MM-DD | Nd | today | yesterday")
+@click.option("--until", help="Date filter: YYYY-MM-DD | Nd | today | yesterday")
+@click.option(
+    "--project",
+    help="Filter by project path substring (case-insensitive).",
+)
+@click.option(
+    "--detail",
+    is_flag=True,
+    help="Expand mcp_server rows into per-tool rows.",
+)
+@click.option(
+    "--top",
+    type=int,
+    default=50,
+    show_default=True,
+    help="Keep top N rows.",
+)
+@click.option(
+    "--sort",
+    type=click.Choice(["isolated_cost", "invocations", "shared_exposure"]),
+    default="isolated_cost",
+    show_default=True,
+    help="Sort key for the result rows.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON to stdout.")
+@click.option("--csv", "as_csv", is_flag=True, help="Emit CSV to stdout.")
+@click.option(
+    "--no-refresh",
+    is_flag=True,
+    help="Skip reconciliation and pricing fetch.",
+)
+def tools(
+    session_spec: str | None,
+    since: str | None,
+    until: str | None,
+    project: str | None,
+    detail: bool,
+    top: int,
+    sort: str,
+    as_json: bool,
+    as_csv: bool,
+    no_refresh: bool,
+) -> None:
+    """Per-tool / per-MCP spend (isolated cost exact, shared exposure upper bound)."""
+    if as_json and as_csv:
+        raise click.UsageError("--json and --csv are mutually exclusive")
+
+    # Local imports: ``render_csv`` and ``render_json`` already exist at
+    # module scope from ``.export``; re-importing them here scopes the
+    # tools-report renderers to this function so they don't shadow the
+    # module-level names.
+    from .report.tools import query_tool_costs, render_csv, render_json, render_text
+
+    conn = _open_index()
+    pricing = _load_pricing()
+    if not no_refresh:
+        reconcile_projects_dir(conn, claude_projects_dir(), pricing)
+        conn.commit()
+
+    # Resolve scope to a list of session_ids.
+    if session_spec:
+        try:
+            session_ids = [resolve_session_id(session_spec, conn)]
+        except AmbiguousPrefix as e:
+            raise click.UsageError(str(e)) from e
+        except SessionNotFound as e:
+            raise click.UsageError(str(e)) from e
+    else:
+        since_dt = parse_since(since) if since else None
+        until_dt = parse_until(until) if until else None
+        where: list[str] = []
+        params: list[object] = []
+        if since_dt:
+            where.append("last_active_at >= ?")
+            params.append(int(since_dt.timestamp()))
+        if until_dt:
+            where.append("last_active_at <= ?")
+            params.append(int(until_dt.timestamp()))
+        if project:
+            where.append("LOWER(IFNULL(project_path,'')) LIKE ?")
+            params.append(f"%{project.lower()}%")
+        sql = "SELECT session_id FROM session_summaries"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        session_ids = [str(r[0]) for r in conn.execute(sql, params).fetchall()]
+
+    rows = query_tool_costs(
+        conn,
+        session_ids=session_ids,
+        detail=detail,
+        top=top,
+        sort=sort,  # type: ignore[arg-type]
+    )
+
+    if as_json:
+        import json as _json
+
+        click.echo(_json.dumps(render_json(rows), indent=2))
+        return
+    if as_csv:
+        click.echo(render_csv(rows), nl=False)
+        return
+    click.echo(render_text(rows), nl=False)
+
+
 @main.group()
 def index() -> None:
     """SQLite index management."""
