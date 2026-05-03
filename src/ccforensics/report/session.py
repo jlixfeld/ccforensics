@@ -104,25 +104,6 @@ class SkillLedgerEntry:
 
 
 @dataclass
-class CacheSummary:
-    """Cache efficiency + dollar savings for a single session.
-
-    ``cache_eff_pct`` and ``cache_savings_usd`` are cost-weighted (per spec
-    `docs/specs/design.md`) — token-ratio overstates dollar impact because
-    cache_read is ~10x cheaper than input. ``excluded_unknown_models`` is
-    the count of distinct models in this session that had no resolvable
-    pricing entry; the user can use this to gauge whether the displayed
-    figures are complete.
-    """
-
-    cache_read_tokens: int
-    cache_creation_tokens: int
-    cache_eff_pct: float
-    cache_savings_usd: float
-    excluded_unknown_models: int
-
-
-@dataclass
 class SessionReport:
     header: SessionHeader
     buckets: list[BucketRow] = field(default_factory=list)
@@ -131,7 +112,18 @@ class SessionReport:
     unattributed_items: list[UnattributedItem] = field(default_factory=list)
     parse_notes: ParseNotes | None = None
     skill_ledger: list[SkillLedgerEntry] = field(default_factory=list)
-    cache: CacheSummary | None = None
+    # Cache fields are top-level per spec (``docs/specs/design.md``) — JSON
+    # output emits them alongside ``service_tier_breakdown`` rather than
+    # nested under a ``cache`` object. ``cache_eff_pct`` /
+    # ``cache_savings_usd`` are cost-weighted; token-ratio overstates dollar
+    # impact because cache_read is ~10x cheaper than input.
+    # ``cache_excluded_unknown_models`` counts distinct models with no
+    # resolvable pricing so the user can gauge completeness of the figures.
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cache_eff_pct: float = 0.0
+    cache_savings_usd: float = 0.0
+    cache_excluded_unknown_models: int = 0
     service_tier_breakdown: dict[str, int] = field(default_factory=dict)
 
 
@@ -321,18 +313,20 @@ def _load_parse_notes(conn: sqlite3.Connection, session_id: str) -> ParseNotes:
     )
 
 
-def _load_cache_summary(
+def _load_cache_metrics(
     conn: sqlite3.Connection,
     session_id: str,
     pricing_data: dict[str, Any] | None,
-) -> CacheSummary:
+) -> tuple[int, int, float, float, int]:
     """Per-model cache token sums + cost-weighted efficiency / savings.
 
-    Excludes ``model IS NULL`` (infrastructure rows) and Claude Code's
-    angle-bracket placeholders like ``<synthetic>`` for the same reasons
-    as ``_load_models``. Without ``pricing_data`` we still report token
-    totals but cost-derived metrics are zero — the only caller that
-    skips pricing is a unit test stub.
+    Returns ``(cache_read_tokens, cache_creation_tokens, eff_pct,
+    savings_usd, excluded_count)``. Excludes ``model IS NULL``
+    (infrastructure rows) and Claude Code's angle-bracket placeholders
+    like ``<synthetic>`` for the same reasons as ``_load_models``.
+    Without ``pricing_data`` we still report token totals but
+    cost-derived metrics are zero — the only caller that skips pricing
+    is a unit test stub.
     """
     rows_data = conn.execute(
         """SELECT model,
@@ -358,26 +352,18 @@ def _load_cache_summary(
     read_total = sum(r.cache_read for r in rows)
     create_total = sum(r.cache_creation for r in rows)
     if pricing_data is None:
-        return CacheSummary(
-            cache_read_tokens=read_total,
-            cache_creation_tokens=create_total,
-            cache_eff_pct=0.0,
-            cache_savings_usd=0.0,
-            excluded_unknown_models=0,
-        )
+        return (read_total, create_total, 0.0, 0.0, 0)
     metrics = cache_metrics(rows, lambda m: resolve_pricing(m, pricing_data))
-    return CacheSummary(
-        cache_read_tokens=read_total,
-        cache_creation_tokens=create_total,
-        cache_eff_pct=metrics.eff_pct,
-        cache_savings_usd=metrics.savings_usd,
-        excluded_unknown_models=metrics.rows_excluded_for_unknown_model,
+    return (
+        read_total,
+        create_total,
+        metrics.eff_pct,
+        metrics.savings_usd,
+        metrics.rows_excluded_for_unknown_model,
     )
 
 
-def _load_service_tier_breakdown(
-    conn: sqlite3.Connection, session_id: str
-) -> dict[str, int]:
+def _load_service_tier_breakdown(conn: sqlite3.Connection, session_id: str) -> dict[str, int]:
     """Count of assistant messages per ``service_tier`` (NULL → 'unknown').
 
     Assistant role only — user/tool_result messages don't carry a tier and
@@ -419,7 +405,9 @@ def build_session_report(
     items = _load_unattributed_items(conn, session_id) if include_unattributed else []
     parse_notes = _load_parse_notes(conn, session_id)
     skill_ledger = _load_skill_ledger(conn, session_id)
-    cache_summary = _load_cache_summary(conn, session_id, pricing_data)
+    cache_read, cache_create, eff_pct, savings, excluded = _load_cache_metrics(
+        conn, session_id, pricing_data
+    )
     tier_breakdown = _load_service_tier_breakdown(conn, session_id)
     return SessionReport(
         header=header,
@@ -429,7 +417,11 @@ def build_session_report(
         unattributed_items=items,
         parse_notes=parse_notes,
         skill_ledger=skill_ledger,
-        cache=cache_summary,
+        cache_read_tokens=cache_read,
+        cache_creation_tokens=cache_create,
+        cache_eff_pct=eff_pct,
+        cache_savings_usd=savings,
+        cache_excluded_unknown_models=excluded,
         service_tier_breakdown=tier_breakdown,
     )
 
@@ -621,21 +613,21 @@ def _human_count(n: int) -> str:
     return str(n)
 
 
-def _render_cache_summary(c: CacheSummary) -> RenderableType | None:
+def _render_cache_summary(report: SessionReport) -> RenderableType | None:
     """Footer-style cache line; suppressed when the session had no cache
     activity at all (clean signal that caching wasn't in play vs. a
     misleading ``0.0% efficiency`` message)."""
-    if c.cache_read_tokens == 0 and c.cache_creation_tokens == 0:
+    if report.cache_read_tokens == 0 and report.cache_creation_tokens == 0:
         return None
-    eff_str = f"{c.cache_eff_pct:.1f}%" if c.cache_eff_pct else "—"
+    eff_str = f"{report.cache_eff_pct:.1f}%" if report.cache_eff_pct else "—"
     line = (
-        f"Cache: {_human_count(c.cache_read_tokens)} read · "
-        f"{_human_count(c.cache_creation_tokens)} created · "
-        f"{eff_str} efficiency · saved ${c.cache_savings_usd:.2f}"
+        f"Cache: {_human_count(report.cache_read_tokens)} read · "
+        f"{_human_count(report.cache_creation_tokens)} created · "
+        f"{eff_str} efficiency · saved ${report.cache_savings_usd:.2f}"
     )
-    if c.excluded_unknown_models:
+    if report.cache_excluded_unknown_models:
         line += (
-            f"  (excluded {c.excluded_unknown_models} model(s) "
+            f"  (excluded {report.cache_excluded_unknown_models} model(s) "
             "with no resolvable pricing)"
         )
     return Text(line, style="dim")
@@ -683,11 +675,10 @@ def render_session_report(report: SessionReport) -> RenderableType:
     # blend into one tall block when rendered with ``box.SIMPLE_HEAVY``.
     sections.append(Text(""))
     sections.append(_render_buckets(report.buckets))
-    if report.cache is not None:
-        cache_text = _render_cache_summary(report.cache)
-        if cache_text is not None:
-            sections.append(Text(""))
-            sections.append(cache_text)
+    cache_text = _render_cache_summary(report)
+    if cache_text is not None:
+        sections.append(Text(""))
+        sections.append(cache_text)
     tier_text = _render_service_tier_line(report.service_tier_breakdown)
     if tier_text is not None:
         sections.append(Text(""))

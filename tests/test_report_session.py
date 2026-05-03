@@ -630,10 +630,21 @@ def _assistant_with_usage(
 
 def test_session_report_includes_cache_summary(tmp_path: Path, pricing_data: dict) -> None:
     """A session with cache_read + cache_creation activity surfaces token
-    totals AND cost-derived efficiency / savings on the report."""
+    totals AND cost-derived efficiency / savings on the report.
+
+    Asserts exact computed values (not just ``> 0``) so the math is
+    locked in: efficiency is cost-weighted per spec
+    (``num = cache_read * read_price``,
+    ``den = num + cache_create * create_price + input * input_price``);
+    savings is ``cache_read * (input_price - read_price)``. Pricing is
+    read live from the fixture so the assertion tracks LiteLLM updates.
+    """
     proj = tmp_path / "projects"
     enc = proj / "-home-test"
     sid = "sess-cache"
+    input_tokens = 1000
+    cache_creation = 2000
+    cache_read = 8000
     _write_jsonl(
         enc / f"{sid}.jsonl",
         [
@@ -644,10 +655,10 @@ def test_session_report_includes_cache_summary(tmp_path: Path, pricing_data: dic
                 "2026-04-22T10:00:05Z",
                 msg_id="m1",
                 req_id="r1",
-                input_tokens=1000,
+                input_tokens=input_tokens,
                 output_tokens=50,
-                cache_creation=2000,
-                cache_read=8000,
+                cache_creation=cache_creation,
+                cache_read=cache_read,
                 service_tier="standard",
             ),
         ],
@@ -659,11 +670,22 @@ def test_session_report_includes_cache_summary(tmp_path: Path, pricing_data: dic
 
     report = build_session_report(conn, sid, pricing_data=pricing_data)
 
-    assert report.cache is not None
-    assert report.cache.cache_read_tokens == 8000
-    assert report.cache.cache_creation_tokens == 2000
-    assert report.cache.cache_eff_pct > 0
-    assert report.cache.cache_savings_usd > 0
+    # Compute expected values directly from the fixture pricing so the test
+    # tracks LiteLLM updates rather than baking in stale magic numbers.
+    sonnet = pricing_data["claude-sonnet-4-5-20250929"]
+    input_price = sonnet["input_cost_per_token"]
+    create_price = sonnet["cache_creation_input_token_cost"]
+    read_price = sonnet["cache_read_input_token_cost"]
+    expected_savings = cache_read * (input_price - read_price)
+    num = cache_read * read_price
+    den = num + cache_creation * create_price + input_tokens * input_price
+    expected_eff_pct = num / den * 100.0
+
+    assert report.cache_read_tokens == cache_read
+    assert report.cache_creation_tokens == cache_creation
+    assert report.cache_eff_pct == pytest.approx(expected_eff_pct)
+    assert report.cache_savings_usd == pytest.approx(expected_savings)
+    assert report.cache_excluded_unknown_models == 0
 
 
 def test_session_report_no_cache_activity(tmp_path: Path, pricing_data: dict) -> None:
@@ -696,16 +718,14 @@ def test_session_report_no_cache_activity(tmp_path: Path, pricing_data: dict) ->
 
     report = build_session_report(conn, sid, pricing_data=pricing_data)
 
-    assert report.cache is not None
-    assert report.cache.cache_read_tokens == 0
-    assert report.cache.cache_creation_tokens == 0
-    assert report.cache.cache_eff_pct == 0.0
-    assert report.cache.cache_savings_usd == 0.0
+    assert report.cache_read_tokens == 0
+    assert report.cache_creation_tokens == 0
+    assert report.cache_eff_pct == 0.0
+    assert report.cache_savings_usd == 0.0
+    assert report.cache_excluded_unknown_models == 0
 
 
-def test_session_report_service_tier_breakdown_present(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_session_report_service_tier_breakdown_present(tmp_path: Path, pricing_data: dict) -> None:
     """Mixed standard + priority should both appear; user role excluded —
     only assistant messages carry a service_tier and inflating with user
     rows would mislead."""
@@ -744,9 +764,7 @@ def test_session_report_service_tier_breakdown_present(
     assert report.service_tier_breakdown == {"standard": 1, "priority": 1}
 
 
-def test_render_session_report_includes_cache_text(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_render_session_report_includes_cache_text(tmp_path: Path, pricing_data: dict) -> None:
     """Rich-rendered output contains the ``Cache:`` footer line when there
     is cache activity in the session — the visible payoff of the metric."""
     from io import StringIO
@@ -787,7 +805,15 @@ def test_render_session_report_includes_cache_text(
     out = buf.getvalue()
     assert "Cache:" in out
     assert "efficiency" in out
-    assert "saved $" in out
+    # Token totals render in compact K/M form — 8000 cache_read → ``8.0K``.
+    assert "8.0K read" in out
+    assert "2.0K created" in out
+    # Savings number must look like a real dollar figure, not ``$0.00``.
+    sonnet = pricing_data["claude-sonnet-4-5-20250929"]
+    expected_savings = 8000 * (
+        sonnet["input_cost_per_token"] - sonnet["cache_read_input_token_cost"]
+    )
+    assert f"saved ${expected_savings:.2f}" in out
 
 
 def test_render_session_report_omits_cache_line_when_no_activity(
