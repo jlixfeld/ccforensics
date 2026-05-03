@@ -536,7 +536,7 @@ def _insert_message(
             else None
         )
         try:
-            args_size = len(json.dumps(tu_input, sort_keys=True, separators=(",", ":")).encode())
+            args_size = len(json.dumps(tu_input))
         except (TypeError, ValueError):
             args_size = 0
         conn.execute(

@@ -130,8 +130,9 @@ def test_multi_tool_turn_writes_all_tool_use_rows(tmp_path: Path, pricing_data: 
         "strattrader-collector",
         rows[2][4],
     )
-    # args_size_bytes is precise byte length of canonical JSON; non-zero for
-    # all three, monotonically derivable but we only assert > 0 here.
+    # args_size_bytes is size telemetry from json.dumps() length; we only
+    # assert it's non-zero here since the exact value is implementation
+    # detail (encoder defaults, key ordering) and not load-bearing.
     for r in rows:
         assert r[4] > 0
 
