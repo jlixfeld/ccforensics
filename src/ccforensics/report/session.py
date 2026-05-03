@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
 
 from rich import box
 from rich.console import Group, RenderableType
@@ -12,11 +13,13 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from ..pricing import resolve_pricing
 from ..registry import (
     classify_agent_source,
     load_plugin_names,
     load_user_level_agent_names,
 )
+from ._cache import CacheRow, cache_metrics
 from ._format import format_cost, format_duration
 
 
@@ -101,6 +104,25 @@ class SkillLedgerEntry:
 
 
 @dataclass
+class CacheSummary:
+    """Cache efficiency + dollar savings for a single session.
+
+    ``cache_eff_pct`` and ``cache_savings_usd`` are cost-weighted (per spec
+    `docs/specs/design.md`) — token-ratio overstates dollar impact because
+    cache_read is ~10x cheaper than input. ``excluded_unknown_models`` is
+    the count of distinct models in this session that had no resolvable
+    pricing entry; the user can use this to gauge whether the displayed
+    figures are complete.
+    """
+
+    cache_read_tokens: int
+    cache_creation_tokens: int
+    cache_eff_pct: float
+    cache_savings_usd: float
+    excluded_unknown_models: int
+
+
+@dataclass
 class SessionReport:
     header: SessionHeader
     buckets: list[BucketRow] = field(default_factory=list)
@@ -109,6 +131,8 @@ class SessionReport:
     unattributed_items: list[UnattributedItem] = field(default_factory=list)
     parse_notes: ParseNotes | None = None
     skill_ledger: list[SkillLedgerEntry] = field(default_factory=list)
+    cache: CacheSummary | None = None
+    service_tier_breakdown: dict[str, int] = field(default_factory=dict)
 
 
 class SessionReportNotFound(Exception):  # noqa: N818 — public name matches resolver style
@@ -297,17 +321,96 @@ def _load_parse_notes(conn: sqlite3.Connection, session_id: str) -> ParseNotes:
     )
 
 
+def _load_cache_summary(
+    conn: sqlite3.Connection,
+    session_id: str,
+    pricing_data: dict[str, Any] | None,
+) -> CacheSummary:
+    """Per-model cache token sums + cost-weighted efficiency / savings.
+
+    Excludes ``model IS NULL`` (infrastructure rows) and Claude Code's
+    angle-bracket placeholders like ``<synthetic>`` for the same reasons
+    as ``_load_models``. Without ``pricing_data`` we still report token
+    totals but cost-derived metrics are zero — the only caller that
+    skips pricing is a unit test stub.
+    """
+    rows_data = conn.execute(
+        """SELECT model,
+                  COALESCE(SUM(input_tokens), 0),
+                  COALESCE(SUM(cache_creation), 0),
+                  COALESCE(SUM(cache_read), 0)
+             FROM messages
+            WHERE session_id=?
+              AND model IS NOT NULL
+              AND model NOT LIKE '<%>'
+            GROUP BY model""",
+        (session_id,),
+    ).fetchall()
+    rows = [
+        CacheRow(
+            model=str(m),
+            input_tokens=int(i or 0),
+            cache_creation=int(cc or 0),
+            cache_read=int(cr or 0),
+        )
+        for (m, i, cc, cr) in rows_data
+    ]
+    read_total = sum(r.cache_read for r in rows)
+    create_total = sum(r.cache_creation for r in rows)
+    if pricing_data is None:
+        return CacheSummary(
+            cache_read_tokens=read_total,
+            cache_creation_tokens=create_total,
+            cache_eff_pct=0.0,
+            cache_savings_usd=0.0,
+            excluded_unknown_models=0,
+        )
+    metrics = cache_metrics(rows, lambda m: resolve_pricing(m, pricing_data))
+    return CacheSummary(
+        cache_read_tokens=read_total,
+        cache_creation_tokens=create_total,
+        cache_eff_pct=metrics.eff_pct,
+        cache_savings_usd=metrics.savings_usd,
+        excluded_unknown_models=metrics.rows_excluded_for_unknown_model,
+    )
+
+
+def _load_service_tier_breakdown(
+    conn: sqlite3.Connection, session_id: str
+) -> dict[str, int]:
+    """Count of assistant messages per ``service_tier`` (NULL → 'unknown').
+
+    Assistant role only — user/tool_result messages don't carry a tier and
+    inflating the count with them would mislead. Returns insertion-order
+    dict keyed by tier.
+    """
+    rows = conn.execute(
+        """SELECT COALESCE(service_tier, 'unknown') AS tier, COUNT(*)
+             FROM messages
+            WHERE session_id=? AND role='assistant'
+            GROUP BY tier
+            ORDER BY tier""",
+        (session_id,),
+    ).fetchall()
+    return {str(tier): int(count) for tier, count in rows}
+
+
 def build_session_report(
     conn: sqlite3.Connection,
     session_id: str,
     *,
     include_unattributed: bool = False,
+    pricing_data: dict[str, Any] | None = None,
 ) -> SessionReport:
     """Load everything needed for the report from the index in one pass.
 
     ``include_unattributed`` controls whether the detailed list of
     unresolvable subagent files is populated; the summary always reports
     the unattributed cost via the bucket table.
+
+    ``pricing_data`` (LiteLLM-shaped dict) is required for the cache
+    cost-savings + efficiency figures. When ``None`` the cache summary
+    still reports token totals but cost-derived metrics are zero.
     """
     header = _load_header(conn, session_id)
     buckets = _load_buckets(conn, session_id)
@@ -316,6 +419,8 @@ def build_session_report(
     items = _load_unattributed_items(conn, session_id) if include_unattributed else []
     parse_notes = _load_parse_notes(conn, session_id)
     skill_ledger = _load_skill_ledger(conn, session_id)
+    cache_summary = _load_cache_summary(conn, session_id, pricing_data)
+    tier_breakdown = _load_service_tier_breakdown(conn, session_id)
     return SessionReport(
         header=header,
         buckets=buckets,
@@ -324,6 +429,8 @@ def build_session_report(
         unattributed_items=items,
         parse_notes=parse_notes,
         skill_ledger=skill_ledger,
+        cache=cache_summary,
+        service_tier_breakdown=tier_breakdown,
     )
 
 
@@ -500,6 +607,55 @@ def _render_skill_ledger(ledger: list[SkillLedgerEntry]) -> Table:
     return t
 
 
+def _human_count(n: int) -> str:
+    """Compact integer formatting for the cache footer line.
+
+    Token totals routinely run into the millions; the full grouped form
+    crowds the line. Single decimal in K/M is plenty of precision for a
+    summary.
+    """
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def _render_cache_summary(c: CacheSummary) -> RenderableType | None:
+    """Footer-style cache line; suppressed when the session had no cache
+    activity at all (clean signal that caching wasn't in play vs. a
+    misleading ``0.0% efficiency`` message)."""
+    if c.cache_read_tokens == 0 and c.cache_creation_tokens == 0:
+        return None
+    eff_str = f"{c.cache_eff_pct:.1f}%" if c.cache_eff_pct else "—"
+    line = (
+        f"Cache: {_human_count(c.cache_read_tokens)} read · "
+        f"{_human_count(c.cache_creation_tokens)} created · "
+        f"{eff_str} efficiency · saved ${c.cache_savings_usd:.2f}"
+    )
+    if c.excluded_unknown_models:
+        line += (
+            f"  (excluded {c.excluded_unknown_models} model(s) "
+            "with no resolvable pricing)"
+        )
+    return Text(line, style="dim")
+
+
+def _render_service_tier_line(breakdown: dict[str, int]) -> RenderableType | None:
+    """One-line service-tier breakdown, only when something non-standard
+    appears. ``standard`` and ``unknown`` are the boring case — surfacing
+    them on every report would be noise. Anything else (priority, batch)
+    is worth flagging because pricing isn't tier-aware yet."""
+    non_standard = any(t not in ("standard", "unknown") for t in breakdown)
+    if not non_standard:
+        return None
+    parts = [f"{t} {c:,} msgs" for t, c in sorted(breakdown.items())]
+    return Text(
+        f"Service tiers: {' · '.join(parts)}  (non-standard pricing not yet applied)",
+        style="dim",
+    )
+
+
 def _render_parse_notes(notes: ParseNotes) -> RenderableType:
     """Footer line, dim-styled so it sits below the data without competing
     with it visually."""
@@ -527,6 +683,15 @@ def render_session_report(report: SessionReport) -> RenderableType:
     # blend into one tall block when rendered with ``box.SIMPLE_HEAVY``.
     sections.append(Text(""))
     sections.append(_render_buckets(report.buckets))
+    if report.cache is not None:
+        cache_text = _render_cache_summary(report.cache)
+        if cache_text is not None:
+            sections.append(Text(""))
+            sections.append(cache_text)
+    tier_text = _render_service_tier_line(report.service_tier_breakdown)
+    if tier_text is not None:
+        sections.append(Text(""))
+        sections.append(tier_text)
     sections.append(Text(""))
     sections.append(_render_plugins(report.plugins))
     if report.models:

@@ -222,8 +222,12 @@ def session_show(
 
     conn = _open_index()
 
+    # Pricing is needed for both reconcile (when refreshing) and the cache
+    # cost-savings/efficiency figures in the report — load it once and pass
+    # to both. Even with --no-refresh the report still needs pricing.
+    pricing = _load_pricing()
+
     if not no_refresh:
-        pricing = _load_pricing()
         reconcile_projects_dir(conn, claude_projects_dir(), pricing)
         conn.commit()
 
@@ -235,7 +239,12 @@ def session_show(
         raise click.UsageError(str(e)) from e
 
     try:
-        report = build_session_report(conn, session_id, include_unattributed=include_unattributed)
+        report = build_session_report(
+            conn,
+            session_id,
+            include_unattributed=include_unattributed,
+            pricing_data=pricing,
+        )
     except SessionReportNotFound as e:
         raise click.UsageError(str(e)) from e
 
