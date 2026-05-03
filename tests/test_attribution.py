@@ -726,3 +726,38 @@ def test_rollup_helper_can_be_called_standalone(tmp_path: Path, pricing_data: di
         "SELECT COUNT(*) FROM session_rollups WHERE session_id=?", (sid,)
     ).fetchone()
     assert rows[0] >= 1
+
+
+def test_invariant_holds_after_v3_migration(tmp_path: Path, pricing_data: dict) -> None:
+    """The bucket-attribution invariant ``Σ session_rollups == Σ messages``
+    must survive the v3 migration (new table, new column, cold backfill).
+    Multi-tool turn included to exercise the new writer code path."""
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    sid = "sess-inv-v3"
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            _user("u1", sid, "2026-04-22T10:00:00Z", "go", cwd="/home/test"),
+            _assistant(
+                "u2", sid, "2026-04-22T10:00:05Z",
+                msg_id="m1", req_id="r1",
+                content=[
+                    {"type": "tool_use", "id": "tu1", "name": "Edit",
+                     "input": {"x": 1}},
+                    {"type": "tool_use", "id": "tu2", "name": "Read",
+                     "input": {"y": 2}},
+                ],
+                input_tokens=100,
+                output_tokens=50,
+            ),
+        ],
+    )
+
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    violators = find_invariant_violators(conn, tolerance=1e-6)
+    assert violators == [], f"invariant violated for sessions: {violators}"
