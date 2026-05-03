@@ -47,6 +47,9 @@ ccforensics plugins
 
 # Last 30 days aggregated per project
 ccforensics aggregate --since 30d --group-by project
+
+# Per-tool / per-MCP-server spend (last 30 days)
+ccforensics tools --since 30d
 ```
 
 ## Commands
@@ -113,6 +116,124 @@ Default render is server-rolled — every `mcp__<server>__*` tool collapses to a
 ccforensics index rebuild [--force] [--yes]   # incremental by default; --force re-parses everything
 ccforensics index stats                        # row counts + last-refresh
 ```
+
+## Sample workflows
+
+These walkthroughs use real questions a heavy Claude Code user might ask. Each one names a specific command sequence and explains how to read the output.
+
+### "Where did my last expensive session's $109 go?"
+
+Find the session, then drill in:
+
+```bash
+ccforensics session list --sort cost --limit 5
+ccforensics session show <id>          # full id, >=6-char prefix, or .jsonl path
+```
+
+`session show` renders five blocks:
+
+1. **Session header** — duration, turns, total cost, models seen, compaction count.
+2. **Cost by bucket** — `main` vs `subagent:<type>` vs `auto-compact` vs `unattributed`. This is the most important table. If `subagent:pr-review-toolkit:code-reviewer` is `$78` of the `$109`, the PR review tool earned its keep — or didn't.
+3. **Cost by plugin** — same numbers re-rolled up to the owning plugin (skips the `subagent:` prefix). Use this when you want the bottom line per plugin install.
+4. **Cost by model** — separates Opus from Sonnet from Haiku spend. A subagent that should be running on Sonnet but lands on Opus is visible here.
+5. **Skill activations** — every skill the session loaded, when, by which channel, content size in bytes.
+
+The `Cache:` footer line under the bucket table tells you whether prompt caching paid for itself in this session — see "Is my prompt cache working" below.
+
+`Σ buckets == total session cost` is a hard invariant. If the numbers don't add up the index is corrupt — `ccforensics index rebuild --force` rebuilds from scratch.
+
+### "Which plugin should I uninstall?"
+
+```bash
+ccforensics plugins --since 90d
+```
+
+Reads as a leaderboard: cost, sessions touched, top subagent type, top skill, first/last seen. Three patterns to look for:
+
+- **High cost, low session count** — one runaway session blew up the average. Cross-reference with `ccforensics session list --since 90d --sort cost` to find it.
+- **High cost, high session count, recent** — actively used and expensive. Worth keeping if it's earning its keep; check whether the work it does is something you'd happily pay for at $X per task.
+- **Low cost, last seen weeks ago** — uninstall candidate. The plugin is loaded but you stopped using it.
+
+`subagent:pr-review-toolkit:code-reviewer` and similar verbose subagent types roll up to their owning plugin in the `source` column. User-level `~/.claude/agents/<name>.md` files appear as `user-level`.
+
+### "Are my MCP servers paying for themselves?"
+
+```bash
+ccforensics tools --since 30d --sort isolated_cost
+```
+
+Default render is server-rolled — every `mcp__<server>__*` tool collapses to one row per server. Two columns matter:
+
+- **`Isolated $`** — exact cost of turns where this tool was the *only* one the assistant emitted. This is the cleanest signal of "what does this tool cost me when I use it." Sum freely across rows.
+- **`Shared $≤`** — upper bound for turns where this tool ran alongside other tools in the same assistant response. The same turn's cost shows up under each sibling tool. **Never sum the Shared $ column across rows** — you'll double-count. Use it as a per-tool ceiling, not a total.
+
+To see which specific MCP tools inside a server are pulling weight, drop the rollup:
+
+```bash
+ccforensics tools --since 30d --detail --sort invocations
+```
+
+Now `mcp__stratplaybook` expands to `mcp__stratplaybook__query`, `mcp__stratplaybook__build`, etc. A server with one heavy-traffic tool and ten near-zero ones is a candidate for trimming the unused tool definitions out of the MCP config — Claude Code injects every tool's schema into context on every turn, so unused tools cost real tokens.
+
+Scope to one session if you want to see what tools a specific session used:
+
+```bash
+ccforensics tools --session 1dbce6d7 --detail
+```
+
+### "Is my prompt cache working?"
+
+`session show` and `aggregate` both surface a cache footer line:
+
+```
+Cache: 12.4M read · 1.2M created · 87.3% efficiency · saved $3.42
+```
+
+Read the four numbers:
+
+- **`12.4M read`** — total tokens served from the cache. High = good, prompt prefixes are stable enough to hit.
+- **`1.2M created`** — total tokens written into the cache. Cache writes cost ~25% more than ordinary input, so high-create-low-read is a bad signal: you're paying the write premium without amortizing it.
+- **`87.3% efficiency`** — **cost-weighted** ratio of cache-read cost vs total token cost. Token-ratio efficiency would overstate the dollar savings (cache reads cost ~10× less than fresh input), so this number is honest.
+- **`saved $3.42`** — `cache_read × (input_price − read_price)` summed per model. What the cache actually saved you in dollars vs running the same prompts uncached.
+
+Aggregate cache stats across a window:
+
+```bash
+ccforensics aggregate --since 30d
+```
+
+Same footer line, scoped to the window. If the efficiency dips after a known prompt-prefix change (e.g. you swapped a system prompt or installed a new plugin that injects into every turn), the drop tells you the new prefix is invalidating the cache.
+
+### "What changed last week?"
+
+```bash
+ccforensics aggregate --since 7d --group-by day
+ccforensics aggregate --since 7d --group-by project
+ccforensics aggregate --since 7d --group-by model
+ccforensics plugins   --since 7d
+```
+
+Run all four and look for the outlier. Day groups surface the spike day; project groups isolate the project that caused it; model groups separate Opus blowups from Sonnet workhorses; plugin rollup tells you which plugin owned the cost.
+
+Combine `--model` with `--group-by project` to ask "which project burned the most Opus":
+
+```bash
+ccforensics aggregate --since 30d --model opus --group-by project
+```
+
+The `--model` filter is a case-insensitive substring match on the model column (so `opus` matches `claude-opus-4-7`). Cost is the per-model slice, not whole-session cost.
+
+### Exporting for spreadsheets / further analysis
+
+Every report supports `--json` and `--csv` (mutually exclusive). The CLI is the canonical source — JSON output is suitable for piping into `jq` or your own scripts; CSV is row-shaped for spreadsheets.
+
+```bash
+ccforensics tools --since 30d --csv > tools.csv
+ccforensics aggregate --since 30d --json | jq '.cache_savings_usd'
+ccforensics plugins --since 90d --json
+```
+
+Note: `aggregate --json` returns an envelope `{rows: [...], cache_*: ..., service_tier_breakdown: {...}}`. Read `payload["rows"]`, not the top-level array.
 
 ## Date formats
 
