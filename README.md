@@ -121,6 +121,12 @@ ccforensics index stats                        # row counts + last-refresh
 
 The easiest way to use ccforensics is to ask Claude Code questions directly. Claude will run the right commands and explain the output.
 
+### "Tell me some interesting things about my Claude Code usage"
+
+> *"Tell me some interesting things about my Claude Code usage"*
+
+A good starting point. Claude will pull the plugin rollup, model breakdown, aggregate totals, and cache stats, then surface patterns worth acting on — which plugins are expensive relative to how often you use them, which models are running where, whether your cache is working, and what your spend trajectory looks like over time.
+
 ### "Where did my last expensive session's $109 go?"
 
 > *"Break down where my most expensive recent session's cost went"*
