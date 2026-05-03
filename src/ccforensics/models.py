@@ -18,6 +18,7 @@ class UsageStats(BaseModel):
     output_tokens: int | None = None
     cache_creation_input_tokens: int | None = None
     cache_read_input_tokens: int | None = None
+    service_tier: str | None = None
 
 
 class ContentBlock(BaseModel):
