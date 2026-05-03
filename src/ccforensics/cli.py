@@ -47,6 +47,16 @@ def _open_index() -> sqlite3.Connection:
     return conn
 
 
+def _resolve_session_id_or_exit(spec: str, conn: sqlite3.Connection) -> str:
+    """Resolve ``spec`` to a session_id, converting both lookup errors
+    (ambiguous prefix, not found) into a click ``UsageError`` so the CLI
+    surfaces a clean message instead of a Python traceback."""
+    try:
+        return resolve_session_id(spec, conn)
+    except (AmbiguousPrefix, SessionNotFound) as e:
+        raise click.UsageError(str(e)) from e
+
+
 def _load_pricing() -> dict[str, dict[str, Any]]:
     cache = PricingCache(cache_file=ccforensics_cache_dir() / "litellm.json")
     data = cache.load_or_fetch()
@@ -235,12 +245,7 @@ def session_show(
         reconcile_projects_dir(conn, claude_projects_dir(), pricing)
         conn.commit()
 
-    try:
-        session_id = resolve_session_id(spec, conn)
-    except AmbiguousPrefix as e:
-        raise click.UsageError(str(e)) from e
-    except SessionNotFound as e:
-        raise click.UsageError(str(e)) from e
+    session_id = _resolve_session_id_or_exit(spec, conn)
 
     try:
         report = build_session_report(
@@ -529,12 +534,7 @@ def tools(
 
     # Resolve scope to a list of session_ids.
     if session_spec:
-        try:
-            session_ids = [resolve_session_id(session_spec, conn)]
-        except AmbiguousPrefix as e:
-            raise click.UsageError(str(e)) from e
-        except SessionNotFound as e:
-            raise click.UsageError(str(e)) from e
+        session_ids = [_resolve_session_id_or_exit(session_spec, conn)]
     else:
         since_dt = parse_since(since) if since else None
         until_dt = parse_until(until) if until else None
