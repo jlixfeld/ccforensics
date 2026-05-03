@@ -62,7 +62,7 @@ def _is_pure_hook_injection(text: str) -> bool:
     return _HOOK_INJECTION_MARKER in text and len(text) > 500
 
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 MIGRATIONS: list[list[str]] = [
     [
@@ -211,6 +211,25 @@ MIGRATIONS: list[list[str]] = [
         "DROP TABLE _subagent_spawns_v1",
         "CREATE INDEX idx_spawns_session ON subagent_spawns(parent_session_id)",
         "CREATE INDEX idx_spawns_type ON subagent_spawns(subagent_type)",
+    ],
+    # v2 → v3: add messages.service_tier column and new message_tool_uses
+    # table (one row per tool_use block on an assistant message — the writer
+    # currently stores only the first). Trailing UPDATE forces cold backfill
+    # on next reconcile so existing data populates.
+    [
+        "ALTER TABLE messages ADD COLUMN service_tier TEXT",
+        """CREATE TABLE message_tool_uses (
+            message_dedup_key  TEXT NOT NULL REFERENCES messages(dedup_key) ON DELETE CASCADE,
+            ordinal            INTEGER NOT NULL,
+            tool_use_id        TEXT NOT NULL,
+            tool_name          TEXT NOT NULL,
+            mcp_server         TEXT,
+            args_size_bytes    INTEGER NOT NULL,
+            PRIMARY KEY (message_dedup_key, ordinal)
+        )""",
+        "CREATE INDEX idx_mtu_tool_name ON message_tool_uses(tool_name)",
+        "CREATE INDEX idx_mtu_mcp_server ON message_tool_uses(mcp_server) WHERE mcp_server IS NOT NULL",
+        "UPDATE files SET mtime_ns = 0",
     ],
 ]
 
