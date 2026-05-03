@@ -153,10 +153,7 @@ The plugin rollup reads as a leaderboard: cost, sessions touched, top subagent t
 
 > *"Which of my MCP servers are costing me the most?"* or *"Break down my MCP tool spend for the last 30 days"*
 
-The tools report collapses every `mcp__<server>__*` tool to one row per server. Two columns matter:
-
-- **`Isolated $`** — exact cost of turns where this tool was the *only* one emitted. The cleanest signal of what a tool costs per use. Sum freely across rows.
-- **`Shared $≤`** — upper bound for turns where this tool ran alongside others. The same turn's cost appears under each sibling. **Never sum across rows** — you'll double-count.
+The tools report collapses every `mcp__<server>__*` tool to one row per server. `Isolated $` is exact; `Shared $≤` is an upper bound — never sum the Shared column across rows (see the `tools` command reference above for the full accounting definition).
 
 Ask Claude to expand per-tool detail if a server looks expensive: a server with one heavy tool and ten near-zero ones is a candidate for trimming unused tool definitions — Claude Code injects every tool's schema into context on every turn, so unused tools cost real tokens.
 
@@ -217,13 +214,7 @@ Pricing is pulled from LiteLLM's model pricing data once per 24h, cached on disk
 
 ### Cache efficiency
 
-`session show` and `aggregate` surface a cache footer line in scope:
-
-```
-Cache: 12.4M read · 1.2M created · 87.3% efficiency · saved $3.42
-```
-
-Both numbers are exact arithmetic over stored token counts and per-model pricing. `efficiency` is **cost-weighted** — `cache_read` tokens cost ~10× less than `input` tokens, so a token-ratio efficiency overstates dollar savings. `saved` is `cache_read × (input_price − read_price)` summed per model.
+`session show` and `aggregate` surface a cache footer line — see "Is my prompt cache working?" in the sample workflows above for how to interpret it. Both numbers are exact arithmetic over stored token counts and per-model pricing.
 
 ## Known limitations
 
