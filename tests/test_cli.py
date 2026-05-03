@@ -773,3 +773,29 @@ def test_tools_command_json_output(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert "_meta" in payload
     assert payload["_meta"]["footer"]
     assert any(r["group_key"] == "Edit" for r in payload["rows"])
+
+
+def test_tools_command_no_refresh_skips_pricing_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--no-refresh must not call PricingCache.load_or_fetch — the tools
+    report consumes pre-annotated costs from the index, not pricing."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    (tmp_path / ".claude" / "projects").mkdir(parents=True)
+
+    from ccforensics import cli as cli_mod
+
+    calls: list[bool] = []
+    original = cli_mod.PricingCache.load_or_fetch
+
+    def tracker(self: cli_mod.PricingCache) -> dict[str, dict[str, object]]:
+        calls.append(True)
+        return original(self)
+
+    monkeypatch.setattr(cli_mod.PricingCache, "load_or_fetch", tracker)
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["tools", "--no-refresh"])
+    assert result.exit_code == 0
+    assert calls == []
