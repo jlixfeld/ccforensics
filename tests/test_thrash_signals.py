@@ -12,10 +12,18 @@ from typing import Any
 from ccforensics.models import TranscriptEntry, parse_entry
 from ccforensics.thrash import (
     SIGNAL_VERSION,
+    BaselineStats,
     assistant_turn_count,
+    detect_novelty_window,
     detect_placeholder_emit,
     detect_repeated_edit,
     detect_repeated_error,
+    detect_session_abandoned,
+    detect_test_regression,
+    detect_tool_arg_churn,
+    detect_trajectory_length_zscore,
+    detect_turn_cost_acceleration,
+    detect_user_correction,
     primary_model,
     session_eligible,
 )
@@ -84,7 +92,12 @@ def _parse(raw: list[dict[str, Any]]) -> list[TranscriptEntry]:
 
 
 def _ts(i: int) -> str:
-    return f"2026-04-22T10:{i:02d}:00Z"
+    """Return an ISO timestamp ``i`` minutes after a fixed start. Rolls
+    over to subsequent hours when ``i >= 60`` so callers can use larger
+    indices for long-session fixtures."""
+    hour = 10 + i // 60
+    minute = i % 60
+    return f"2026-04-22T{hour:02d}:{minute:02d}:00Z"
 
 
 def _bulk_assistant(
@@ -432,3 +445,448 @@ def test_signal_version_is_positive_int() -> None:
     code change; this test simply pins the type contract."""
     assert isinstance(SIGNAL_VERSION, int)
     assert SIGNAL_VERSION >= 1
+
+
+# ---------- tool_arg_churn ----------
+
+
+def _bash_run(turn_idx: int, tool_id: str, command: str, result: str) -> list[dict[str, Any]]:
+    return [
+        _assistant(
+            f"a-bash-{turn_idx}",
+            _ts(turn_idx * 2),
+            content=[_tool_use("Bash", tool_id, command=command)],
+        ),
+        _user(
+            f"u-bash-{turn_idx}",
+            _ts(turn_idx * 2 + 1),
+            text=[_tool_result(tool_id, result)],
+        ),
+    ]
+
+
+def test_tool_arg_churn_fires_on_identical_repeated_call_and_result() -> None:
+    raw: list[dict[str, Any]] = []
+    for i in range(4):
+        raw.extend(_bash_run(i, f"tb{i}", "ls /nope", "Error: No such file or directory"))
+    entries = _parse(raw)
+    signals = detect_tool_arg_churn(entries)
+    assert len(signals) == 1
+    sig = signals[0]
+    assert sig.signal_type == "tool_arg_churn"
+    assert sig.count == 4
+    assert sig.evidence["result_variation"] is False
+
+
+def test_tool_arg_churn_suppressed_when_results_vary() -> None:
+    """Same args, alternating success/failure → flake retry, not churn."""
+    raw: list[dict[str, Any]] = []
+    for i, result in enumerate(["pass", "Error: foo", "pass", "Error: foo"]):
+        raw.extend(_bash_run(i, f"tb{i}", "pytest", result))
+    entries = _parse(raw)
+    assert detect_tool_arg_churn(entries) == []
+
+
+def test_tool_arg_churn_does_not_fire_below_threshold() -> None:
+    raw: list[dict[str, Any]] = []
+    for i in range(2):
+        raw.extend(_bash_run(i, f"tb{i}", "ls /nope", "Error"))
+    entries = _parse(raw)
+    assert detect_tool_arg_churn(entries) == []
+
+
+def test_tool_arg_churn_does_not_fire_when_args_differ() -> None:
+    raw: list[dict[str, Any]] = []
+    for i in range(4):
+        raw.extend(_bash_run(i, f"tb{i}", f"ls /opt/{i}", "Error"))
+    entries = _parse(raw)
+    assert detect_tool_arg_churn(entries) == []
+
+
+# ---------- user_correction ----------
+
+
+def test_user_correction_fires_on_short_corrective_messages() -> None:
+    entries = _parse(
+        [
+            _user("u0", _ts(0), "Initial prompt — do something"),
+            _assistant("a1", _ts(1)),
+            _user("u2", _ts(2), "no, that's wrong"),
+            _assistant("a3", _ts(3)),
+            _user("u4", _ts(4), "still broken"),
+            _assistant("a5", _ts(5)),
+            _user("u6", _ts(6), "try again"),
+        ]
+    )
+    signals = detect_user_correction(entries)
+    assert len(signals) == 1
+    sig = signals[0]
+    assert sig.signal_type == "user_correction"
+    assert sig.count == 3
+    assert sig.evidence["turn_indices"] == [1, 2, 3]
+
+
+def test_user_correction_excludes_first_user_message() -> None:
+    entries = _parse(
+        [
+            _user("u0", _ts(0), "no this is wrong"),  # first prompt; ignored
+            _assistant("a1", _ts(1)),
+            _user("u2", _ts(2), "still broken"),
+        ]
+    )
+    assert detect_user_correction(entries) == []
+
+
+def test_user_correction_does_not_fire_on_long_messages() -> None:
+    long_text = "okay so the previous attempt did not work because " * 5
+    entries = _parse(
+        [
+            _user("u0", _ts(0), "init"),
+            _assistant("a1", _ts(1)),
+            _user("u2", _ts(2), long_text),
+            _assistant("a3", _ts(3)),
+            _user("u4", _ts(4), long_text),
+        ]
+    )
+    assert detect_user_correction(entries) == []
+
+
+def test_user_correction_does_not_fire_on_greetings() -> None:
+    entries = _parse(
+        [
+            _user("u0", _ts(0), "init"),
+            _assistant("a1", _ts(1)),
+            _user("u2", _ts(2), "thanks!"),
+            _assistant("a3", _ts(3)),
+            _user("u4", _ts(4), "great"),
+        ]
+    )
+    assert detect_user_correction(entries) == []
+
+
+# ---------- session_abandoned ----------
+
+
+def _long_session(
+    n_turns: int,
+    *,
+    final_role: str = "assistant",
+    final_user_text: str = "thanks",
+    final_tool_error: bool = False,
+) -> list[TranscriptEntry]:
+    raw: list[dict[str, Any]] = [_user("u-init", _ts(0), "go")]
+    ts_idx = 1
+    for i in range(n_turns):
+        raw.append(_assistant(f"a{i}", _ts(ts_idx)))
+        ts_idx += 1
+    if final_role == "user":
+        if final_tool_error:
+            raw.append(_user("u-end", _ts(ts_idx), text=[_tool_result("t-x", "Error: boom")]))
+        else:
+            raw.append(_user("u-end", _ts(ts_idx), text=final_user_text))
+    return _parse(raw)
+
+
+def test_session_abandoned_fires_when_last_role_is_assistant() -> None:
+    entries = _long_session(25, final_role="assistant")
+    signals = detect_session_abandoned(entries)
+    assert len(signals) == 1
+    sig = signals[0]
+    assert sig.signal_type == "session_abandoned"
+    assert sig.evidence["last_role"] == "assistant"
+    assert sig.evidence["total_turns"] == 25
+
+
+def test_session_abandoned_fires_on_final_tool_error() -> None:
+    entries = _long_session(25, final_role="user", final_tool_error=True)
+    signals = detect_session_abandoned(entries)
+    assert len(signals) == 1
+    assert signals[0].evidence["last_tool_error"] is True
+
+
+def test_session_abandoned_does_not_fire_on_thanks() -> None:
+    entries = _long_session(25, final_role="user", final_user_text="thanks, that worked")
+    assert detect_session_abandoned(entries) == []
+
+
+def test_session_abandoned_does_not_fire_below_min_turns() -> None:
+    entries = _long_session(5, final_role="assistant")
+    assert detect_session_abandoned(entries) == []
+
+
+# ---------- novelty_window ----------
+
+
+def test_novelty_window_fires_on_long_flat_run_with_repeated_text() -> None:
+    """20 assistant turns, all reusing same Edit target + same tool +
+    similar text → flat run >= window, jaccard high → fire."""
+    raw: list[dict[str, Any]] = [_user("u-init", _ts(0), "go")]
+    raw.append(
+        _assistant(
+            "a-init",
+            _ts(1),
+            content=[
+                _tool_use("Edit", "tinit", file_path="/x/foo.py", new_string="v"),
+                {"type": "text", "text": "starting"},
+            ],
+        )
+    )
+    for i in range(2, 20):
+        raw.append(
+            _assistant(
+                f"a{i}",
+                _ts(i),
+                content=[
+                    _tool_use("Edit", f"t{i}", file_path="/x/foo.py", new_string="v"),
+                    {"type": "text", "text": "trying again with the same approach again"},
+                ],
+            )
+        )
+    entries = _parse(raw)
+    signals = detect_novelty_window(entries, threshold=1)
+    assert len(signals) == 1
+    sig = signals[0]
+    assert sig.signal_type == "novelty_window"
+    assert sig.count >= 6
+
+
+def test_novelty_window_suppressed_by_low_text_jaccard() -> None:
+    """Same flat structure but assistant text diverges turn-to-turn →
+    deep debugging, not stagnation."""
+    diverse_texts = [
+        "alpha beta gamma 123",
+        "x y z banana split",
+        "lorem ipsum dolor sit amet",
+        "qq ww ee rr tt yy uu ii",
+        "0987654321 ##$%^&*()",
+        "abcdefghijklm nopqrst uvwx",
+        "the quick brown fox jumped",
+        "another set of completely different words now",
+        "and some more variety here too",
+        "yet still more textual variation",
+    ]
+    raw: list[dict[str, Any]] = [_user("u-init", _ts(0), "go")]
+    raw.append(
+        _assistant(
+            "a-init",
+            _ts(1),
+            content=[
+                _tool_use("Edit", "tinit", file_path="/x/foo.py", new_string="v"),
+                {"type": "text", "text": diverse_texts[0]},
+            ],
+        )
+    )
+    for i, text in enumerate(diverse_texts[1:], start=2):
+        raw.append(
+            _assistant(
+                f"a{i}",
+                _ts(i),
+                content=[
+                    _tool_use("Edit", f"t{i}", file_path="/x/foo.py", new_string="v"),
+                    {"type": "text", "text": text},
+                ],
+            )
+        )
+    entries = _parse(raw)
+    assert detect_novelty_window(entries, threshold=1) == []
+
+
+def test_novelty_window_resets_on_new_file() -> None:
+    """Touching a new file mid-run resets the flat counter."""
+    raw: list[dict[str, Any]] = [_user("u-init", _ts(0), "go")]
+    raw.append(
+        _assistant(
+            "a-init",
+            _ts(1),
+            content=[
+                _tool_use("Edit", "tinit", file_path="/x/foo.py", new_string="v"),
+                {"type": "text", "text": "trying"},
+            ],
+        )
+    )
+    for i in range(3):
+        raw.append(
+            _assistant(
+                f"a{i}",
+                _ts(i + 2),
+                content=[
+                    _tool_use("Edit", f"t{i}", file_path="/x/foo.py", new_string="v"),
+                    {"type": "text", "text": "trying"},
+                ],
+            )
+        )
+    raw.append(
+        _assistant(
+            "a-novel",
+            _ts(10),
+            content=[_tool_use("Edit", "tnov", file_path="/x/bar.py", new_string="v")],
+        )
+    )
+    for i in range(3):
+        raw.append(
+            _assistant(
+                f"a-tail-{i}",
+                _ts(20 + i),
+                content=[
+                    _tool_use("Edit", f"t-tail-{i}", file_path="/x/bar.py", new_string="v"),
+                    {"type": "text", "text": "trying again"},
+                ],
+            )
+        )
+    entries = _parse(raw)
+    assert detect_novelty_window(entries, window=10, threshold=1) == []
+
+
+# ---------- turn_cost_acceleration ----------
+
+
+def _assistant_with_output(uuid: str, ts: str, output_tokens: int) -> dict[str, Any]:
+    e = _assistant(uuid, ts)
+    e["message"]["usage"]["output_tokens"] = output_tokens
+    return e
+
+
+def test_turn_cost_acceleration_fires_on_rising_output_tokens() -> None:
+    raw: list[dict[str, Any]] = []
+    for i in range(20):
+        raw.append(_assistant_with_output(f"a{i}", _ts(i), output_tokens=100 + i * 50))
+    entries = _parse(raw)
+    signals = detect_turn_cost_acceleration(entries)
+    assert len(signals) == 1
+    sig = signals[0]
+    assert sig.signal_type == "turn_cost_acceleration"
+    assert sig.evidence["slope_output_tokens_per_turn"] > 0
+    assert sig.evidence["r_squared"] >= 0.55
+
+
+def test_turn_cost_acceleration_does_not_fire_on_flat_output() -> None:
+    raw: list[dict[str, Any]] = []
+    for i in range(20):
+        raw.append(_assistant_with_output(f"a{i}", _ts(i), output_tokens=100))
+    entries = _parse(raw)
+    assert detect_turn_cost_acceleration(entries) == []
+
+
+def test_turn_cost_acceleration_does_not_fire_below_min_turns() -> None:
+    raw: list[dict[str, Any]] = []
+    for i in range(10):
+        raw.append(_assistant_with_output(f"a{i}", _ts(i), output_tokens=100 + i * 50))
+    entries = _parse(raw)
+    assert detect_turn_cost_acceleration(entries) == []
+
+
+def test_turn_cost_acceleration_uses_output_tokens_not_input() -> None:
+    """A session w/ flat output_tokens but rising input_tokens (tool
+    output accumulation) should NOT fire."""
+    raw: list[dict[str, Any]] = []
+    for i in range(20):
+        e = _assistant_with_output(f"a{i}", _ts(i), output_tokens=80)
+        e["message"]["usage"]["input_tokens"] = 100 + i * 100
+        raw.append(e)
+    entries = _parse(raw)
+    assert detect_turn_cost_acceleration(entries) == []
+
+
+# ---------- test_regression ----------
+
+
+def test_test_regression_fires_when_pytest_fails_after_edit() -> None:
+    raw: list[dict[str, Any]] = [
+        _assistant(
+            "a-test1",
+            _ts(0),
+            content=[_tool_use("Bash", "tb1", command="uv run pytest")],
+        ),
+        _user("u-r1", _ts(1), text=[_tool_result("tb1", "2 failed, 8 passed")]),
+        _assistant(
+            "a-edit",
+            _ts(2),
+            content=[_tool_use("Edit", "te", file_path="/x/foo.py", new_string="bad")],
+        ),
+        _user("u-edit-ok", _ts(3), text=[_tool_result("te", "ok")]),
+        _assistant(
+            "a-test2",
+            _ts(4),
+            content=[_tool_use("Bash", "tb2", command="uv run pytest")],
+        ),
+        _user("u-r2", _ts(5), text=[_tool_result("tb2", "7 failed, 3 passed")]),
+    ]
+    entries = _parse(raw)
+    signals = detect_test_regression(entries)
+    assert len(signals) == 1
+    sig = signals[0]
+    assert sig.signal_type == "test_regression"
+    assert sig.evidence["fail_count_before"] == 2
+    assert sig.evidence["fail_count_after"] == 7
+
+
+def test_test_regression_does_not_fire_when_failures_decrease() -> None:
+    raw: list[dict[str, Any]] = [
+        _assistant("a1", _ts(0), content=[_tool_use("Bash", "tb1", command="pytest")]),
+        _user("u1", _ts(1), text=[_tool_result("tb1", "5 failed")]),
+        _assistant(
+            "a-edit",
+            _ts(2),
+            content=[_tool_use("Edit", "te", file_path="/x/foo.py", new_string="fix")],
+        ),
+        _user("u-ed", _ts(3), text=[_tool_result("te", "ok")]),
+        _assistant("a2", _ts(4), content=[_tool_use("Bash", "tb2", command="pytest")]),
+        _user("u2", _ts(5), text=[_tool_result("tb2", "1 failed")]),
+    ]
+    entries = _parse(raw)
+    assert detect_test_regression(entries) == []
+
+
+def test_test_regression_unrecognized_runner_silently_ignored() -> None:
+    raw: list[dict[str, Any]] = [
+        _assistant("a1", _ts(0), content=[_tool_use("Bash", "tb1", command="echo hi")]),
+        _user("u1", _ts(1), text=[_tool_result("tb1", "hi")]),
+    ]
+    entries = _parse(raw)
+    assert detect_test_regression(entries) == []
+
+
+# ---------- trajectory_length_zscore ----------
+
+
+def test_trajectory_length_zscore_fires_for_anomalous_session() -> None:
+    entries = _parse(_bulk_assistant(80, model="claude-sonnet-4-6"))
+    baseline = BaselineStats(
+        primary_model="claude-sonnet-4-6",
+        mean_turns=24.0,
+        stddev_turns=8.0,
+        n_sessions=30,
+    )
+    signals = detect_trajectory_length_zscore(entries, baseline)
+    assert len(signals) == 1
+    sig = signals[0]
+    assert sig.signal_type == "trajectory_length_zscore"
+    assert sig.evidence["session_turns"] == 80
+    assert sig.evidence["z_score"] > 2.0
+
+
+def test_trajectory_length_zscore_suppressed_by_small_baseline() -> None:
+    entries = _parse(_bulk_assistant(80, model="claude-sonnet-4-6"))
+    baseline = BaselineStats(
+        primary_model="claude-sonnet-4-6",
+        mean_turns=24.0,
+        stddev_turns=8.0,
+        n_sessions=10,
+    )
+    assert detect_trajectory_length_zscore(entries, baseline) == []
+
+
+def test_trajectory_length_zscore_does_not_fire_for_normal_session() -> None:
+    entries = _parse(_bulk_assistant(28, model="claude-sonnet-4-6"))
+    baseline = BaselineStats(
+        primary_model="claude-sonnet-4-6",
+        mean_turns=24.0,
+        stddev_turns=8.0,
+        n_sessions=30,
+    )
+    assert detect_trajectory_length_zscore(entries, baseline) == []
+
+
+def test_trajectory_length_zscore_returns_empty_when_baseline_is_none() -> None:
+    entries = _parse(_bulk_assistant(80, model="claude-sonnet-4-6"))
+    assert detect_trajectory_length_zscore(entries, None) == []
