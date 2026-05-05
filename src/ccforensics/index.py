@@ -19,7 +19,7 @@ from .models import TranscriptEntry, load_meta_json
 from .paths import claude_home, claude_plugins_cache_dir, decode_project_dirname
 from .registry import populate_registry
 from .skills import build_resolver_from_paths, populate_from_session_files
-from .thrash import populate_session_signals
+from .thrash import SubagentSpawnInfo, populate_session_signals, primary_model
 from .tree import discover_spawn
 
 logger = logging.getLogger("ccforensics.index")
@@ -931,8 +931,9 @@ def _populate_thrash_for_session(conn: sqlite3.Connection, session_id: str) -> N
     """Re-parse the session's main file, run thrash signal extractors,
     and write results to ``session_signals`` + ``session_rollups``.
 
-    Subagent-files are intentionally NOT included in T4 — subagent
-    escalation is added in T6 alongside the escalation detector.
+    Includes subagent-dispatch escalation by querying ``subagent_spawns``
+    + parsing each child subagent file's primary model.
+
     Baseline (BaselineStats for trajectory_length_zscore) is built by
     T7 calibration; for now we pass None so the extractor returns [].
     """
@@ -947,7 +948,97 @@ def _populate_thrash_for_session(conn: sqlite3.Connection, session_id: str) -> N
         result = parse_file(main_path)
     except FileNotFoundError:
         return
-    populate_session_signals(conn, session_id, list(result.entries), baseline=None)
+    parent_entries = list(result.entries)
+    spawns = _gather_subagent_spawns(conn, session_id, parent_entries)
+    populate_session_signals(
+        conn,
+        session_id,
+        parent_entries,
+        baseline=None,
+        subagent_spawns=spawns,
+    )
+
+
+def _gather_subagent_spawns(
+    conn: sqlite3.Connection,
+    session_id: str,
+    parent_entries: list[TranscriptEntry],
+) -> list[SubagentSpawnInfo]:
+    """Build the ``SubagentSpawnInfo`` list that
+    ``detect_subagent_escalation`` consumes.
+
+    For each ``subagent_spawns`` row whose parent linkage resolved
+    (``parent_message_dedup_key IS NOT NULL``):
+
+    1. Locate the parent message in ``parent_entries`` by re-computing
+       its dedup_key — translates dedup_key to the parent assistant
+       turn index that escalation detection needs.
+    2. Parse the child subagent file once to extract its primary model.
+    3. Pull the Agent/Task tool_use's ``input.prompt`` from the parent
+       message for ``subagent_prompt_excerpt`` audit-trail context.
+    4. Use ``subagent_spawns.total_cost_usd`` populated by
+       ``backfill_spawn_totals`` (runs before this hook) as the child
+       session's full cost.
+
+    Failures in child-file parsing are logged and skipped — the
+    main-session escalation detection still runs.
+    """
+    rows = conn.execute(
+        """SELECT parent_message_dedup_key, child_file_path, total_cost_usd
+             FROM subagent_spawns
+            WHERE parent_session_id = ?
+              AND parent_message_dedup_key IS NOT NULL
+              AND child_file_path IS NOT NULL""",
+        (session_id,),
+    ).fetchall()
+    if not rows:
+        return []
+
+    dedup_to_turn: dict[str, int] = {}
+    dedup_to_prompt: dict[str, str | None] = {}
+    assistant_turn = -1
+    for entry in parent_entries:
+        if not entry.message or entry.message.role != "assistant":
+            continue
+        assistant_turn += 1
+        key = dedup_key(entry)
+        if key is None:
+            continue
+        dedup_to_turn[key] = assistant_turn
+        # Pull the FIRST tool_use's input.prompt for an excerpt.
+        prompt_excerpt: str | None = None
+        for block in entry.message.content:
+            if block.type == "tool_use" and block.input:
+                prompt = block.input.get("prompt") or block.input.get("description")
+                if isinstance(prompt, str) and prompt:
+                    prompt_excerpt = prompt[:200]
+                    break
+        dedup_to_prompt[key] = prompt_excerpt
+
+    spawns: list[SubagentSpawnInfo] = []
+    for parent_key, child_path_str, total_cost in rows:
+        if parent_key not in dedup_to_turn:
+            continue
+        child_path = Path(child_path_str)
+        try:
+            child_result = parse_file(child_path)
+        except FileNotFoundError:
+            logger.debug("subagent file missing: %s", child_path)
+            continue
+        except OSError:
+            logger.warning("subagent parse failed: %s", child_path, exc_info=True)
+            continue
+        child_model = primary_model(list(child_result.entries))
+        spawns.append(
+            SubagentSpawnInfo(
+                parent_message_dedup_key=parent_key,
+                child_session_cost_usd=float(total_cost or 0.0),
+                child_primary_model=child_model,
+                child_prompt_excerpt=dedup_to_prompt.get(parent_key),
+                parent_assistant_turn_index=dedup_to_turn[parent_key],
+            )
+        )
+    return spawns
 
 
 @dataclass

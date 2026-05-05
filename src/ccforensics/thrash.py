@@ -18,6 +18,7 @@ import json
 import math
 import re
 from collections import defaultdict
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -1037,8 +1038,10 @@ def populate_session_signals(
     session_id: str,
     entries: list[TranscriptEntry],
     baseline: BaselineStats | None = None,
+    subagent_spawns: list[SubagentSpawnInfo] | None = None,
 ) -> float | None:
-    """Write per-session thrash signals + composite score to the index.
+    """Write per-session thrash signals + composite score + escalation
+    event to the index.
 
     Returns the computed thrash_score, or None when the session was
     filtered out (Opus primary, fewer than MIN_SESSION_TURNS, etc.).
@@ -1047,8 +1050,14 @@ def populate_session_signals(
     - ``session_signals`` — one row per fired signal_type (deletes
       stale rows for this session first).
     - ``session_rollups`` — updates every bucket row for this session
-      with the same ``thrash_score`` + ``thrash_score_version`` so
-      downstream queries can read the score from any rollup row.
+      with the same ``thrash_score``, ``thrash_score_version``, and
+      JSON-serialized ``escalation_event`` so downstream queries can
+      read from any rollup row.
+
+    Escalation event detection runs whether or not the session was
+    filtered — sessions filtered for thrash scoring (Opus primary)
+    still benefit from having escalation events recorded for the
+    calibration table (T7).
 
     Filtered sessions get ``thrash_score = NULL`` written to all
     rollup rows (explicitly cleared so prior scores don't linger after
@@ -1056,13 +1065,24 @@ def populate_session_signals(
     """
     conn.execute("DELETE FROM session_signals WHERE session_id = ?", (session_id,))
 
+    # Escalation event runs for ALL sessions — calibration table
+    # (T7) needs Opus and short sessions when they contain user-
+    # initiated escalations.
+    candidates = [
+        detect_escalation(entries),
+        detect_subagent_escalation(entries, subagent_spawns or []),
+    ]
+    escalation_event = select_earliest_escalation(candidates)
+    escalation_json = json.dumps(escalation_event, sort_keys=True) if escalation_event else None
+
     if not session_eligible(entries):
         conn.execute(
             """UPDATE session_rollups
                SET thrash_score = NULL,
-                   thrash_score_version = NULL
+                   thrash_score_version = NULL,
+                   escalation_event = ?
                WHERE session_id = ?""",
-            (session_id,),
+            (escalation_json, session_id),
         )
         return None
 
@@ -1086,8 +1106,334 @@ def populate_session_signals(
     conn.execute(
         """UPDATE session_rollups
            SET thrash_score = ?,
-               thrash_score_version = ?
+               thrash_score_version = ?,
+               escalation_event = ?
            WHERE session_id = ?""",
-        (score, SIGNAL_VERSION, session_id),
+        (score, SIGNAL_VERSION, escalation_json, session_id),
     )
     return score
+
+
+# ---------- T5: escalation event detector ----------
+
+
+_TIER_RANKS: dict[str, int] = {"haiku": 1, "sonnet": 2, "opus": 3}
+_TIER_NAME_RE = re.compile(r"claude-(haiku|sonnet|opus)-", re.IGNORECASE)
+_AUTO_MODE_PROBE_TURNS = 20
+_AUTO_MODE_MIN_SWITCHES = 3
+_RESOLUTION_WINDOW = 10
+
+
+def model_tier(model: str | None) -> int:
+    """Return tier rank: haiku=1, sonnet=2, opus=3, unknown=0.
+    Used by the escalation detector — only tier-strictly-increasing
+    transitions count as escalation."""
+    if not model:
+        return 0
+    m = _TIER_NAME_RE.search(model)
+    if not m:
+        return 0
+    return _TIER_RANKS.get(m.group(1).lower(), 0)
+
+
+@dataclass(frozen=True)
+class AssistantTurn:
+    """Compact representation of an assistant turn for escalation
+    analysis. Avoids passing pydantic objects through downstream
+    serialization."""
+
+    turn_index: int
+    timestamp_iso: str
+    model: str | None
+    cost_usd: float
+    tier: int
+
+
+def _assistant_turns(entries: list[TranscriptEntry]) -> list[AssistantTurn]:
+    out: list[AssistantTurn] = []
+    idx = -1
+    for e in entries:
+        if not e.message or e.message.role != "assistant":
+            continue
+        idx += 1
+        cost = _entry_cost(e)
+        out.append(
+            AssistantTurn(
+                turn_index=idx,
+                timestamp_iso=e.timestamp.isoformat(),
+                model=e.message.model,
+                cost_usd=cost,
+                tier=model_tier(e.message.model),
+            )
+        )
+    return out
+
+
+def _entry_cost(entry: TranscriptEntry) -> float:
+    """Best-effort cost extraction. The reconcile pipeline annotates
+    cost on the JSONL entries via ``annotate_cost``; for entries that
+    haven't been annotated (raw parse) ``extras`` carries an
+    ``annotated_cost_usd`` key set by ``annotate_cost``. Falls back to
+    0.0 when missing."""
+    cost = entry.extras.get("annotated_cost_usd")
+    if isinstance(cost, (int, float)):
+        return float(cost)
+    return 0.0
+
+
+def _detect_resolution(entries: list[TranscriptEntry], post_switch_start: int) -> tuple[int, str]:
+    """Walk forward from ``post_switch_start`` (assistant turn index of
+    the first post-switch turn) and find the first resolution marker
+    within ``_RESOLUTION_WINDOW`` assistant turns.
+
+    Returns ``(turns_to_resolution, resolution_marker)``. The resolution
+    marker enum:
+    - "user_thanks" — user message contains a resolution-shape token
+    - "session_end" — session ends within the window with no further
+      user input after the last assistant turn
+    - "tool_success_no_followup" — last tool result was non-error and
+      no further tool calls follow within the window
+    - "unresolved_within_window" — none of the above fired
+    """
+    assistant_turn = -1
+    last_assistant_in_window: int | None = None
+    saw_post_switch_assistant = False
+    for e in entries:
+        if not e.message:
+            continue
+        if e.message.role == "assistant":
+            assistant_turn += 1
+            if assistant_turn >= post_switch_start:
+                saw_post_switch_assistant = True
+                last_assistant_in_window = assistant_turn
+                if assistant_turn - post_switch_start >= _RESOLUTION_WINDOW:
+                    break
+            continue
+        if e.message.role != "user" or not saw_post_switch_assistant:
+            continue
+        text = _user_text_blocks(e.message.content)
+        if text and _RESOLUTION_RE.search(text):
+            turns = max(1, assistant_turn - post_switch_start + 1)
+            return turns, "user_thanks"
+
+    # No user-thanks in the window. Check if the last seen assistant
+    # turn within the window had a non-error tool result and no further
+    # tool calls.
+    if last_assistant_in_window is not None:
+        if not _last_tool_result_is_error(entries):
+            window_turns = last_assistant_in_window - post_switch_start + 1
+            return min(_RESOLUTION_WINDOW, window_turns), "tool_success_no_followup"
+        window_turns = last_assistant_in_window - post_switch_start + 1
+        return min(_RESOLUTION_WINDOW, window_turns), "unresolved_within_window"
+    return 1, "session_end"
+
+
+def detect_escalation(
+    entries: list[TranscriptEntry],
+) -> dict[str, Any] | None:
+    """Detect the FIRST tier-escalation event in the session.
+
+    Returns a JSON-serializable dict matching the
+    ``session_rollups.escalation_event`` schema (spec §2), or None
+    when no escalation found.
+
+    Priority order matches spec §3 — escalation event detector:
+    1. ``auto_mode`` — >= 3 model switches in first 20 assistant turns.
+       The first switch is recorded; auto_mode events are excluded
+       from the calibration table downstream.
+    2. ``model_switch`` — first tier-strictly-increasing transition.
+    3. (subagent_dispatch is detected by ``detect_subagent_escalation``
+       in T6 — needs cross-session subagent_spawns data.)
+
+    Same-tier transitions (Sonnet 4.6 -> Sonnet 4.7) and tier-equal
+    capability routing are NOT counted.
+    """
+    turns = _assistant_turns(entries)
+    if len(turns) < 2:
+        return None
+
+    # Count model switches in the auto-mode probe window
+    probe = turns[:_AUTO_MODE_PROBE_TURNS]
+    n_switches = sum(1 for i in range(1, len(probe)) if probe[i].model != probe[i - 1].model)
+    auto_mode = n_switches >= _AUTO_MODE_MIN_SWITCHES
+
+    # Find first tier-strictly-increasing transition (regardless of
+    # auto_mode — auto_mode just changes the kind label).
+    for i in range(1, len(turns)):
+        prev, cur = turns[i - 1], turns[i]
+        if prev.tier == 0 or cur.tier == 0:
+            continue
+        if cur.tier <= prev.tier:
+            continue
+        return _build_escalation_event(
+            entries=entries,
+            switch_index=i,
+            from_model=prev.model or "",
+            to_model=cur.model or "",
+            turns=turns,
+            kind="auto_mode" if auto_mode else "model_switch",
+        )
+
+    # No tier-increase found. If auto_mode but only same-tier bouncing,
+    # we still record the first model change (if any) so the report
+    # can surface auto_mode sessions for context.
+    if auto_mode:
+        for i in range(1, len(turns)):
+            if turns[i].model != turns[i - 1].model:
+                return _build_escalation_event(
+                    entries=entries,
+                    switch_index=i,
+                    from_model=turns[i - 1].model or "",
+                    to_model=turns[i].model or "",
+                    turns=turns,
+                    kind="auto_mode",
+                )
+    return None
+
+
+def _build_escalation_event(
+    *,
+    entries: list[TranscriptEntry],
+    switch_index: int,
+    from_model: str,
+    to_model: str,
+    turns: list[AssistantTurn],
+    kind: str,
+) -> dict[str, Any]:
+    cost_before = sum(t.cost_usd for t in turns[:switch_index])
+    cost_after = sum(t.cost_usd for t in turns[switch_index:])
+    first_ts = entries[0].timestamp
+    switch_entry = next(
+        e for i, e in enumerate(_assistant_entries_iter(entries)) if i == switch_index
+    )
+    last_ts = entries[-1].timestamp
+    wall_before = int((switch_entry.timestamp - first_ts).total_seconds())
+    wall_after = int((last_ts - switch_entry.timestamp).total_seconds())
+
+    turns_to_res, marker = _detect_resolution(entries, switch_index)
+    return {
+        "turn_index": switch_index,
+        "from_model": from_model,
+        "to_model": to_model,
+        "escalation_kind": kind,
+        "turns_after_switch_to_resolution": turns_to_res,
+        "cost_before_switch_usd": round(cost_before, 6),
+        "cost_after_switch_usd": round(cost_after, 6),
+        "wall_clock_before_seconds": wall_before,
+        "wall_clock_after_seconds": wall_after,
+        "resolution_marker": marker,
+        "subagent_prompt_excerpt": None,
+    }
+
+
+def _assistant_entries_iter(
+    entries: list[TranscriptEntry],
+) -> Iterator[TranscriptEntry]:
+    for e in entries:
+        if e.message and e.message.role == "assistant":
+            yield e
+
+
+# ---------- T6: subagent_dispatch escalation ----------
+
+
+@dataclass(frozen=True)
+class SubagentSpawnInfo:
+    """One spawn record needed for subagent_dispatch escalation
+    detection. The orchestrator builds this from ``subagent_spawns``
+    rows + a one-shot parse of each child file's primary model."""
+
+    parent_message_dedup_key: str | None
+    child_session_cost_usd: float
+    child_primary_model: str | None
+    child_prompt_excerpt: str | None
+    parent_assistant_turn_index: int
+
+
+def detect_subagent_escalation(
+    entries: list[TranscriptEntry],
+    spawns: list[SubagentSpawnInfo],
+) -> dict[str, Any] | None:
+    """Find the first subagent dispatch where the child model's tier
+    is strictly greater than the parent's at-spawn-turn model.
+
+    "Capability routing" cases (Sonnet parent → Sonnet code-reviewer
+    subagent) are NOT counted — only tier-strictly-increasing
+    dispatches qualify, per spec §0.1 (capability-router vs
+    difficulty-escalator). Returns a dict matching
+    ``escalation_event`` shape, or None.
+    """
+    if not spawns:
+        return None
+    parent_turns = _assistant_turns(entries)
+    if not parent_turns:
+        return None
+
+    # Find earliest qualifying spawn (smallest parent_assistant_turn_index)
+    candidates: list[tuple[int, SubagentSpawnInfo, AssistantTurn]] = []
+    for spawn in spawns:
+        idx = spawn.parent_assistant_turn_index
+        if idx < 0 or idx >= len(parent_turns):
+            continue
+        parent_turn = parent_turns[idx]
+        parent_tier = parent_turn.tier
+        child_tier = model_tier(spawn.child_primary_model)
+        if parent_tier == 0 or child_tier == 0:
+            continue
+        if child_tier <= parent_tier:
+            continue
+        candidates.append((idx, spawn, parent_turn))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda t: t[0])
+    switch_index, spawn, parent_turn = candidates[0]
+
+    # Cost: parent-side cost up to + including the spawn turn = "before",
+    # parent-side cost AFTER the spawn turn + the child's full session
+    # cost = "after". The child session cost lives in
+    # ``session_rollups.cost_usd`` for the child's session (already
+    # attributed); we trust the orchestrator to populate
+    # ``child_session_cost_usd`` from that source.
+    cost_before = sum(t.cost_usd for t in parent_turns[: switch_index + 1])
+    cost_after_parent = sum(t.cost_usd for t in parent_turns[switch_index + 1 :])
+    cost_after = cost_after_parent + spawn.child_session_cost_usd
+
+    first_ts = entries[0].timestamp
+    last_ts = entries[-1].timestamp
+    spawn_entry = next(
+        e for i, e in enumerate(_assistant_entries_iter(entries)) if i == switch_index
+    )
+    wall_before = int((spawn_entry.timestamp - first_ts).total_seconds())
+    wall_after = int((last_ts - spawn_entry.timestamp).total_seconds())
+
+    turns_to_res, marker = _detect_resolution(entries, switch_index + 1)
+
+    return {
+        "turn_index": switch_index,
+        "from_model": parent_turn.model or "",
+        "to_model": spawn.child_primary_model or "",
+        "escalation_kind": "subagent_dispatch",
+        "turns_after_switch_to_resolution": turns_to_res,
+        "cost_before_switch_usd": round(cost_before, 6),
+        "cost_after_switch_usd": round(cost_after, 6),
+        "wall_clock_before_seconds": wall_before,
+        "wall_clock_after_seconds": wall_after,
+        "resolution_marker": marker,
+        "subagent_prompt_excerpt": (
+            spawn.child_prompt_excerpt[:200] if spawn.child_prompt_excerpt else None
+        ),
+    }
+
+
+def select_earliest_escalation(
+    candidates: list[dict[str, Any] | None],
+) -> dict[str, Any] | None:
+    """Pick the escalation event with the smallest ``turn_index``;
+    None if no candidates fired. Used by the orchestrator to combine
+    model_switch + subagent_dispatch into a single recorded event."""
+    valid = [c for c in candidates if c is not None]
+    if not valid:
+        return None
+    return min(valid, key=lambda e: e["turn_index"])
