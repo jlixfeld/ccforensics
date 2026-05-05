@@ -63,7 +63,7 @@ def _is_pure_hook_injection(text: str) -> bool:
     return _HOOK_INJECTION_MARKER in text and len(text) > 500
 
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 MIGRATIONS: list[list[str]] = [
     [
@@ -230,6 +230,30 @@ MIGRATIONS: list[list[str]] = [
         )""",
         "CREATE INDEX idx_mtu_tool_name ON message_tool_uses(tool_name)",
         "CREATE INDEX idx_mtu_mcp_server ON message_tool_uses(mcp_server) WHERE mcp_server IS NOT NULL",
+        "UPDATE files SET mtime_ns = 0",
+    ],
+    # v3 → v4: thrash detection metadata. Adds three columns to
+    # session_rollups (score, score_version, escalation_event JSON) plus a
+    # new session_signals table keyed by (session_id, signal_type) that
+    # holds per-signal counts + evidence JSON. ``thrash_score_version``
+    # tracks the SIGNAL_VERSION constant in ``thrash.py`` so threshold or
+    # weight changes invalidate prior scores. None of these participate
+    # in the bucket-attribution invariant; they are pure metadata. The
+    # trailing UPDATE forces cold backfill so existing sessions get
+    # signals populated on the next reconcile.
+    [
+        "ALTER TABLE session_rollups ADD COLUMN thrash_score REAL",
+        "ALTER TABLE session_rollups ADD COLUMN thrash_score_version INTEGER",
+        "ALTER TABLE session_rollups ADD COLUMN escalation_event TEXT",
+        """CREATE TABLE session_signals (
+            session_id     TEXT NOT NULL,
+            signal_type    TEXT NOT NULL,
+            count          INTEGER NOT NULL,
+            evidence       TEXT NOT NULL,
+            signal_version INTEGER NOT NULL,
+            PRIMARY KEY (session_id, signal_type)
+        )""",
+        "CREATE INDEX idx_signals_session ON session_signals(session_id)",
         "UPDATE files SET mtime_ns = 0",
     ],
 ]

@@ -88,9 +88,74 @@ def test_schema_v3_creates_message_tool_uses_and_service_tier(tmp_path: Path) ->
     }
 
 
+def test_schema_v4_creates_thrash_columns_and_session_signals(tmp_path: Path) -> None:
+    db = tmp_path / "v4.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+
+    assert CURRENT_SCHEMA_VERSION >= 4
+
+    rollup_cols = {row[1] for row in conn.execute("PRAGMA table_info(session_rollups)").fetchall()}
+    assert "thrash_score" in rollup_cols
+    assert "thrash_score_version" in rollup_cols
+    assert "escalation_event" in rollup_cols
+
+    tables = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    assert "session_signals" in tables
+
+    sig_cols = {row[1] for row in conn.execute("PRAGMA table_info(session_signals)").fetchall()}
+    assert sig_cols == {
+        "session_id",
+        "signal_type",
+        "count",
+        "evidence",
+        "signal_version",
+    }
+
+    indexes = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='session_signals'"
+        ).fetchall()
+    }
+    assert "idx_signals_session" in indexes
+
+
+def test_schema_v4_cold_backfill_resets_file_mtime(tmp_path: Path) -> None:
+    """v3 → v4 migration MUST reset files.mtime_ns to force re-reconcile so
+    thrash signals + escalation events populate from existing files."""
+    db = tmp_path / "v3.sqlite"
+    conn = open_connection(db)
+    # Apply migrations up to v3 by running ensure_schema after temporarily
+    # capping at 3, then bump back and run the v3 → v4 step.
+    import ccforensics.index as idx_mod
+
+    real_version = idx_mod.CURRENT_SCHEMA_VERSION
+    idx_mod.CURRENT_SCHEMA_VERSION = 3
+    try:
+        ensure_schema(conn)
+    finally:
+        idx_mod.CURRENT_SCHEMA_VERSION = real_version
+
+    conn.execute(
+        """INSERT INTO files (path, mtime_ns, size, session_id, kind, last_parsed_at)
+           VALUES ('/x.jsonl', 999999, 100, 's', 'main', 0)"""
+    )
+    conn.commit()
+
+    ensure_schema(conn)
+
+    row = conn.execute("SELECT mtime_ns FROM files WHERE path='/x.jsonl'").fetchone()
+    assert row[0] == 0, "v4 migration must reset mtime_ns to force cold backfill"
+
+
 def test_schema_v3_cold_backfill_resets_file_mtime(tmp_path: Path) -> None:
     """v2 → v3 migration MUST reset files.mtime_ns to force re-reconcile so
     message_tool_uses and service_tier populate from existing files."""
+    import ccforensics.index as idx_mod
     from ccforensics.index import ensure_schema, open_connection
 
     # Build a v2 db manually then migrate.
@@ -122,7 +187,15 @@ def test_schema_v3_cold_backfill_resets_file_mtime(tmp_path: Path) -> None:
     conn.execute("PRAGMA user_version = 2")
     conn.commit()
 
-    ensure_schema(conn)
+    # Isolate v2 → v3 migration boundary: synthetic v2 schema lacks tables
+    # touched by later migrations (e.g., session_rollups for v4). Cap to 3
+    # so this test verifies only the v2 → v3 cold-backfill behavior.
+    real_version = idx_mod.CURRENT_SCHEMA_VERSION
+    idx_mod.CURRENT_SCHEMA_VERSION = 3
+    try:
+        ensure_schema(conn)
+    finally:
+        idx_mod.CURRENT_SCHEMA_VERSION = real_version
 
     row = conn.execute("SELECT mtime_ns FROM files WHERE path='/x.jsonl'").fetchone()
     assert row[0] == 0, "v3 migration must reset mtime_ns to force cold backfill"
