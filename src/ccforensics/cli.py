@@ -633,5 +633,146 @@ def index_rebuild(force: bool, yes: bool) -> None:
     )
 
 
+@main.command()
+@click.option("--days", type=int, default=30, show_default=True, help="Scope to last N days.")
+@click.option("--since", help="Date filter: YYYY-MM-DD | Nd | today | yesterday")
+@click.option("--until", help="Date filter: YYYY-MM-DD | Nd | today | yesterday")
+@click.option(
+    "--session",
+    "session_spec",
+    default=None,
+    help="Drill into one session by id / prefix / path (bypasses score gates).",
+)
+@click.option(
+    "--min-score",
+    type=float,
+    default=0.40,
+    show_default=True,
+    help="Composite-score threshold for flagging.",
+)
+@click.option(
+    "--min-signals",
+    type=int,
+    default=2,
+    show_default=True,
+    help="Require at least N distinct signal types.",
+)
+@click.option(
+    "--top",
+    type=int,
+    default=25,
+    show_default=True,
+    help="Keep top N flagged sessions.",
+)
+@click.option(
+    "--sort",
+    type=click.Choice(["score", "observed_cost", "est_savings_mid", "est_savings_high"]),
+    default="score",
+    show_default=True,
+    help="Sort key for the result rows.",
+)
+@click.option(
+    "--evidence",
+    is_flag=True,
+    help="Expand per-session signal evidence underneath each row.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON to stdout.")
+@click.option("--csv", "as_csv", is_flag=True, help="Emit CSV to stdout.")
+@click.option(
+    "--no-refresh",
+    is_flag=True,
+    help="Skip reconciliation and pricing fetch.",
+)
+def thrash(
+    days: int,
+    since: str | None,
+    until: str | None,
+    session_spec: str | None,
+    min_score: float,
+    min_signals: int,
+    top: int,
+    sort: str,
+    evidence: bool,
+    as_json: bool,
+    as_csv: bool,
+    no_refresh: bool,
+) -> None:
+    """Detect Sonnet/Haiku sessions where higher-tier model would have been cheaper.
+
+    Caveats: thresholds are intuition-tuned (validation spike deferred —
+    see docs/specs/2026-05-05-thrash-detection-design.md §6).
+    Counterfactual is "what user experienced when they did escalate",
+    not "what would have happened from a cold-start Opus session" —
+    cache-priming + selection bias may understate Opus cost. The
+    user_correction signal regex is English-only and silently misses
+    other-language corrections.
+    """
+    if as_json and as_csv:
+        raise click.UsageError("--json and --csv are mutually exclusive")
+
+    from .report.thrash import (
+        compute_headline,
+        query_flagged_sessions,
+        render_text,
+    )
+    from .report.thrash import (
+        render_csv as render_thrash_csv,
+    )
+    from .report.thrash import (
+        render_json as render_thrash_json,
+    )
+    from .thrash_calibration import build_calibration_table
+
+    conn = _open_index()
+    if not no_refresh:
+        pricing = _load_pricing()
+        reconcile_projects_dir(conn, claude_projects_dir(), pricing)
+        conn.commit()
+
+    # Date scope: explicit --since/--until override --days.
+    if since or until:
+        since_dt = parse_since(since) if since else None
+        until_dt = parse_until(until) if until else None
+        scope_label = f"{since or 'beginning'} → {until or 'now'}"
+    else:
+        since_dt = parse_since(f"{days}d")
+        until_dt = None
+        scope_label = f"last {days} days"
+
+    session_id_filter: str | None = None
+    if session_spec:
+        session_id_filter = _resolve_session_id_or_exit(session_spec, conn)
+        scope_label = f"session {session_id_filter[:8]}"
+
+    calibration_table = build_calibration_table(conn)
+    sessions = query_flagged_sessions(
+        conn,
+        since=since_dt,
+        until=until_dt,
+        min_score=min_score,
+        min_signals=min_signals,
+        top=top,
+        sort=sort,  # type: ignore[arg-type]
+        calibration_table=calibration_table,
+        session_id_filter=session_id_filter,
+    )
+    headline = compute_headline(
+        sessions, scope_label=scope_label, calibration_table=calibration_table
+    )
+
+    if as_json:
+        sys.stdout.write(render_thrash_json(headline, sessions))
+        sys.stdout.write("\n")
+        return
+    if as_csv:
+        sys.stdout.write(render_thrash_csv(sessions))
+        return
+
+    console = Console()
+    console.print(
+        render_text(headline, sessions, show_evidence=evidence or bool(session_id_filter))
+    )
+
+
 if __name__ == "__main__":
     main()
