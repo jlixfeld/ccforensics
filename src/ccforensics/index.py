@@ -19,6 +19,7 @@ from .models import TranscriptEntry, load_meta_json
 from .paths import claude_home, claude_plugins_cache_dir, decode_project_dirname
 from .registry import populate_registry
 from .skills import build_resolver_from_paths, populate_from_session_files
+from .thrash import populate_session_signals
 from .tree import discover_spawn
 
 logger = logging.getLogger("ccforensics.index")
@@ -916,6 +917,37 @@ def _recompute_session_aggregates(
             sid,
             exc_info=True,
         )
+    try:
+        _populate_thrash_for_session(conn, sid)
+    except (OSError, sqlite3.Error):
+        logger.warning(
+            "populate_thrash failed for session_id=%s; skipping",
+            sid,
+            exc_info=True,
+        )
+
+
+def _populate_thrash_for_session(conn: sqlite3.Connection, session_id: str) -> None:
+    """Re-parse the session's main file, run thrash signal extractors,
+    and write results to ``session_signals`` + ``session_rollups``.
+
+    Subagent-files are intentionally NOT included in T4 — subagent
+    escalation is added in T6 alongside the escalation detector.
+    Baseline (BaselineStats for trajectory_length_zscore) is built by
+    T7 calibration; for now we pass None so the extractor returns [].
+    """
+    row = conn.execute(
+        "SELECT path FROM files WHERE session_id=? AND kind='main' LIMIT 1",
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        return
+    main_path = Path(row[0])
+    try:
+        result = parse_file(main_path)
+    except FileNotFoundError:
+        return
+    populate_session_signals(conn, session_id, list(result.entries), baseline=None)
 
 
 @dataclass

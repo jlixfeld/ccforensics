@@ -947,3 +947,147 @@ def detect_trajectory_length_zscore(
             },
         )
     ]
+
+
+# ---------- T4: composite scorer + orchestrator ----------
+
+
+WEIGHTS: dict[str, float] = {
+    "novelty_window": 0.22,
+    "test_regression": 0.18,
+    "repeated_edit": 0.15,
+    "repeated_error": 0.12,
+    "placeholder_emit": 0.10,
+    "user_correction": 0.08,
+    "trajectory_length_zscore": 0.06,
+    "tool_arg_churn": 0.05,
+    "turn_cost_acceleration": 0.02,
+    "session_abandoned": 0.02,
+}
+
+THRESHOLDS: dict[str, int] = {
+    "novelty_window": 6,
+    "test_regression": 1,
+    "repeated_edit": 4,
+    "repeated_error": 3,
+    "placeholder_emit": 2,
+    "user_correction": 2,
+    "trajectory_length_zscore": 1,
+    "tool_arg_churn": 3,
+    "turn_cost_acceleration": 1,
+    "session_abandoned": 20,
+}
+
+FLAG_THRESHOLD = 0.40
+MIN_FIRED_SIGNAL_TYPES = 2
+
+
+def compute_thrash_score(signals: list[Signal]) -> float:
+    """Composite in [0.0, 1.0]. Each fired signal contributes its full
+    weight; counts beyond the per-signal threshold add a log-scaled
+    bonus capped at 1.5x. Sessions with fewer than
+    ``MIN_FIRED_SIGNAL_TYPES`` distinct signals score below
+    ``FLAG_THRESHOLD`` by construction (single-signal cap = 0.22 x 1.5
+    = 0.33; well below 0.40 flag gate).
+    """
+    fired = {s.signal_type: s.count for s in signals}
+    score = 0.0
+    for sig_type, weight in WEIGHTS.items():
+        if sig_type not in fired:
+            continue
+        count = max(1, fired[sig_type])
+        threshold = THRESHOLDS.get(sig_type, 1)
+        bonus = min(0.5, 0.1 * math.log2(max(1.0, count / threshold)))
+        score += weight * (1.0 + bonus)
+    return min(1.0, max(0.0, score))
+
+
+def is_flagged(signals: list[Signal]) -> bool:
+    """Session must fire >= MIN_FIRED_SIGNAL_TYPES AND score >=
+    FLAG_THRESHOLD. Both gates are required — composite score alone
+    can be reached by stacking bonus on a single signal."""
+    if len({s.signal_type for s in signals}) < MIN_FIRED_SIGNAL_TYPES:
+        return False
+    return compute_thrash_score(signals) >= FLAG_THRESHOLD
+
+
+def extract_all_signals(
+    entries: list[TranscriptEntry],
+    baseline: BaselineStats | None = None,
+) -> list[Signal]:
+    """Run every extractor and concatenate the results. Pure / no I/O.
+    Caller is responsible for filtering via ``session_eligible`` before
+    calling — this function does NOT short-circuit on filter."""
+    signals: list[Signal] = []
+    signals.extend(detect_placeholder_emit(entries))
+    signals.extend(detect_repeated_edit(entries))
+    signals.extend(detect_repeated_error(entries))
+    signals.extend(detect_tool_arg_churn(entries))
+    signals.extend(detect_user_correction(entries))
+    signals.extend(detect_session_abandoned(entries))
+    signals.extend(detect_novelty_window(entries))
+    signals.extend(detect_turn_cost_acceleration(entries))
+    signals.extend(detect_test_regression(entries))
+    signals.extend(detect_trajectory_length_zscore(entries, baseline))
+    return signals
+
+
+def populate_session_signals(
+    conn: Any,
+    session_id: str,
+    entries: list[TranscriptEntry],
+    baseline: BaselineStats | None = None,
+) -> float | None:
+    """Write per-session thrash signals + composite score to the index.
+
+    Returns the computed thrash_score, or None when the session was
+    filtered out (Opus primary, fewer than MIN_SESSION_TURNS, etc.).
+
+    Writes:
+    - ``session_signals`` — one row per fired signal_type (deletes
+      stale rows for this session first).
+    - ``session_rollups`` — updates every bucket row for this session
+      with the same ``thrash_score`` + ``thrash_score_version`` so
+      downstream queries can read the score from any rollup row.
+
+    Filtered sessions get ``thrash_score = NULL`` written to all
+    rollup rows (explicitly cleared so prior scores don't linger after
+    a filter-criterion change).
+    """
+    conn.execute("DELETE FROM session_signals WHERE session_id = ?", (session_id,))
+
+    if not session_eligible(entries):
+        conn.execute(
+            """UPDATE session_rollups
+               SET thrash_score = NULL,
+                   thrash_score_version = NULL
+               WHERE session_id = ?""",
+            (session_id,),
+        )
+        return None
+
+    signals = extract_all_signals(entries, baseline)
+    score = compute_thrash_score(signals)
+
+    for sig in signals:
+        conn.execute(
+            """INSERT INTO session_signals
+               (session_id, signal_type, count, evidence, signal_version)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                session_id,
+                sig.signal_type,
+                sig.count,
+                json.dumps(sig.evidence, sort_keys=True),
+                SIGNAL_VERSION,
+            ),
+        )
+
+    conn.execute(
+        """UPDATE session_rollups
+           SET thrash_score = ?,
+               thrash_score_version = ?
+           WHERE session_id = ?""",
+        (score, SIGNAL_VERSION, session_id),
+    )
+    return score
