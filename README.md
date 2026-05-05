@@ -47,6 +47,9 @@ ccforensics plugins
 
 # Last 30 days aggregated per project
 ccforensics aggregate --since 30d --group-by project
+
+# Per-tool / per-MCP-server spend (last 30 days)
+ccforensics tools --since 30d
 ```
 
 ## Commands
@@ -114,6 +117,67 @@ ccforensics index rebuild [--force] [--yes]   # incremental by default; --force 
 ccforensics index stats                        # row counts + last-refresh
 ```
 
+## Sample workflows
+
+The easiest way to use ccforensics is to ask Claude Code questions directly. Claude will run the right commands and explain the output.
+
+### "Tell me some interesting things about my Claude Code usage"
+
+> *"Tell me some interesting things about my Claude Code usage"*
+
+A good starting point. Claude will pull the plugin rollup, model breakdown, aggregate totals, and cache stats, then surface patterns worth acting on — which plugins are expensive relative to how often you use them, which models are running where, whether your cache is working, and what your spend trajectory looks like over time.
+
+### "Where did my last expensive session's $109 go?"
+
+> *"Break down where my most expensive recent session's cost went"*
+
+Claude will find the session and run `session show`, which renders five blocks:
+
+1. **Session header** — duration, turns, total cost, models seen, compaction count.
+2. **Cost by bucket** — `main` vs `subagent:<type>` vs `auto-compact` vs `unattributed`. This is the most important table. If `subagent:pr-review-toolkit:code-reviewer` is `$78` of the `$109`, the PR review tool earned its keep — or didn't.
+3. **Cost by plugin** — same numbers re-rolled up to the owning plugin. The bottom line per plugin install.
+4. **Cost by model** — separates Opus from Sonnet from Haiku spend. A subagent running on Opus that should be on Sonnet is visible here.
+5. **Skill activations** — every skill the session loaded, when, by which channel, content size in bytes.
+
+### "Which plugin should I uninstall?"
+
+> *"Show me which plugins I'm paying for but not using"* or *"Give me a plugin cost leaderboard for the last 90 days"*
+
+The plugin rollup reads as a leaderboard: cost, sessions touched, top subagent type, top skill, first/last seen. Three patterns to look for:
+
+- **High cost, low session count** — one runaway session blew up the average.
+- **High cost, high session count, recent** — actively used and expensive. Worth keeping if the work it does is something you'd happily pay $X per task for.
+- **Low cost, last seen weeks ago** — uninstall candidate. The plugin is loaded but you stopped using it.
+
+### "Are my MCP servers paying for themselves?"
+
+> *"Which of my MCP servers are costing me the most?"* or *"Break down my MCP tool spend for the last 30 days"*
+
+The tools report collapses every `mcp__<server>__*` tool to one row per server. `Isolated $` is exact; `Shared $≤` is an upper bound — never sum the Shared column across rows (see the `tools` command reference above for the full accounting definition).
+
+Ask Claude to expand per-tool detail if a server looks expensive: a server with one heavy tool and ten near-zero ones is a candidate for trimming unused tool definitions — Claude Code injects every tool's schema into context on every turn, so unused tools cost real tokens.
+
+### "Is my prompt cache working?"
+
+> *"How efficient is my prompt cache?"* or *"Is caching saving me money?"*
+
+The cache footer appears on `session show` and `aggregate` output:
+
+```
+Cache: 12.4M read · 1.2M created · 87.3% efficiency · saved $3.42
+```
+
+- **`read`** — tokens served from cache. High = good, prefixes are stable.
+- **`created`** — tokens written into cache. High-create-low-read means you're paying the write premium without amortizing it.
+- **`efficiency`** — **cost-weighted** (cache reads cost ~10× less than input, so token-ratio efficiency would overstate savings).
+- **`saved`** — actual dollars saved vs running uncached.
+
+### "What drove my spend last week?"
+
+> *"What drove my Claude Code spend last week?"* or *"Show me a cost breakdown by day/project/model for the last 7 days"*
+
+Claude will run `aggregate` grouped by day, project, and model, then `plugins`, and surface the outlier. Day groups show the spike; project groups isolate the culprit; model groups separate Opus blowups from Sonnet workhorses; plugin rollup names who owned the cost.
+
 ## Date formats
 
 All `--since` / `--until` accept:
@@ -150,13 +214,7 @@ Pricing is pulled from LiteLLM's model pricing data once per 24h, cached on disk
 
 ### Cache efficiency
 
-`session show` and `aggregate` surface a cache footer line in scope:
-
-```
-Cache: 12.4M read · 1.2M created · 87.3% efficiency · saved $3.42
-```
-
-Both numbers are exact arithmetic over stored token counts and per-model pricing. `efficiency` is **cost-weighted** — `cache_read` tokens cost ~10× less than `input` tokens, so a token-ratio efficiency overstates dollar savings. `saved` is `cache_read × (input_price − read_price)` summed per model.
+`session show` and `aggregate` surface a cache footer line — see "Is my prompt cache working?" in the sample workflows above for how to interpret it. Both numbers are exact arithmetic over stored token counts and per-model pricing.
 
 ## Known limitations
 
