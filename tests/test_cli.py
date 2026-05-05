@@ -42,9 +42,9 @@ def test_thrash_no_refresh_runs_against_empty_index(
 ) -> None:
     """A fresh index w/ no sessions should print "No flagged sessions"
     rather than crash."""
-    from ccforensics import paths as paths_mod
+    from ccforensics import cli as cli_mod
 
-    monkeypatch.setattr(paths_mod, "ccforensics_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(cli_mod, "ccforensics_cache_dir", lambda: tmp_path)
     runner = CliRunner()
     result = runner.invoke(main, ["thrash", "--no-refresh"])
     assert result.exit_code == 0, result.output
@@ -54,9 +54,9 @@ def test_thrash_no_refresh_runs_against_empty_index(
 def test_thrash_json_emits_valid_json_against_empty_index(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from ccforensics import paths as paths_mod
+    from ccforensics import cli as cli_mod
 
-    monkeypatch.setattr(paths_mod, "ccforensics_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(cli_mod, "ccforensics_cache_dir", lambda: tmp_path)
     runner = CliRunner()
     result = runner.invoke(main, ["thrash", "--no-refresh", "--json"])
     assert result.exit_code == 0, result.output
@@ -68,9 +68,9 @@ def test_thrash_json_emits_valid_json_against_empty_index(
 def test_thrash_csv_emits_header_against_empty_index(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from ccforensics import paths as paths_mod
+    from ccforensics import cli as cli_mod
 
-    monkeypatch.setattr(paths_mod, "ccforensics_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(cli_mod, "ccforensics_cache_dir", lambda: tmp_path)
     runner = CliRunner()
     result = runner.invoke(main, ["thrash", "--no-refresh", "--csv"])
     assert result.exit_code == 0, result.output
@@ -83,9 +83,9 @@ def test_thrash_csv_emits_header_against_empty_index(
 def test_thrash_json_csv_mutually_exclusive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from ccforensics import paths as paths_mod
+    from ccforensics import cli as cli_mod
 
-    monkeypatch.setattr(paths_mod, "ccforensics_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(cli_mod, "ccforensics_cache_dir", lambda: tmp_path)
     runner = CliRunner()
     result = runner.invoke(main, ["thrash", "--no-refresh", "--json", "--csv"])
     assert result.exit_code != 0
@@ -96,7 +96,7 @@ def test_version_flag() -> None:
     runner = CliRunner()
     result = runner.invoke(main, ["--version"])
     assert result.exit_code == 0
-    assert "0.1.0" in result.output
+    assert "0.2.0" in result.output
 
 
 def test_verbose_flag_is_accepted() -> None:

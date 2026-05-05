@@ -45,7 +45,7 @@ def _seed_session(
     cost_usd: float = 1.00,
     turn_count: int = 50,
     duration_s: int = 600,
-    last_active_at: int = 1_700_000_000_000,
+    last_active_at: int = 1_700_000_000,
     thrash_score: float = 0.55,
     primary_model: str = "claude-sonnet-4-6",
     signals: list[tuple[str, int, dict]] | None = None,

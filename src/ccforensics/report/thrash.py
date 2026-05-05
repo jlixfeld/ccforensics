@@ -77,10 +77,10 @@ def _scope_clause(since: datetime | None, until: datetime | None) -> tuple[str, 
     params: list[Any] = []
     if since is not None:
         fragments.append("ss.last_active_at >= ?")
-        params.append(int(since.timestamp() * 1000))
+        params.append(int(since.timestamp()))
     if until is not None:
         fragments.append("ss.last_active_at <= ?")
-        params.append(int(until.timestamp() * 1000))
+        params.append(int(until.timestamp()))
     if not fragments:
         return "", []
     return "AND " + " AND ".join(fragments), params
