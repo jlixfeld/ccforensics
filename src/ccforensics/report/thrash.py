@@ -70,20 +70,42 @@ class HeadlineAggregate:
 # ---------- query ----------
 
 
-def _scope_clause(since: datetime | None, until: datetime | None) -> tuple[str, list[Any]]:
-    """Build a SQL ``WHERE`` fragment + parameter list scoped on
-    ``session_summaries.last_active_at``."""
-    fragments: list[str] = []
-    params: list[Any] = []
-    if since is not None:
-        fragments.append("ss.last_active_at >= ?")
-        params.append(int(since.timestamp()))
-    if until is not None:
-        fragments.append("ss.last_active_at <= ?")
-        params.append(int(until.timestamp()))
-    if not fragments:
-        return "", []
-    return "AND " + " AND ".join(fragments), params
+def _scope_params(
+    since: datetime | None,
+    until: datetime | None,
+    session_id_filter: str | None,
+) -> tuple[int | None, int | None, str | None]:
+    """Return the three scope-bind parameters consumed by
+    ``_FLAGGED_SESSIONS_SQL``. The query uses NULL-guarded conditions
+    (``? IS NULL OR ...``) so each parameter is either a real bound
+    value or NULL meaning "no filter on this dimension"."""
+    return (
+        int(since.timestamp()) if since is not None else None,
+        int(until.timestamp()) if until is not None else None,
+        session_id_filter,
+    )
+
+
+_FLAGGED_SESSIONS_SQL = (
+    "SELECT "
+    "ss.session_id, "
+    "ss.summary_text, "
+    "COALESCE(ss.total_cost_usd, 0.0) AS observed_cost_usd, "
+    "ss.turn_count, "
+    "ss.duration_s, "
+    "ss.last_active_at, "
+    "(SELECT MAX(thrash_score) FROM session_rollups "
+    " WHERE session_id = ss.session_id) AS thrash_score, "
+    "(SELECT MAX(thrash_score_version) FROM session_rollups "
+    " WHERE session_id = ss.session_id) AS thrash_score_version, "
+    "(SELECT escalation_event FROM session_rollups "
+    " WHERE session_id = ss.session_id "
+    "   AND escalation_event IS NOT NULL LIMIT 1) AS escalation_event_json "
+    "FROM session_summaries ss "
+    "WHERE (? IS NULL OR ss.last_active_at >= ?) "
+    "  AND (? IS NULL OR ss.last_active_at <= ?) "
+    "  AND (? IS NULL OR ss.session_id = ?)"
+)
 
 
 def query_flagged_sessions(
@@ -109,36 +131,20 @@ def query_flagged_sessions(
     if calibration_table is None:
         calibration_table = build_calibration_table(conn)
 
-    scope_sql, scope_params = _scope_clause(since, until)
-    if session_id_filter is not None:
-        scope_sql = "AND ss.session_id = ?"
-        scope_params = [session_id_filter]
-
-    # ``scope_sql`` is composed from a closed set of literal fragments
-    # in ``_scope_clause`` — no user input is ever interpolated. The SQL
-    # body below is constant; the only variable piece is the trailing
-    # WHERE-fragment append. Concatenation (rather than f-string) keeps
-    # the static analyzer's SQL-injection rule from flagging this on
-    # false-positive grounds; user-supplied values still flow through
-    # parameterized placeholders via ``scope_params``.
-    base_sql = (
-        "SELECT "
-        "ss.session_id, "
-        "ss.summary_text, "
-        "COALESCE(ss.total_cost_usd, 0.0) AS observed_cost_usd, "
-        "ss.turn_count, "
-        "ss.duration_s, "
-        "ss.last_active_at, "
-        "(SELECT MAX(thrash_score) FROM session_rollups "
-        " WHERE session_id = ss.session_id) AS thrash_score, "
-        "(SELECT MAX(thrash_score_version) FROM session_rollups "
-        " WHERE session_id = ss.session_id) AS thrash_score_version, "
-        "(SELECT escalation_event FROM session_rollups "
-        " WHERE session_id = ss.session_id "
-        "   AND escalation_event IS NOT NULL LIMIT 1) AS escalation_event_json "
-        "FROM session_summaries ss WHERE 1=1 "
-    )
-    rows = conn.execute(base_sql + scope_sql, scope_params).fetchall()
+    # Each filter dimension uses a ``? IS NULL OR ...`` NULL-guard so
+    # the SQL body is a single literal string (no f-string / no concat
+    # of variable fragments). User-supplied values still flow through
+    # parameterized ``?`` placeholders. NULL means "no filter on this
+    # dimension"; ``--session ID`` flips the session_id filter on and
+    # leaves the others NULL since drill-in bypasses the date scope.
+    since_p, until_p, sid_p = _scope_params(since, until, session_id_filter)
+    if sid_p is not None:
+        since_p = None
+        until_p = None
+    rows = conn.execute(
+        _FLAGGED_SESSIONS_SQL,
+        (since_p, since_p, until_p, until_p, sid_p, sid_p),
+    ).fetchall()
 
     out: list[FlaggedSession] = []
     for (
