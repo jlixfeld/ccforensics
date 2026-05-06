@@ -22,14 +22,81 @@ def test_help_prints_command_tree() -> None:
     assert "aggregate" in result.output
     assert "plugins" in result.output
     assert "tools" in result.output
+    assert "thrash" in result.output
     assert "index" in result.output
+
+
+def test_thrash_help_documents_caveats() -> None:
+    runner = CliRunner()
+    result = runner.invoke(main, ["thrash", "--help"])
+    assert result.exit_code == 0
+    assert "thrash" in result.output.lower()
+    assert "Caveats" in result.output
+    assert "--evidence" in result.output
+    assert "--session" in result.output
+    assert "--min-signals" in result.output
+
+
+def test_thrash_no_refresh_runs_against_empty_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh index w/ no sessions should print "No flagged sessions"
+    rather than crash."""
+    from ccforensics import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "ccforensics_cache_dir", lambda: tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(main, ["thrash", "--no-refresh"])
+    assert result.exit_code == 0, result.output
+    assert "No flagged sessions in scope" in result.output
+
+
+def test_thrash_json_emits_valid_json_against_empty_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ccforensics import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "ccforensics_cache_dir", lambda: tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(main, ["thrash", "--no-refresh", "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["headline"]["n_flagged"] == 0
+    assert payload["rows"] == []
+
+
+def test_thrash_csv_emits_header_against_empty_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ccforensics import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "ccforensics_cache_dir", lambda: tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(main, ["thrash", "--no-refresh", "--csv"])
+    assert result.exit_code == 0, result.output
+    reader = csv.reader(io.StringIO(result.output))
+    header = next(reader)
+    assert "session_id" in header
+    assert "thrash_score" in header
+
+
+def test_thrash_json_csv_mutually_exclusive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ccforensics import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "ccforensics_cache_dir", lambda: tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(main, ["thrash", "--no-refresh", "--json", "--csv"])
+    assert result.exit_code != 0
+    assert "mutually exclusive" in result.output
 
 
 def test_version_flag() -> None:
     runner = CliRunner()
     result = runner.invoke(main, ["--version"])
     assert result.exit_code == 0
-    assert "0.1.0" in result.output
+    assert "0.2.0" in result.output
 
 
 def test_verbose_flag_is_accepted() -> None:

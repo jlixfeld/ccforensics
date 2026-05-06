@@ -1,17 +1,26 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.0] — 2026-05-05
 
 ### Added
 
+- `ccforensics thrash` — model-misuse detection for Sonnet/Haiku sessions where a higher-tier model would plausibly have been cheaper. Ten typed signal extractors (novelty_window, test_regression, repeated_edit, repeated_error, placeholder_emit, user_correction, trajectory_length_zscore, tool_arg_churn, turn_cost_acceleration, session_abandoned) plus a composite scorer. Both gates required to flag (composite score >= 0.40 AND >= 2 distinct signal types). Counterfactual cost ranges anchored on observed user-driven escalation events (model_switch, subagent_dispatch); auto_mode events tagged but excluded from calibration. Confidence tiers (low/mid/high) narrow the multiplicative range as more events accumulate; per-session sanity gate suppresses implausible estimates. `--evidence` expands signal payloads, `--session ID` drills into a specific session bypassing flag gates, `--json` / `--csv` for export.
 - `ccforensics tools` — per-tool / per-MCP-server spend with honest isolated/shared accounting. `--detail` drills into individual MCP tools; `--top` clamps; `--sort {isolated_cost,invocations,shared_exposure}` sorts. Isolated cost is exact; shared exposure is an upper bound and labeled as such.
 - Cache efficiency + cache savings on `session show` and `aggregate` — cost-weighted ratio plus `saved $X.XX` line, both exact arithmetic over stored values.
 - `service_tier` capture on every message (precursor to fast-mode pricing). `session show` and `aggregate` render a breakdown line only when a non-standard tier is present.
 
 ### Changed
 
+- Schema migrated v3 → v4 (adds `session_rollups.thrash_score`, `session_rollups.thrash_score_version`, `session_rollups.escalation_event` JSON, plus new `session_signals` table keyed by `(session_id, signal_type)`). First command after upgrade triggers a one-shot full re-reconcile to cold-backfill the new columns/table.
 - Schema migrated v2 → v3 (adds `messages.service_tier` and a new `message_tool_uses` table). First command after upgrade triggers a one-shot full re-reconcile to cold-backfill the new columns/table.
 - `aggregate --json` output is now an envelope `{rows: [...], cache_*: ..., service_tier_breakdown: {...}}` rather than a bare list of rows. Existing JSON consumers must read `payload["rows"]` instead of indexing the top-level array.
+
+### Caveats / known limitations (thrash)
+
+- Thresholds + signal weights are intuition-tuned. The labeled-set validation spike (precision/recall against hand-labeled corpus) is deferred to a follow-up — see `docs/specs/2026-05-05-thrash-detection-design.md` §6.
+- Counterfactual is "what user experienced when they did escalate", not "what would have happened on a cold-start Opus session". Cache priming + selection bias may understate Opus cost on equivalent fresh sessions.
+- `user_correction` regex is English-only; non-English correction signals silently miss.
+- Signal version recorded per row (`session_signals.signal_version` + `session_rollups.thrash_score_version`) so future threshold changes can detect drift.
 
 ## [0.1.0] — unreleased
 

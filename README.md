@@ -110,6 +110,44 @@ Default render is server-rolled — every `mcp__<server>__*` tool collapses to a
 
 `Isolated $` is exact (turns where this tool was the only one emitted). `Shared $≤` is an upper bound (turns where this tool ran alongside others; the same turn's cost appears under each sibling — never sum across rows).
 
+### `thrash`
+
+Detect Sonnet/Haiku sessions where a higher-tier model would plausibly have been cheaper, anchored on observed user-driven escalation events.
+
+```
+ccforensics thrash [--days N] [--since D] [--until D] [--session SPEC]
+                   [--min-score F] [--min-signals N] [--top N]
+                   [--sort score|observed_cost|est_savings_mid|est_savings_high]
+                   [--evidence] [--json | --csv] [--no-refresh]
+```
+
+Default scope is the last 30 days. Default sort is composite thrash score (highest first). Both gates apply: `thrash_score >= --min-score` (default 0.40) AND distinct fired signal types `>= --min-signals` (default 2).
+
+Ten typed signals fire per spec §3 (`docs/specs/2026-05-05-thrash-detection-design.md`):
+
+- `novelty_window` — N consecutive turns w/ no new file/error/tool + high text-similarity (industry `no_progress_steps` pattern)
+- `test_regression` — pytest/jest/cargo/go/mvn/make test fail count rises after an Edit (SWE-bench `fail2pass` framework)
+- `repeated_edit` — same file edited >= 4x w/ >= 2 distinct errors observed during the edit window
+- `repeated_error` — same normalized error excerpt surfaces in >= 3 distinct turns
+- `placeholder_emit` — TODO / FIXME / NotImplementedError / stub markers in Edit / Write inputs
+- `user_correction` — short corrective user message ("no", "still broken", "try again", ...) fired >= 2 times (English-only)
+- `trajectory_length_zscore` — session length anomalously long compared to the user's per-model baseline
+- `tool_arg_churn` — same `(tool, args)` AND same result repeated >= 3 times (flake-retry suppressed)
+- `turn_cost_acceleration` — output-tokens-per-turn slope rising w/ r² >= 0.55
+- `session_abandoned` — long session ending without a resolution marker
+
+`--evidence` expands per-session signal payloads w/ a one-line summary per signal_type plus the counterfactual breakdown and the escalation_event metadata.
+
+`--session ID` drills into a specific session regardless of flag status — useful for investigating something you remember as bad. Implies `--evidence`.
+
+**Counterfactual cost** is anchored on observed model-switch + subagent-dispatch escalation events from your corpus. Confidence tiers narrow the multiplicative range as more events accumulate (low: <15 events → 0.33x-3.0x; mid: 15-49 → 0.5x-2.0x; high: 50+ → 0.67x-1.5x). Below 10 events the counterfactual is suppressed entirely. Per-session sanity gate suppresses the dollar comparison when the estimate dwarfs observed (>10x or <0.1x).
+
+**Caveats** (rendered in the report footer + `--help`):
+
+- Thresholds are intuition-tuned; the labeled-set validation spike is deferred (see spec §6).
+- Counterfactual is "what user experienced when they did escalate", not "what would have happened on a cold-start Opus session" — cache-priming + selection bias may understate Opus cost on equivalent fresh sessions.
+- `user_correction` regex is English-only; non-English corrections silently miss.
+
 ### `index rebuild` / `index stats`
 
 ```
@@ -177,6 +215,12 @@ Cache: 12.4M read · 1.2M created · 87.3% efficiency · saved $3.42
 > *"What drove my Claude Code spend last week?"* or *"Show me a cost breakdown by day/project/model for the last 7 days"*
 
 Claude will run `aggregate` grouped by day, project, and model, then `plugins`, and surface the outlier. Day groups show the spike; project groups isolate the culprit; model groups separate Opus blowups from Sonnet workhorses; plugin rollup names who owned the cost.
+
+### "Did Sonnet thrash on something where Opus would've been cheaper?"
+
+> *"Show me Sonnet sessions where I should have escalated to Opus"* or *"Are there sessions where I burned cost looping on something Opus would have nailed?"*
+
+Claude will run `ccforensics thrash --evidence` and read the per-session breakdown. Each flagged session shows which signals fired (e.g. `repeated_edit on src/parser.py — 7 edits across turns 12-31`, `placeholder_emit on 3 turns`) and the counterfactual cost range anchored on prior escalation events from your own corpus. The flagged set requires both the composite score gate AND >= 2 distinct signal types — single-signal sessions never flag, by construction. Counterfactual ranges narrow as more escalation events accumulate; below 10 events the dollar comparison is suppressed and only detection surfaces.
 
 ## Date formats
 
