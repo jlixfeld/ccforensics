@@ -341,7 +341,9 @@ def _aggregate_cache_metrics(
         SELECT m.model,
                COALESCE(SUM(m.input_tokens), 0),
                COALESCE(SUM(m.cache_creation), 0),
-               COALESCE(SUM(m.cache_read), 0)
+               COALESCE(SUM(m.cache_read), 0),
+               COALESCE(SUM(m.cache_creation_1h), 0),
+               COALESCE(SUM(m.cache_creation_5m), 0)
           FROM messages m
           JOIN session_summaries ss ON ss.session_id = m.session_id
          WHERE {" AND ".join(where)}
@@ -354,8 +356,10 @@ def _aggregate_cache_metrics(
             input_tokens=int(i or 0),
             cache_creation=int(cc or 0),
             cache_read=int(cr or 0),
+            cache_creation_1h=int(cc1h or 0),
+            cache_creation_5m=int(cc5m or 0),
         )
-        for (m, i, cc, cr) in rows_data
+        for (m, i, cc, cr, cc1h, cc5m) in rows_data
     ]
     cache_read_total = sum(r.cache_read for r in rows)
     cache_create_total = sum(r.cache_creation for r in rows)

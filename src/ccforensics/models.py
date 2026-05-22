@@ -11,6 +11,22 @@ from pydantic import BaseModel, ConfigDict, Field
 logger = logging.getLogger("ccforensics.models")
 
 
+class CacheCreationDetail(BaseModel):
+    """TTL split of cache-creation tokens emitted in ``usage.cache_creation``.
+
+    Present on transcripts written by Claude Code versions that send the
+    1h-cache beta header (``ENABLE_PROMPT_CACHING_1H`` — default on Max
+    subscriptions since 2.1.108). The sum equals ``cache_creation_input_tokens``
+    when both sides are present. Older transcripts omit this sub-object and
+    only carry the top-level total — treated as all-5m for back-compat.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    ephemeral_1h_input_tokens: int | None = None
+    ephemeral_5m_input_tokens: int | None = None
+
+
 class UsageStats(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -19,6 +35,10 @@ class UsageStats(BaseModel):
     cache_creation_input_tokens: int | None = None
     cache_read_input_tokens: int | None = None
     service_tier: str | None = None
+    cache_creation: CacheCreationDetail | None = None
+    # ``"standard"`` | ``"fast"``. Fast-mode pricing not yet in LiteLLM —
+    # captured here as a precursor; pricing branch deferred until rates land.
+    speed: str | None = None
 
 
 class ContentBlock(BaseModel):

@@ -64,7 +64,7 @@ def _is_pure_hook_injection(text: str) -> bool:
     return _HOOK_INJECTION_MARKER in text and len(text) > 500
 
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 MIGRATIONS: list[list[str]] = [
     [
@@ -255,6 +255,24 @@ MIGRATIONS: list[list[str]] = [
             PRIMARY KEY (session_id, signal_type)
         )""",
         "CREATE INDEX idx_signals_session ON session_signals(session_id)",
+        "UPDATE files SET mtime_ns = 0",
+    ],
+    # v4 → v5: per-TTL cache-creation token split + speed capture.
+    # ``cache_creation_1h`` / ``cache_creation_5m`` populate from
+    # ``usage.cache_creation.ephemeral_*_input_tokens`` (emitted by Claude
+    # Code when ``ENABLE_PROMPT_CACHING_1H`` is active — default on Max
+    # since 2.1.108). 1h tokens price at 2.0x input vs 5m at 1.25x —
+    # collapsing them caused systematic under-counting on 1h-cache-heavy
+    # sessions. ``speed`` captures the ``usage.speed`` field (``standard``
+    # or ``fast``) as a precursor to fast-mode pricing. The legacy
+    # ``cache_creation`` column stays as the total for back-compat; new
+    # rows fill the split, old rows leave it NULL (cost recomputes from
+    # total at 5m rate to preserve prior semantics). Trailing UPDATE
+    # forces cold backfill so existing sessions re-price with the split.
+    [
+        "ALTER TABLE messages ADD COLUMN cache_creation_1h INTEGER",
+        "ALTER TABLE messages ADD COLUMN cache_creation_5m INTEGER",
+        "ALTER TABLE messages ADD COLUMN speed TEXT",
         "UPDATE files SET mtime_ns = 0",
     ],
 ]
@@ -520,6 +538,9 @@ def _insert_message(
                     tool_use_id = block.id
                     tool_name = block.name
                 tool_uses_for_aux.append((ordinal, block.id, block.name, block.input))
+    cache_detail = usage.cache_creation if usage else None
+    cache_1h = cache_detail.ephemeral_1h_input_tokens if cache_detail else None
+    cache_5m = cache_detail.ephemeral_5m_input_tokens if cache_detail else None
     conn.execute(
         """INSERT OR REPLACE INTO messages (
             dedup_key, file_path, session_id, uuid, parent_uuid,
@@ -527,8 +548,8 @@ def _insert_message(
             tool_use_id, tool_name, agent_id, role, type, model, ts,
             is_sidechain, is_meta,
             input_tokens, output_tokens, cache_creation, cache_read, cost_usd,
-            service_tier
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            service_tier, cache_creation_1h, cache_creation_5m, speed
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             key,
             file_path,
@@ -552,6 +573,9 @@ def _insert_message(
             usage.cache_read_input_tokens if usage else None,
             cost_usd,
             usage.service_tier if usage else None,
+            cache_1h,
+            cache_5m,
+            usage.speed if usage else None,
         ),
     )
     for ordinal, tu_id, tu_name, tu_input in tool_uses_for_aux:

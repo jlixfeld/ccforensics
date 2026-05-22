@@ -91,6 +91,8 @@ def test_model_price_fills_cache_fields_from_ratio_when_missing() -> None:
     assert p.input_cost == 0.000003
     assert p.output_cost == 0.000015
     assert p.cache_creation_cost == pytest.approx(0.00000075)
+    # 1h fallback: 2.0x input.
+    assert p.cache_creation_1h_cost == pytest.approx(0.000006)
     assert p.cache_read_cost == pytest.approx(0.0000003)
 
 
@@ -99,11 +101,28 @@ def test_model_price_uses_explicit_cache_fields_when_present() -> None:
         "input_cost_per_token": 0.000003,
         "output_cost_per_token": 0.000015,
         "cache_creation_input_token_cost": 0.00000375,
+        "cache_creation_input_token_cost_above_1hr": 0.000006,
         "cache_read_input_token_cost": 0.0000003,
     }
     p = ModelPrice.from_entry(entry)
     assert p.cache_creation_cost == 0.00000375
+    assert p.cache_creation_1h_cost == 0.000006
     assert p.cache_read_cost == 0.0000003
+
+
+def test_model_price_1h_falls_back_when_only_5m_present() -> None:
+    """LiteLLM entries for models like sonnet-4.6 carry the 5m rate but not
+    the 1h field — fallback is 2.0x input, NOT the 5m rate."""
+    entry = {
+        "input_cost_per_token": 0.000003,
+        "output_cost_per_token": 0.000015,
+        "cache_creation_input_token_cost": 0.00000375,
+        "cache_read_input_token_cost": 0.0000003,
+    }
+    p = ModelPrice.from_entry(entry)
+    assert p.cache_creation_cost == 0.00000375
+    # 1h synthesized = input * 2.0 = 6e-6 (NOT the 5m rate of 3.75e-6)
+    assert p.cache_creation_1h_cost == pytest.approx(0.000006)
 
 
 def test_compute_message_cost() -> None:
@@ -111,6 +130,7 @@ def test_compute_message_cost() -> None:
         input_cost=0.000003,
         output_cost=0.000015,
         cache_creation_cost=0.00000375,
+        cache_creation_1h_cost=0.000006,
         cache_read_cost=0.0000003,
     )
     cost = compute_message_cost(
@@ -120,13 +140,72 @@ def test_compute_message_cost() -> None:
         cache_creation=500,
         cache_read=10000,
     )
+    # Legacy total-only path: all 500 cache_creation charged at 5m rate.
     expected = 0.003 + 0.003 + 0.001875 + 0.003
     assert cost == pytest.approx(expected)
 
 
+def test_compute_message_cost_with_ttl_split() -> None:
+    """When ``cache_creation_1h`` / ``cache_creation_5m`` provided, each
+    bucket prices at its own rate; legacy ``cache_creation`` total is ignored."""
+    p = ModelPrice(
+        input_cost=0.000005,
+        output_cost=0.000025,
+        cache_creation_cost=0.00000625,
+        cache_creation_1h_cost=0.00001,
+        cache_read_cost=0.0000005,
+    )
+    cost = compute_message_cost(
+        price=p,
+        input_tokens=0,
+        output_tokens=0,
+        cache_creation=10000,  # ignored when split provided
+        cache_read=0,
+        cache_creation_1h=8000,
+        cache_creation_5m=2000,
+    )
+    expected = 2000 * 0.00000625 + 8000 * 0.00001
+    assert cost == pytest.approx(expected)
+    # And it must NOT equal what the legacy path would have charged.
+    legacy = compute_message_cost(
+        price=p,
+        input_tokens=0,
+        output_tokens=0,
+        cache_creation=10000,
+        cache_read=0,
+    )
+    assert legacy != pytest.approx(expected)
+    assert legacy < expected  # legacy under-counts
+
+
+def test_compute_message_cost_split_with_only_5m() -> None:
+    """Split where only 5m is present (1h=None) must NOT fall back to legacy
+    total — that path is reached only when BOTH split values are None."""
+    p = ModelPrice(
+        input_cost=1e-6,
+        output_cost=1e-6,
+        cache_creation_cost=1.25e-6,
+        cache_creation_1h_cost=2e-6,
+        cache_read_cost=0.1e-6,
+    )
+    cost = compute_message_cost(
+        price=p,
+        input_tokens=0,
+        output_tokens=0,
+        cache_creation=9999,  # ignored when ANY split arg is non-None
+        cache_read=0,
+        cache_creation_5m=1000,
+    )
+    assert cost == pytest.approx(1000 * 1.25e-6)
+
+
 def test_compute_message_cost_handles_none() -> None:
     p = ModelPrice(
-        input_cost=1e-6, output_cost=1e-6, cache_creation_cost=1e-6, cache_read_cost=1e-6
+        input_cost=1e-6,
+        output_cost=1e-6,
+        cache_creation_cost=1e-6,
+        cache_creation_1h_cost=1e-6,
+        cache_read_cost=1e-6,
     )
     assert compute_message_cost(p, None, None, None, None) == 0.0
 
@@ -135,9 +214,37 @@ def test_fallback_hardcoded_covers_current_claude_models() -> None:
     data = fallback_hardcoded()
     assert "claude-sonnet-4-5-20250929" in data
     assert "claude-haiku-4-5-20251001" in data
+    assert "claude-opus-4-6" in data
+    assert "claude-opus-4-7" in data
+    assert "claude-sonnet-4-6" in data
     for _key, entry in data.items():
         assert "input_cost_per_token" in entry
         assert "output_cost_per_token" in entry
+
+
+def test_fallback_hardcoded_includes_1h_rates_for_4x_models() -> None:
+    """4.x models (opus/sonnet/haiku) all support 1h cache TTL; fallback must
+    carry the explicit 1h rate so cost math doesn't synthesize via the 2.0x
+    multiplier (which is the correct default but not what Anthropic actually
+    charges for these models — they ARE at 2.0x, but pinning is more robust).
+    """
+    data = fallback_hardcoded()
+    for key in (
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-5-20251101",
+        "claude-opus-4-1-20250805",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-5-20250929",
+        "claude-sonnet-4-20250514",
+        "claude-haiku-4-5-20251001",
+    ):
+        entry = data[key]
+        assert "cache_creation_input_token_cost_above_1hr" in entry, key
+        # Sanity: 1h rate must be 2.0x input.
+        assert entry["cache_creation_input_token_cost_above_1hr"] == pytest.approx(
+            entry["input_cost_per_token"] * 2.0
+        ), key
 
 
 def test_pricing_cache_reads_fresh_snapshot(tmp_path: Path, pricing_data: dict) -> None:
