@@ -1,5 +1,23 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Cost under-counting on sessions using the 1-hour prompt cache TTL (default on Max subscriptions since Claude Code 2.1.108). Cache-creation tokens are now priced per-TTL: 5-minute tokens at the 1.25× input rate, 1-hour tokens at the 2.0× input rate. Previously the entire `usage.cache_creation_input_tokens` total was charged at the 5m rate, under-counting 1h cache-creation cost by ~37%. The bucket-attribution hard invariant continues to hold; reported totals now match what Anthropic actually bills.
+
+### Added
+
+- `usage.speed` capture (`standard` / `fast`) — precursor to fast-mode pricing. No pricing branch yet; field is captured so it's available when fast-mode rates land in LiteLLM.
+- Pydantic model for `usage.cache_creation` sub-object (`ephemeral_1h_input_tokens` / `ephemeral_5m_input_tokens`).
+- `claude-opus-4-6`, `claude-opus-4-7`, `claude-sonnet-4-6` entries in `pricing.fallback_hardcoded`.
+
+### Changed
+
+- Schema migrated v4 → v5: adds `messages.cache_creation_1h`, `messages.cache_creation_5m`, `messages.speed` columns. First command after upgrade triggers a one-shot full re-reconcile to cold-backfill the new columns. **Sessions with non-zero 1h cache-creation tokens will see higher reported `cost_usd` after backfill** — this is correcting the under-count, not a regression.
+- `pricing.ModelPrice` gains `cache_creation_1h_cost` field. LiteLLM resolver reads `cache_creation_input_token_cost_above_1hr` with `input_cost * 2.0` fallback for entries that omit it.
+- `pricing.compute_message_cost` accepts optional `cache_creation_1h` / `cache_creation_5m` kwargs. Legacy single-total calls fall back to the 5m rate, preserving prior cost semantics for transcripts that don't carry the TTL split.
+
 ## [0.2.0] — 2026-05-05
 
 ### Added

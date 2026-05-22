@@ -216,12 +216,17 @@ def annotate_cost(
             out.append(AnnotatedEntry(entry=e, cost_usd=None, pricing_unresolved_model=model))
             continue
         usage = e.message.usage
+        detail = usage.cache_creation
+        cache_1h = detail.ephemeral_1h_input_tokens if detail else None
+        cache_5m = detail.ephemeral_5m_input_tokens if detail else None
         cost = compute_message_cost(
             price=price,
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             cache_creation=usage.cache_creation_input_tokens,
             cache_read=usage.cache_read_input_tokens,
+            cache_creation_1h=cache_1h,
+            cache_creation_5m=cache_5m,
         )
         out.append(AnnotatedEntry(entry=e, cost_usd=cost))
     return out

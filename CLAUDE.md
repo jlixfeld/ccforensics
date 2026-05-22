@@ -60,9 +60,20 @@ The bucket decision is a single SQL CASE over `files.kind` and `subagent_spawns.
 - `auto-compact`: `agent-acompact-*.jsonl` — real billable cost from Claude Code's context-compaction worker, explicitly bucketed, not routed to `unattributed`.
 - `unattributed`: subagent file whose parent Agent/Task call couldn't be resolved (~0.5% on real corpus).
 
-### Schema (current: v3)
+### Schema (current: v5)
 
-Migrations live in `index.py::MIGRATIONS` and are gated by `PRAGMA user_version`. v3 (2026-05-02) added:
+Migrations live in `index.py::MIGRATIONS` and are gated by `PRAGMA user_version`. `CURRENT_SCHEMA_VERSION` in the same file pins the active target.
+
+**v5 (2026-05-22)** — per-TTL cache-creation split + speed capture:
+
+- `messages.cache_creation_1h` / `messages.cache_creation_5m` — nullable INTEGER. Populated from `usage.cache_creation.ephemeral_*_input_tokens` (emitted by Claude Code 2.1.108+ when `ENABLE_PROMPT_CACHING_1H` is active — default on Max subscriptions). When both are NULL on a row, the legacy `messages.cache_creation` total is charged at the 5m rate for back-compat with older transcripts.
+- `messages.speed` — nullable TEXT, captured verbatim from `usage.speed`. Fast-mode pricing branch deferred (no rate in LiteLLM yet).
+- 1h tokens price at the 2.0× input rate (`ModelPrice.cache_creation_1h_cost`), 5m at 1.25×. Collapsing them caused systematic under-counting (~37%) on 1h-cache-heavy sessions.
+- Trailing `UPDATE files SET mtime_ns = 0` forces a cold re-reconcile on first command after upgrade so existing sessions re-price with the split.
+
+**v4 (2026-05-05)** — thrash detection metadata: `session_rollups.thrash_score`, `thrash_score_version`, `escalation_event` JSON; `session_signals` table.
+
+**v3 (2026-05-02)** — added:
 
 - `messages.service_tier` — nullable TEXT, captured verbatim from `usage.service_tier`. No pricing branch yet — fast-mode pricing requires a verifiable real fast-mode session.
 - `message_tool_uses` table — keyed `(message_dedup_key, ordinal)` with FK `ON DELETE CASCADE` to `messages(dedup_key)`. One row per `tool_use` block on an assistant message; `mcp_server` column derived from `mcp__<server>__<rest>` pattern. `messages.tool_name`/`messages.tool_use_id` still latch onto the FIRST tool_use of the turn — load-bearing for `tree.discover_spawn`. Don't change that.

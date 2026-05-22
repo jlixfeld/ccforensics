@@ -337,7 +337,9 @@ def _load_cache_metrics(
         """SELECT model,
                   COALESCE(SUM(input_tokens), 0),
                   COALESCE(SUM(cache_creation), 0),
-                  COALESCE(SUM(cache_read), 0)
+                  COALESCE(SUM(cache_read), 0),
+                  COALESCE(SUM(cache_creation_1h), 0),
+                  COALESCE(SUM(cache_creation_5m), 0)
              FROM messages
             WHERE session_id=?
               AND model IS NOT NULL
@@ -351,8 +353,10 @@ def _load_cache_metrics(
             input_tokens=int(i or 0),
             cache_creation=int(cc or 0),
             cache_read=int(cr or 0),
+            cache_creation_1h=int(cc1h or 0),
+            cache_creation_5m=int(cc5m or 0),
         )
-        for (m, i, cc, cr) in rows_data
+        for (m, i, cc, cr, cc1h, cc5m) in rows_data
     ]
     read_total = sum(r.cache_read for r in rows)
     create_total = sum(r.cache_creation for r in rows)

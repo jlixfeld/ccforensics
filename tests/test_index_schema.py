@@ -199,3 +199,43 @@ def test_schema_v3_cold_backfill_resets_file_mtime(tmp_path: Path) -> None:
 
     row = conn.execute("SELECT mtime_ns FROM files WHERE path='/x.jsonl'").fetchone()
     assert row[0] == 0, "v3 migration must reset mtime_ns to force cold backfill"
+
+
+def test_schema_v5_adds_cache_ttl_split_and_speed_columns(tmp_path: Path) -> None:
+    db = tmp_path / "v5.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+
+    assert CURRENT_SCHEMA_VERSION >= 5
+
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+    assert "cache_creation_1h" in cols
+    assert "cache_creation_5m" in cols
+    assert "speed" in cols
+
+
+def test_schema_v5_cold_backfill_resets_file_mtime(tmp_path: Path) -> None:
+    """v4 → v5 migration MUST reset files.mtime_ns to force re-reconcile so
+    the new TTL split + speed columns populate from existing transcripts."""
+    import ccforensics.index as idx_mod
+
+    db = tmp_path / "v4.sqlite"
+    conn = open_connection(db)
+
+    real_version = idx_mod.CURRENT_SCHEMA_VERSION
+    idx_mod.CURRENT_SCHEMA_VERSION = 4
+    try:
+        ensure_schema(conn)
+    finally:
+        idx_mod.CURRENT_SCHEMA_VERSION = real_version
+
+    conn.execute(
+        """INSERT INTO files (path, mtime_ns, size, session_id, kind, last_parsed_at)
+           VALUES ('/x.jsonl', 999999, 100, 's', 'main', 0)"""
+    )
+    conn.commit()
+
+    ensure_schema(conn)
+
+    row = conn.execute("SELECT mtime_ns FROM files WHERE path='/x.jsonl'").fetchone()
+    assert row[0] == 0, "v5 migration must reset mtime_ns to force cold backfill"
