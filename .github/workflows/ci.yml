@@ -45,7 +45,11 @@ jobs:
             if ! (
                   set -e
                   cd "$d"
-                  uv sync
+                  # --all-extras so test deps declared as optional-dependencies
+                  # (e.g. a `dev` extra carrying pytest-asyncio) are installed;
+                  # plain `uv sync` only covers core + default dependency-groups,
+                  # which silently drops async-test plugins.
+                  uv sync --all-extras
                   uv run --with mypy mypy --ignore-missing-imports --check-untyped-defs . || true
                   if find . -path '*/.venv' -prune -o \( -name 'test_*.py' -o -name '*_test.py' \) -print | grep -q .; then
                     uv run --with pytest pytest -q
@@ -91,6 +95,9 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v6
+      # QEMU + Buildx so multi-arch `platforms:` builds (e.g. linux/arm64) work.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
       - name: Test-build Docker images
         shell: bash
         run: |
@@ -100,10 +107,23 @@ jobs:
           # each Dockerfile in its own directory. Repos with neither no-op.
           # No secrets, no push — this only proves the images still build.
           shopt -s nullglob
+          # Compose `env_file:` / `${VAR:?}` placeholders need a .env to exist.
+          # Seed a stub next to each compose file from an example if present,
+          # else an empty file (defaults via ${VAR:-...} still apply). CI never
+          # holds real secrets — this only lets the build resolve.
+          stub_env() {
+            local dir="$1"
+            [ -f "$dir/.env" ] && return
+            for ex in "$dir/.env.example" "$dir/.env.sample"; do
+              [ -f "$ex" ] && { cp "$ex" "$dir/.env"; return; }
+            done
+            : > "$dir/.env"
+          }
           compose=( docker-compose.y*ml compose.y*ml */docker-compose.y*ml */compose.y*ml )
           if [ ${#compose[@]} -gt 0 ]; then
             fail=0
             for f in "${compose[@]}"; do
+              stub_env "$(dirname "$f")"
               echo "::group::docker compose -f $f build"
               docker compose -f "$f" build || fail=1
               echo "::endgroup::"
