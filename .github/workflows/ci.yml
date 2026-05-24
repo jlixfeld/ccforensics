@@ -13,10 +13,52 @@ jobs:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v7
       - run: uv tool install ruff
-      - run: uv tool install mypy
       - run: ruff check .
       - run: ruff format --check .
-      - run: mypy . || true
+
+  uv-checks:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+      - name: Discover uv projects, run mypy + pytest
+        shell: bash
+        run: |
+          set -uo pipefail
+          # Layout-agnostic: find every uv project (a dir with pyproject.toml
+          # that has a uv.lock or a [tool.uv] table), then per project run
+          # mypy (non-blocking, matches the lint job's fleet default) and
+          # pytest (blocking — only if the project actually ships tests).
+          mapfile -t roots < <(
+            find . \( -path '*/.venv' -o -path '*/node_modules' -o -path './.git' \) -prune \
+              -o -name pyproject.toml -print | xargs -r -n1 dirname | sort -u
+          )
+          ran=0 fail=0
+          for d in "${roots[@]}"; do
+            if [ ! -f "$d/uv.lock" ] && ! grep -q '\[tool\.uv\]' "$d/pyproject.toml" 2>/dev/null; then
+              echo "skip $d (not a uv project)"; continue
+            fi
+            ran=1
+            echo "::group::$d"
+            if ! (
+                  set -e
+                  cd "$d"
+                  uv sync
+                  uv run --with mypy mypy --ignore-missing-imports --check-untyped-defs . || true
+                  if find . -path '*/.venv' -prune -o \( -name 'test_*.py' -o -name '*_test.py' \) -print | grep -q .; then
+                    uv run --with pytest pytest -q
+                  else
+                    echo "no tests in $d — skipping pytest"
+                  fi
+                ); then
+              echo "FAILED: $d"; fail=1
+            fi
+            echo "::endgroup::"
+          done
+          [ "$ran" = 1 ] || echo "no uv projects discovered — nothing to test"
+          [ "$fail" = 0 ] || { echo "one or more uv projects failed"; exit 1; }
 
   secrets:
     runs-on: ubuntu-latest
@@ -64,3 +106,65 @@ jobs:
           plugins: 'code-review@claude-code-plugins'
           show_full_output: true
           prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }} --comment'
+
+  # Advisory merge signal in a SEPARATE job: claude-code-action cannot submit
+  # formal review verdicts itself (documented restriction), so this job submits
+  # one as github-actions[bot] via the default GITHUB_TOKEN. Kept out of the
+  # claude-review job so this advisory check reports an independent status,
+  # decoupled from the review action's lifecycle.
+  #
+  # NOT a hard gate — blocking merge needs branch protection, which GitHub gates
+  # behind Pro/Team for private repos. Behaviour:
+  #   - inline review comments on the latest commit -> REQUEST_CHANGES (red badge)
+  #   - none -> dismiss any prior bot REQUEST_CHANGES review (clears the badge)
+  # Actions are NOT permitted to APPROVE a PR (422), so the clean path dismisses
+  # rather than approves. The signal refreshes on push, not on clicking
+  # "Resolve" (thread resolution fires no workflow event).
+  #
+  # NB: claude-code-action fails its own token exchange on any PR that modifies
+  # THIS workflow file ("Workflow validation failed ... this is normal ...");
+  # that clears once the change is on the default branch and does not affect
+  # this job.
+  review-verdict:
+    runs-on: ubuntu-latest
+    needs: claude-review
+    if: always()
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Advisory review verdict
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pull_number = context.payload.pull_request.number;
+            const headSha = context.payload.pull_request.head.sha;
+            const short = headSha.slice(0, 7);
+            const comments = await github.paginate(
+              github.rest.pulls.listReviewComments,
+              { owner, repo, pull_number, per_page: 100 },
+            );
+            const findings = comments.filter((c) => c.commit_id === headSha);
+            if (findings.length > 0) {
+              await github.rest.pulls.createReview({
+                owner, repo, pull_number,
+                event: 'REQUEST_CHANGES',
+                body: `🔴 ${findings.length} unaddressed review comment(s) on the latest commit (\`${short}\`). Address them and push — this advisory verdict clears once the latest commit has no outstanding review comments. (Advisory only: it does not block merge.)`,
+              });
+              return;
+            }
+            // Clean: Actions can't APPROVE, so dismiss any prior bot REQUEST_CHANGES review.
+            const reviews = await github.paginate(
+              github.rest.pulls.listReviews,
+              { owner, repo, pull_number, per_page: 100 },
+            );
+            const stale = reviews.filter(
+              (r) => r.state === 'CHANGES_REQUESTED' && r.user?.login === 'github-actions[bot]',
+            );
+            for (const r of stale) {
+              await github.rest.pulls.dismissReview({
+                owner, repo, pull_number, review_id: r.id,
+                message: `✅ No outstanding review comments on the latest commit (\`${short}\`).`,
+              });
+            }
