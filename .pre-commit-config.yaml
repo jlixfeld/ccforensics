@@ -1,0 +1,13 @@
+# Canonical pre-commit hooks, seeded by the deploy-ci plugin.
+# Mirrors the server-side `lint` job in ci.yml (ruff check + ruff format) so
+# mechanical lint/format issues are fixed locally at commit time instead of
+# failing CI. CI remains the read-only enforcement gate.
+#
+# Install once per clone:  pre-commit install
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.14
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
