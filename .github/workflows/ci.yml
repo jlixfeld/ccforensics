@@ -85,6 +85,47 @@ jobs:
       - uses: actions/checkout@v6
       - run: semgrep ci --config=auto
 
+  docker-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: Test-build Docker images
+        shell: bash
+        run: |
+          set -uo pipefail
+          # Layout-agnostic, build-only smoke test. If the repo ships a Compose
+          # file, `docker compose build` covers every service; otherwise build
+          # each Dockerfile in its own directory. Repos with neither no-op.
+          # No secrets, no push — this only proves the images still build.
+          shopt -s nullglob
+          compose=( docker-compose.y*ml compose.y*ml */docker-compose.y*ml */compose.y*ml )
+          if [ ${#compose[@]} -gt 0 ]; then
+            fail=0
+            for f in "${compose[@]}"; do
+              echo "::group::docker compose -f $f build"
+              docker compose -f "$f" build || fail=1
+              echo "::endgroup::"
+            done
+            [ "$fail" = 0 ] || { echo "one or more compose builds failed"; exit 1; }
+            exit 0
+          fi
+          mapfile -t dfs < <(
+            find . -path ./.git -prune -o \( -name Dockerfile -o -name 'Dockerfile.*' \) -print
+          )
+          if [ ${#dfs[@]} -eq 0 ]; then
+            echo "no Dockerfile or Compose file — nothing to build"
+            exit 0
+          fi
+          fail=0
+          for df in "${dfs[@]}"; do
+            echo "::group::docker build -f $df $(dirname "$df")"
+            docker build -f "$df" "$(dirname "$df")" || fail=1
+            echo "::endgroup::"
+          done
+          [ "$fail" = 0 ] || { echo "one or more docker builds failed"; exit 1; }
+
   claude-review:
     runs-on: ubuntu-latest
     permissions:
