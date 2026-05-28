@@ -97,7 +97,7 @@ jobs:
       - uses: actions/checkout@v6
       # QEMU + Buildx so multi-arch `platforms:` builds (e.g. linux/arm64) work.
       - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - name: Test-build Docker images
         shell: bash
         run: |
