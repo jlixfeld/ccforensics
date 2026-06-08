@@ -5,6 +5,8 @@ from pathlib import Path
 from ccforensics.index import (
     CURRENT_SCHEMA_VERSION,
     MIGRATIONS,
+    _classify_file,
+    _parent_session_path,
     ensure_schema,
     open_connection,
 )
@@ -68,3 +70,33 @@ def test_v6_migration_purges_phantom_workflow_sessions(tmp_path: Path) -> None:
         "SELECT COUNT(*) FROM files WHERE path LIKE '%/subagents/workflows/%'"
     ).fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM messages WHERE session_id='agent-dead'").fetchone()[0] == 0
+
+
+def test_classify_workflow_agent_path() -> None:
+    p = Path("/p/-enc/SESS-UUID/subagents/workflows/wf_2328ca35-f9d/agent-deadbeef.jsonl")
+    assert _classify_file(p) == ("subagent", "deadbeef", "SESS-UUID")
+
+
+def test_classify_direct_subagent_still_works() -> None:
+    p = Path("/p/-enc/SESS-UUID/subagents/agent-abc.jsonl")
+    assert _classify_file(p) == ("subagent", "abc", "SESS-UUID")
+
+
+def test_classify_autocompact_still_works() -> None:
+    p = Path("/p/-enc/SESS-UUID/subagents/agent-acompact-fff.jsonl")
+    assert _classify_file(p) == ("auto-compact", "acompact-fff", "SESS-UUID")
+
+
+def test_classify_main_still_works() -> None:
+    p = Path("/p/-enc/SESS-UUID.jsonl")
+    assert _classify_file(p) == ("main", None, "SESS-UUID")
+
+
+def test_parent_session_path_workflow() -> None:
+    child = Path("/p/-enc/SESS-UUID/subagents/workflows/wf_z/agent-dead.jsonl")
+    assert _parent_session_path(child) == Path("/p/-enc/SESS-UUID.jsonl")
+
+
+def test_parent_session_path_direct_subagent() -> None:
+    child = Path("/p/-enc/SESS-UUID/subagents/agent-abc.jsonl")
+    assert _parent_session_path(child) == Path("/p/-enc/SESS-UUID.jsonl")
