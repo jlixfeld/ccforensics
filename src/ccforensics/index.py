@@ -436,6 +436,7 @@ def _reconcile_spawn(
         child_entries=child_entries,
         parent_entries=parent_entries,
         meta=meta,
+        is_workflow=bool(_WORKFLOW_AGENT_RE.search(subagent_path.as_posix())),
     )
     if spawn is None:
         return
@@ -875,6 +876,10 @@ def reconcile_projects_dir(
     # That ordering guarantees a subagent's spawn discovery sees its
     # parent main file already indexed.
     for path in sorted(projects_dir.rglob("*.jsonl"), key=str):
+        if path.name == "journal.jsonl":
+            # Workflow orchestration log — not a transcript, carries no billable
+            # usage. Skipping avoids a phantom 'journal' session.
+            continue
         stats.files_scanned += 1
         stat = path.stat()
         if _row_is_unchanged(conn, path, stat.st_mtime_ns, stat.st_size):
