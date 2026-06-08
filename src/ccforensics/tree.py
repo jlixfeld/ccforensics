@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -9,6 +10,34 @@ from pathlib import Path
 from .models import SpawnMeta, TranscriptEntry
 
 logger = logging.getLogger("ccforensics.tree")
+
+_WORKFLOW_NAME_RE = re.compile(r"name:\s*['\"]([^'\"]+)['\"]")
+_WORKFLOW_SCRIPTPATH_SUFFIX_RE = re.compile(r"-wf_[0-9a-z-]+$", re.IGNORECASE)
+
+
+def _workflow_name(inp: object) -> str | None:
+    """Best-effort workflow name from a ``Workflow`` tool_use input.
+
+    Priority: saved-workflow ``name`` → ``scriptPath`` filename stem (minus
+    the trailing ``-wf_<id>``) → inline ``script`` ``meta.name`` regex. Returns
+    ``None`` if all fail; the caller substitutes the ``wf_<id>`` directory name.
+    """
+    if not isinstance(inp, dict):
+        return None
+    name = inp.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    script_path = inp.get("scriptPath")
+    if isinstance(script_path, str) and script_path.strip():
+        stem = _WORKFLOW_SCRIPTPATH_SUFFIX_RE.sub("", Path(script_path).stem)
+        if stem:
+            return stem
+    script = inp.get("script")
+    if isinstance(script, str):
+        m = _WORKFLOW_NAME_RE.search(script)
+        if m:
+            return m.group(1)
+    return None
 
 
 @dataclass(frozen=True)

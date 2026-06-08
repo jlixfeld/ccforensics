@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from ccforensics.models import SpawnMeta, TranscriptEntry, parse_entry
-from ccforensics.tree import Spawn, build_session_graph, discover_spawn
+from ccforensics.tree import Spawn, _workflow_name, build_session_graph, discover_spawn
 
 # ---------- fixture helpers ----------
 
@@ -394,3 +394,29 @@ def test_spawn_dataclass_frozen() -> None:
         pass
     else:
         raise AssertionError("Spawn should be frozen")
+
+
+# ---------- _workflow_name ----------
+
+
+def test_workflow_name_from_saved_name() -> None:
+    assert _workflow_name({"name": "review-pr"}) == "review-pr"
+
+
+def test_workflow_name_from_script_path_strips_wf_suffix() -> None:
+    assert _workflow_name({"scriptPath": "/a/b/sdk-drift-audit-wf_2328ca35-f9d.js"}) == "sdk-drift-audit"
+
+
+def test_workflow_name_from_inline_script_meta() -> None:
+    script = "export const meta = {\n  name: 'find-flaky',\n  description: 'x',\n}"
+    assert _workflow_name({"script": script}) == "find-flaky"
+
+
+def test_workflow_name_prefers_name_over_script() -> None:
+    assert _workflow_name({"name": "saved", "script": "name: 'inline'"}) == "saved"
+
+
+def test_workflow_name_none_when_unparseable() -> None:
+    assert _workflow_name({"script": "no meta here"}) is None
+    assert _workflow_name({}) is None
+    assert _workflow_name("not a dict") is None
