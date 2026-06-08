@@ -171,6 +171,13 @@ def fallback_hardcoded() -> dict[str, dict[str, float]]:
             "cache_creation_input_token_cost_above_1hr": 0.00001,
             "cache_read_input_token_cost": 0.0000005,
         },
+        "claude-opus-4-8": {
+            "input_cost_per_token": 0.000005,
+            "output_cost_per_token": 0.000025,
+            "cache_creation_input_token_cost": 0.00000625,
+            "cache_creation_input_token_cost_above_1hr": 0.00001,
+            "cache_read_input_token_cost": 0.0000005,
+        },
         "claude-sonnet-4-6": {
             "input_cost_per_token": 0.000003,
             "output_cost_per_token": 0.000015,
