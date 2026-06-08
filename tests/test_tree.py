@@ -404,7 +404,10 @@ def test_workflow_name_from_saved_name() -> None:
 
 
 def test_workflow_name_from_script_path_strips_wf_suffix() -> None:
-    assert _workflow_name({"scriptPath": "/a/b/sdk-drift-audit-wf_2328ca35-f9d.js"}) == "sdk-drift-audit"
+    assert (
+        _workflow_name({"scriptPath": "/a/b/sdk-drift-audit-wf_2328ca35-f9d.js"})
+        == "sdk-drift-audit"
+    )
 
 
 def test_workflow_name_from_inline_script_meta() -> None:
@@ -427,46 +430,52 @@ def test_workflow_name_none_when_unparseable() -> None:
 
 def _wf_parent_entries() -> list[TranscriptEntry]:
     return [
-        parse_entry({
-            "type": "assistant",
-            "uuid": "p1",
-            "sessionId": "SESS",
-            "timestamp": "2026-06-08T10:00:00Z",
-            "requestId": "r1",
-            "message": {
-                "id": "m1",
-                "role": "assistant",
-                "model": "claude-opus-4-8",
-                "content": [{
-                    "type": "tool_use",
-                    "id": "tu-wf",
-                    "name": "Workflow",
-                    "input": {"script": "export const meta = { name: 'sdk-drift-audit' }"},
-                }],
-                "usage": {"input_tokens": 1, "output_tokens": 1},
-            },
-        }),
+        parse_entry(
+            {
+                "type": "assistant",
+                "uuid": "p1",
+                "sessionId": "SESS",
+                "timestamp": "2026-06-08T10:00:00Z",
+                "requestId": "r1",
+                "message": {
+                    "id": "m1",
+                    "role": "assistant",
+                    "model": "claude-opus-4-8",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tu-wf",
+                            "name": "Workflow",
+                            "input": {"script": "export const meta = { name: 'sdk-drift-audit' }"},
+                        }
+                    ],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            }
+        ),
     ]
 
 
 def _wf_child_entries() -> list[TranscriptEntry]:
     return [
-        parse_entry({
-            "type": "assistant",
-            "uuid": "c1",
-            "sessionId": "SESS",
-            "agentId": "dead",
-            "timestamp": "2026-06-08T10:00:30Z",
-            "isSidechain": True,
-            "requestId": "r2",
-            "message": {
-                "id": "m2",
-                "role": "assistant",
-                "model": "claude-haiku-4-5-20251001",
-                "content": [{"type": "text", "text": "x"}],
-                "usage": {"input_tokens": 1, "output_tokens": 1},
-            },
-        }),
+        parse_entry(
+            {
+                "type": "assistant",
+                "uuid": "c1",
+                "sessionId": "SESS",
+                "agentId": "dead",
+                "timestamp": "2026-06-08T10:00:30Z",
+                "isSidechain": True,
+                "requestId": "r2",
+                "message": {
+                    "id": "m2",
+                    "role": "assistant",
+                    "model": "claude-haiku-4-5-20251001",
+                    "content": [{"type": "text", "text": "x"}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            }
+        ),
     ]
 
 
@@ -525,40 +534,52 @@ def test_discover_spawn_workflow_unresolvable_parent() -> None:
 def test_discover_spawn_workflow_picks_nearest_before() -> None:
     """Two Workflow calls before the spawn → the latest-before one wins."""
     parent = [
-        parse_entry({
-            "type": "assistant",
-            "uuid": "p-old",
-            "sessionId": "SESS",
-            "timestamp": "2026-06-08T10:00:00Z",
-            "requestId": "r1",
-            "message": {
-                "id": "m1",
-                "role": "assistant",
-                "model": "claude-opus-4-8",
-                "content": [{
-                    "type": "tool_use", "id": "tu-old", "name": "Workflow",
-                    "input": {"name": "older"},
-                }],
-                "usage": {"input_tokens": 1, "output_tokens": 1},
-            },
-        }),
-        parse_entry({
-            "type": "assistant",
-            "uuid": "p-new",
-            "sessionId": "SESS",
-            "timestamp": "2026-06-08T10:00:25Z",
-            "requestId": "r1b",
-            "message": {
-                "id": "m1b",
-                "role": "assistant",
-                "model": "claude-opus-4-8",
-                "content": [{
-                    "type": "tool_use", "id": "tu-new", "name": "Workflow",
-                    "input": {"name": "newer"},
-                }],
-                "usage": {"input_tokens": 1, "output_tokens": 1},
-            },
-        }),
+        parse_entry(
+            {
+                "type": "assistant",
+                "uuid": "p-old",
+                "sessionId": "SESS",
+                "timestamp": "2026-06-08T10:00:00Z",
+                "requestId": "r1",
+                "message": {
+                    "id": "m1",
+                    "role": "assistant",
+                    "model": "claude-opus-4-8",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tu-old",
+                            "name": "Workflow",
+                            "input": {"name": "older"},
+                        }
+                    ],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            }
+        ),
+        parse_entry(
+            {
+                "type": "assistant",
+                "uuid": "p-new",
+                "sessionId": "SESS",
+                "timestamp": "2026-06-08T10:00:25Z",
+                "requestId": "r1b",
+                "message": {
+                    "id": "m1b",
+                    "role": "assistant",
+                    "model": "claude-opus-4-8",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tu-new",
+                            "name": "Workflow",
+                            "input": {"name": "newer"},
+                        }
+                    ],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            }
+        ),
     ]
     spawn = discover_spawn(
         parent_session_id="SESS",

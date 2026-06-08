@@ -34,7 +34,14 @@ def test_v6_migration_purges_phantom_workflow_sessions(tmp_path: Path) -> None:
         "schema_version, parse_warnings, last_parsed_at) VALUES (?,?,?,?,?,?,?,?,?)",
         (
             "/p/-enc/SESS/subagents/workflows/wf_z/agent-dead.jsonl",
-            123, 456, "agent-dead", "main", None, "5", 0, 0,
+            123,
+            456,
+            "agent-dead",
+            "main",
+            None,
+            "5",
+            0,
+            0,
         ),
     )
     conn.execute(
@@ -43,7 +50,10 @@ def test_v6_migration_purges_phantom_workflow_sessions(tmp_path: Path) -> None:
         (
             "req:m1:r1",
             "/p/-enc/SESS/subagents/workflows/wf_z/agent-dead.jsonl",
-            "agent-dead", "assistant", "assistant", 0,
+            "agent-dead",
+            "assistant",
+            "assistant",
+            0,
         ),
     )
     conn.execute(
@@ -63,13 +73,22 @@ def test_v6_migration_purges_phantom_workflow_sessions(tmp_path: Path) -> None:
 
     assert conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
     assert CURRENT_SCHEMA_VERSION == 6
-    assert conn.execute(
-        "SELECT COUNT(*) FROM session_rollups WHERE session_id LIKE 'agent-%' OR session_id='journal'"
-    ).fetchone()[0] == 0
-    assert conn.execute(
-        "SELECT COUNT(*) FROM files WHERE path LIKE '%/subagents/workflows/%'"
-    ).fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM messages WHERE session_id='agent-dead'").fetchone()[0] == 0
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM session_rollups WHERE session_id LIKE 'agent-%' OR session_id='journal'"
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM files WHERE path LIKE '%/subagents/workflows/%'"
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        conn.execute("SELECT COUNT(*) FROM messages WHERE session_id='agent-dead'").fetchone()[0]
+        == 0
+    )
 
 
 def test_classify_workflow_agent_path() -> None:

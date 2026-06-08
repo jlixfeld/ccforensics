@@ -774,11 +774,19 @@ def test_workflow_bucket_first_class(tmp_path: Path, pricing_data: dict) -> None
         [
             _user("u1", sid, "2026-06-08T10:00:00Z", "go", cwd="/home/test"),
             _assistant(
-                "u2", sid, "2026-06-08T10:00:10Z", msg_id="m1", req_id="r1",
-                content=[{
-                    "type": "tool_use", "id": "tu-wf", "name": "Workflow",
-                    "input": {"script": "export const meta = { name: 'sdk-drift-audit' }"},
-                }],
+                "u2",
+                sid,
+                "2026-06-08T10:00:10Z",
+                msg_id="m1",
+                req_id="r1",
+                content=[
+                    {
+                        "type": "tool_use",
+                        "id": "tu-wf",
+                        "name": "Workflow",
+                        "input": {"script": "export const meta = { name: 'sdk-drift-audit' }"},
+                    }
+                ],
             ),
         ],
     )
@@ -788,8 +796,14 @@ def test_workflow_bucket_first_class(tmp_path: Path, pricing_data: dict) -> None
         wf_dir / "agent-dead.jsonl",
         [
             _assistant(
-                "c1", sid, "2026-06-08T10:00:20Z", msg_id="m2", req_id="r2",
-                model="claude-haiku-4-5-20251001", agentId="dead", isSidechain=True,
+                "c1",
+                sid,
+                "2026-06-08T10:00:20Z",
+                msg_id="m2",
+                req_id="r2",
+                model="claude-haiku-4-5-20251001",
+                agentId="dead",
+                isSidechain=True,
             ),
         ],
     )
