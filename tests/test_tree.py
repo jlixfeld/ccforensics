@@ -520,3 +520,55 @@ def test_discover_spawn_workflow_unresolvable_parent() -> None:
     assert spawn is not None
     assert spawn.parent_message_uuid is None
     assert spawn.subagent_type == "workflow:wf_abc123"
+
+
+def test_discover_spawn_workflow_picks_nearest_before() -> None:
+    """Two Workflow calls before the spawn → the latest-before one wins."""
+    parent = [
+        parse_entry({
+            "type": "assistant",
+            "uuid": "p-old",
+            "sessionId": "SESS",
+            "timestamp": "2026-06-08T10:00:00Z",
+            "requestId": "r1",
+            "message": {
+                "id": "m1",
+                "role": "assistant",
+                "model": "claude-opus-4-8",
+                "content": [{
+                    "type": "tool_use", "id": "tu-old", "name": "Workflow",
+                    "input": {"name": "older"},
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        }),
+        parse_entry({
+            "type": "assistant",
+            "uuid": "p-new",
+            "sessionId": "SESS",
+            "timestamp": "2026-06-08T10:00:25Z",
+            "requestId": "r1b",
+            "message": {
+                "id": "m1b",
+                "role": "assistant",
+                "model": "claude-opus-4-8",
+                "content": [{
+                    "type": "tool_use", "id": "tu-new", "name": "Workflow",
+                    "input": {"name": "newer"},
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        }),
+    ]
+    spawn = discover_spawn(
+        parent_session_id="SESS",
+        child_agent_id="dead",
+        child_file_path=Path("/p/-enc/SESS/subagents/workflows/wf_x/agent-dead.jsonl"),
+        child_entries=_wf_child_entries(),
+        parent_entries=parent,
+        meta=None,
+        is_workflow=True,
+    )
+    assert spawn is not None
+    assert spawn.parent_tool_use_id == "tu-new"
+    assert spawn.subagent_type == "workflow:newer"
