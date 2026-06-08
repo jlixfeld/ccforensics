@@ -13,6 +13,7 @@ class BucketKind(StrEnum):
     MAIN = "main"
     AUTO_COMPACT = "auto-compact"
     SUBAGENT = "subagent"
+    WORKFLOW = "workflow"
     UNATTRIBUTED = "unattributed"
 
 
@@ -20,6 +21,10 @@ _BUCKET_KIND_EXPR = f"""
     CASE
         WHEN f.kind = 'main'         THEN '{BucketKind.MAIN}'
         WHEN f.kind = 'auto-compact' THEN '{BucketKind.AUTO_COMPACT}'
+        WHEN f.kind = 'subagent'
+             AND s.parent_message_dedup_key IS NOT NULL
+             AND s.subagent_type LIKE 'workflow:%'
+            THEN '{BucketKind.WORKFLOW}'
         WHEN f.kind = 'subagent'
              AND s.parent_message_dedup_key IS NOT NULL
              AND s.subagent_type IS NOT NULL
@@ -32,6 +37,10 @@ _BUCKET_NAME_EXPR = f"""
     CASE
         WHEN f.kind = 'main'         THEN '{BucketKind.MAIN}'
         WHEN f.kind = 'auto-compact' THEN '{BucketKind.AUTO_COMPACT}'
+        WHEN f.kind = 'subagent'
+             AND s.parent_message_dedup_key IS NOT NULL
+             AND s.subagent_type LIKE 'workflow:%'
+            THEN s.subagent_type
         WHEN f.kind = 'subagent'
              AND s.parent_message_dedup_key IS NOT NULL
              AND s.subagent_type IS NOT NULL

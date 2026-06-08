@@ -26,6 +26,9 @@ logger = logging.getLogger("ccforensics.index")
 
 _AUTOCOMPACT_FILENAME = re.compile(r"^agent-acompact-([0-9a-f]+)\.jsonl$", re.IGNORECASE)
 _SUBAGENT_FILENAME = re.compile(r"^agent-([0-9a-f]+)\.jsonl$", re.IGNORECASE)
+_WORKFLOW_AGENT_RE = re.compile(
+    r"subagents/workflows/wf_[^/]+/agent-([0-9a-f]+)\.jsonl$", re.IGNORECASE
+)
 
 _COMMAND_WRAPPER_RE = re.compile(
     r"<command-(name|message|args)>.*?</command-\1>",
@@ -64,7 +67,7 @@ def _is_pure_hook_injection(text: str) -> bool:
     return _HOOK_INJECTION_MARKER in text and len(text) > 500
 
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 MIGRATIONS: list[list[str]] = [
     [
@@ -275,6 +278,22 @@ MIGRATIONS: list[list[str]] = [
         "ALTER TABLE messages ADD COLUMN speed TEXT",
         "UPDATE files SET mtime_ns = 0",
     ],
+    # v5 → v6: dynamic-workflow attribution. Workflow-tool agents live at
+    # ``<enc>/<sess>/subagents/workflows/wf_<id>/agent-<hex>.jsonl`` — two
+    # levels below ``subagents/`` — so the pre-v6 ``_classify_file`` mislabeled
+    # them as ``main`` sessions named ``agent-<hex>`` (and ``journal``). Purge
+    # those phantom rows, drop the workflow files rows (CASCADE removes their
+    # messages), then cold-reconcile so the files re-classify into the new
+    # ``workflow:<name>`` bucket.
+    [
+        "DELETE FROM session_rollups WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
+        "DELETE FROM session_summaries WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
+        "DELETE FROM session_signals WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
+        "DELETE FROM skill_activations WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
+        "DELETE FROM messages WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
+        "DELETE FROM files WHERE path LIKE '%/subagents/workflows/%'",
+        "UPDATE files SET mtime_ns = 0",
+    ],
 ]
 
 
@@ -306,16 +325,26 @@ def _classify_file(path: Path) -> tuple[str, str | None, str]:
     - Main session:  ``<enc>/<sessionId>.jsonl``
     - Subagent:      ``<enc>/<sessionId>/subagents/agent-<hex>.jsonl``
     - Auto-compact:  ``<enc>/<sessionId>/subagents/agent-acompact-<hex>.jsonl``
+    - Workflow:      ``<enc>/<sessionId>/subagents/workflows/wf_<id>/agent-<hex>.jsonl``
 
     Auto-compact files are Claude Code's internal context-compaction
     artifacts (no meta.json, no parent Agent/Task call). They still carry
     billable cost but don't belong in ``subagent_spawns``; they get their
     own bucket at attribution time.
 
+    Dynamic-workflow agents nest two levels below ``subagents/``; they are
+    classified as ``subagent`` with the orchestrator session id (the dir
+    three levels up) so spawn discovery can link them to the parent
+    ``Workflow`` tool_use — see ``discover_spawn(is_workflow=True)``.
+
     Files under ``subagents/`` that match neither pattern are classified
     as ``subagent`` with ``agent_id=None`` and a warning is logged — never
     silently mislabeled as ``main``.
     """
+    wf = _WORKFLOW_AGENT_RE.search(path.as_posix())
+    if wf:
+        # parents: [0]=wf_<id>, [1]=workflows, [2]=subagents, [3]=<session>
+        return ("subagent", wf.group(1), path.parents[3].name)
     name = path.name
     if path.parent.name == "subagents":
         m = _AUTOCOMPACT_FILENAME.match(name)
@@ -334,8 +363,14 @@ def _classify_file(path: Path) -> tuple[str, str | None, str]:
 
 
 def _parent_session_path(subagent_path: Path) -> Path:
-    """``<enc>/<sess>/subagents/agent-<id>.jsonl`` → ``<enc>/<sess>.jsonl``."""
-    session_dir = subagent_path.parent.parent
+    """Subagent file → its orchestrator ``<enc>/<sess>.jsonl``.
+
+    Direct subagents nest one level (``<sess>/subagents/``); workflow agents
+    nest three (``<sess>/subagents/workflows/wf_<id>/``)."""
+    if _WORKFLOW_AGENT_RE.search(subagent_path.as_posix()):
+        session_dir = subagent_path.parents[3]
+    else:
+        session_dir = subagent_path.parent.parent
     return session_dir.parent / f"{session_dir.name}.jsonl"
 
 
@@ -401,6 +436,7 @@ def _reconcile_spawn(
         child_entries=child_entries,
         parent_entries=parent_entries,
         meta=meta,
+        is_workflow=bool(_WORKFLOW_AGENT_RE.search(subagent_path.as_posix())),
     )
     if spawn is None:
         return
@@ -840,6 +876,10 @@ def reconcile_projects_dir(
     # That ordering guarantees a subagent's spawn discovery sees its
     # parent main file already indexed.
     for path in sorted(projects_dir.rglob("*.jsonl"), key=str):
+        if path.name == "journal.jsonl":
+            # Workflow orchestration log — not a transcript, carries no billable
+            # usage. Skipping avoids a phantom 'journal' session.
+            continue
         stats.files_scanned += 1
         stat = path.stat()
         if _row_is_unchanged(conn, path, stat.st_mtime_ns, stat.st_size):

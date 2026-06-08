@@ -216,10 +216,23 @@ def test_fallback_hardcoded_covers_current_claude_models() -> None:
     assert "claude-haiku-4-5-20251001" in data
     assert "claude-opus-4-6" in data
     assert "claude-opus-4-7" in data
+    assert "claude-opus-4-8" in data
     assert "claude-sonnet-4-6" in data
     for _key, entry in data.items():
         assert "input_cost_per_token" in entry
         assert "output_cost_per_token" in entry
+
+
+def test_fallback_hardcoded_opus_4_8_rates() -> None:
+    """Opus 4.8 standard pricing: $5/$25 per MTok, cache 5m $6.25 / 1h $10 /
+    read $0.50 (same as 4.6/4.7). The default model — pin it so a LiteLLM
+    fetch failure doesn't leave opus-4-8 rows with NULL cost."""
+    entry = fallback_hardcoded()["claude-opus-4-8"]
+    assert entry["input_cost_per_token"] == 0.000005
+    assert entry["output_cost_per_token"] == 0.000025
+    assert entry["cache_creation_input_token_cost"] == 0.00000625
+    assert entry["cache_creation_input_token_cost_above_1hr"] == 0.00001
+    assert entry["cache_read_input_token_cost"] == 0.0000005
 
 
 def test_fallback_hardcoded_includes_1h_rates_for_4x_models() -> None:
@@ -232,6 +245,7 @@ def test_fallback_hardcoded_includes_1h_rates_for_4x_models() -> None:
     for key in (
         "claude-opus-4-6",
         "claude-opus-4-7",
+        "claude-opus-4-8",
         "claude-opus-4-5-20251101",
         "claude-opus-4-1-20250805",
         "claude-sonnet-4-6",

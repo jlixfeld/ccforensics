@@ -762,3 +762,80 @@ def test_invariant_holds_after_v3_migration(tmp_path: Path, pricing_data: dict) 
 
     violators = find_invariant_violators(conn, tolerance=1e-6)
     assert violators == [], f"invariant violated for sessions: {violators}"
+
+
+def test_workflow_bucket_first_class(tmp_path: Path, pricing_data: dict) -> None:
+    proj = tmp_path / "projects"
+    enc = proj / "-home-test"
+    sid = "sess-wf"
+    # Orchestrator session: a Workflow tool_use on an assistant message.
+    _write_jsonl(
+        enc / f"{sid}.jsonl",
+        [
+            _user("u1", sid, "2026-06-08T10:00:00Z", "go", cwd="/home/test"),
+            _assistant(
+                "u2",
+                sid,
+                "2026-06-08T10:00:10Z",
+                msg_id="m1",
+                req_id="r1",
+                content=[
+                    {
+                        "type": "tool_use",
+                        "id": "tu-wf",
+                        "name": "Workflow",
+                        "input": {"script": "export const meta = { name: 'sdk-drift-audit' }"},
+                    }
+                ],
+            ),
+        ],
+    )
+    wf_dir = enc / sid / "subagents" / "workflows" / "wf_2328ca35-f9d"
+    wf_dir.mkdir(parents=True)
+    _write_jsonl(
+        wf_dir / "agent-dead.jsonl",
+        [
+            _assistant(
+                "c1",
+                sid,
+                "2026-06-08T10:00:20Z",
+                msg_id="m2",
+                req_id="r2",
+                model="claude-haiku-4-5-20251001",
+                agentId="dead",
+                isSidechain=True,
+            ),
+        ],
+    )
+    (wf_dir / "agent-dead.meta.json").write_text('{"agentType":"Explore"}')
+    # journal.jsonl must be ignored — write a non-transcript line.
+    _write_jsonl(wf_dir / "journal.jsonl", [{"event": "phase", "label": "Research"}])
+
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    ensure_schema(conn)
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    rollups = {
+        (r[0], r[1]): r[2]
+        for r in conn.execute(
+            "SELECT bucket_kind, bucket_name, cost_usd FROM session_rollups WHERE session_id=?",
+            (sid,),
+        ).fetchall()
+    }
+    # First-class workflow bucket, named by meta.name (NOT the per-agent Explore).
+    assert ("workflow", "workflow:sdk-drift-audit") in rollups
+    assert ("main", "main") in rollups
+    # No phantom 'agent-<hex>' or 'journal' session anywhere.
+    phantom = conn.execute(
+        "SELECT COUNT(*) FROM session_rollups WHERE session_id LIKE 'agent-%' OR session_id='journal'"
+    ).fetchone()[0]
+    assert phantom == 0
+    # Invariant holds for this session.
+    assert verify_invariant(conn, sid)[0]
+    # Per-message model is still derivable from the workflow agent's row.
+    model = conn.execute(
+        "SELECT model FROM messages WHERE session_id=? AND model='claude-haiku-4-5-20251001'",
+        (sid,),
+    ).fetchone()
+    assert model is not None

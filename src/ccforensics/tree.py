@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -9,6 +10,34 @@ from pathlib import Path
 from .models import SpawnMeta, TranscriptEntry
 
 logger = logging.getLogger("ccforensics.tree")
+
+_WORKFLOW_NAME_RE = re.compile(r"name:\s*['\"]([^'\"]+)['\"]")
+_WORKFLOW_SCRIPTPATH_SUFFIX_RE = re.compile(r"-wf_[0-9a-z-]+$", re.IGNORECASE)
+
+
+def _workflow_name(inp: object) -> str | None:
+    """Best-effort workflow name from a ``Workflow`` tool_use input.
+
+    Priority: saved-workflow ``name`` → ``scriptPath`` filename stem (minus
+    the trailing ``-wf_<id>``) → inline ``script`` ``meta.name`` regex. Returns
+    ``None`` if all fail; the caller substitutes the ``wf_<id>`` directory name.
+    """
+    if not isinstance(inp, dict):
+        return None
+    name = inp.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    script_path = inp.get("scriptPath")
+    if isinstance(script_path, str) and script_path.strip():
+        stem = _WORKFLOW_SCRIPTPATH_SUFFIX_RE.sub("", Path(script_path).stem)
+        if stem:
+            return stem
+    script = inp.get("script")
+    if isinstance(script, str):
+        m = _WORKFLOW_NAME_RE.search(script)
+        if m:
+            return m.group(1)
+    return None
 
 
 @dataclass(frozen=True)
@@ -161,6 +190,26 @@ def _iter_agent_tool_uses(
             yield entry.timestamp, entry.uuid, block.id, subtype
 
 
+def _iter_workflow_tool_uses(
+    parent_entries: Iterable[TranscriptEntry],
+    before: datetime,
+) -> Iterable[tuple[datetime, str, str, str | None]]:
+    """Yield ``(ts, emitter_uuid, tool_use_id, workflow_name)`` for every
+    ``Workflow`` tool_use emitted before ``before``. ``workflow_name`` is
+    ``None`` when it can't be extracted from the call input."""
+    for entry in parent_entries:
+        if entry.timestamp > before:
+            continue
+        if entry.uuid is None or entry.message is None:
+            continue
+        for block in entry.message.content or []:
+            if block.type != "tool_use" or block.name != "Workflow":
+                continue
+            if not block.id:
+                continue
+            yield entry.timestamp, entry.uuid, block.id, _workflow_name(block.input)
+
+
 def discover_spawn(
     *,
     parent_session_id: str,
@@ -169,32 +218,40 @@ def discover_spawn(
     child_entries: Iterable[TranscriptEntry],
     parent_entries: Iterable[TranscriptEntry],
     meta: SpawnMeta | None,
+    is_workflow: bool = False,
 ) -> Spawn | None:
-    """Link a subagent file to its parent Agent/Task call. Rank key
-    ``(type_match, timestamp)``: matches dominate, nearest wins."""
+    """Link a subagent file to its parent Agent/Task call (or, when
+    ``is_workflow``, its parent ``Workflow`` call). Rank key for Agent/Task is
+    ``(type_match, timestamp)``; for workflows it is ``timestamp`` alone
+    (nearest-before)."""
     child_list = list(child_entries)
     if not child_list:
         return None
 
     ts_spawned = min(e.timestamp for e in child_list)
 
-    wanted = meta.agent_type if meta else None
-    candidates = list(_iter_agent_tool_uses(parent_entries, before=ts_spawned))
-
     parent_uuid: str | None = None
     parent_tu_id: str | None = None
-    parent_subtype: str | None = None
-    if candidates:
-        _, uid, tu_id, subtype = max(
-            candidates,
-            key=lambda c: ((c[3] == wanted) if wanted else False, c[0]),
-        )
-        parent_uuid = uid
-        parent_tu_id = tu_id
-        parent_subtype = subtype
 
-    subagent_type = (meta.agent_type if meta else None) or parent_subtype
-    description = meta.description if meta else None
+    if is_workflow:
+        wf_id = Path(child_file_path).parent.name
+        candidates = list(_iter_workflow_tool_uses(parent_entries, before=ts_spawned))
+        name: str | None = None
+        if candidates:
+            _, parent_uuid, parent_tu_id, name = max(candidates, key=lambda c: c[0])
+        subagent_type: str | None = "workflow:" + (name or wf_id)
+        description = meta.description if meta else None
+    else:
+        wanted = meta.agent_type if meta else None
+        candidates = list(_iter_agent_tool_uses(parent_entries, before=ts_spawned))
+        parent_subtype: str | None = None
+        if candidates:
+            _, parent_uuid, parent_tu_id, parent_subtype = max(
+                candidates,
+                key=lambda c: ((c[3] == wanted) if wanted else False, c[0]),
+            )
+        subagent_type = (meta.agent_type if meta else None) or parent_subtype
+        description = meta.description if meta else None
 
     model_hint: str | None = None
     for entry in sorted(child_list, key=lambda e: e.timestamp):

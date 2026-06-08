@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`ccforensics` is a CLI that parses `~/.claude/projects/**/*.jsonl` and attributes every message's cost to exactly one bucket — `main`, `subagent:<type>`, `auto-compact`, or `unattributed` — so a user can tell which plugins/skills/subagents are driving their Claude Code spend. See `docs/specs/design.md` for the normative design and `docs/specs/problem-statement.md` for motivation.
+`ccforensics` is a CLI that parses `~/.claude/projects/**/*.jsonl` and attributes every message's cost to exactly one bucket — `main`, `subagent:<type>`, `workflow:<name>`, `auto-compact`, or `unattributed` — so a user can tell which plugins/skills/subagents are driving their Claude Code spend. See `docs/specs/design.md` for the normative design and `docs/specs/problem-statement.md` for motivation.
 
 Additional reports layered on the same index: cache efficiency + savings (cost-weighted, exact arithmetic), per-tool / per-MCP-server spend (`tools` command — isolated cost is exact, shared exposure is an upper bound), and `service_tier` capture (precursor to fast-mode pricing; pricing branch deferred). See `docs/specs/2026-05-02-cache-tools-tier-design.md`.
 
@@ -57,12 +57,17 @@ The bucket decision is a single SQL CASE over `files.kind` and `subagent_spawns.
 
 - `main`: primary session file.
 - `subagent:<type>`: subagent file **and** `subagent_spawns` has a resolved `parent_message_dedup_key` + `subagent_type`.
+- `workflow:<name>`: dynamic-workflow agent (`subagents/workflows/wf_<id>/agent-<hex>.jsonl`) — first-class bucket, `subagent_type LIKE 'workflow:%'` set from the parent `Workflow` tool_use input. Reuses the `subagent_spawns` plumbing.
 - `auto-compact`: `agent-acompact-*.jsonl` — real billable cost from Claude Code's context-compaction worker, explicitly bucketed, not routed to `unattributed`.
-- `unattributed`: subagent file whose parent Agent/Task call couldn't be resolved (~0.5% on real corpus).
+- `unattributed`: subagent file whose parent Agent/Task (or `Workflow`) call couldn't be resolved (~0.5% on real corpus).
 
-### Schema (current: v5)
+### Schema (current: v6)
 
 Migrations live in `index.py::MIGRATIONS` and are gated by `PRAGMA user_version`. `CURRENT_SCHEMA_VERSION` in the same file pins the active target.
+
+**v6 (2026-06-08)** — dynamic-workflow attribution:
+
+- Workflow-tool agents (`<enc>/<sess>/subagents/workflows/wf_<id>/agent-<hex>.jsonl`) classify as `subagent` kind with the **orchestrator** session id (path `parents[3]`), via `_WORKFLOW_AGENT_RE` in `_classify_file` — not phantom `main` sessions named `agent-<hex>`. `discover_spawn(is_workflow=True)` matches the parent `Workflow` tool_use (nearest-before) and sets `subagent_type = "workflow:<name>"` from `_workflow_name` (input `name` → `scriptPath` stem → inline `meta.name` → `wf_<id>` fallback), **ignoring** the per-agent `meta.agentType` (which can be `Explore`, `workflow-subagent`, …). One `Workflow` call → N agents share one `parent_message_dedup_key`. `journal.jsonl` is skipped in the reconcile walk. `attribution.py` renders a first-class `workflow:<name>` bucket (`BucketKind.WORKFLOW`). The migration purges pre-existing `agent-<hex>`/`journal` phantom sessions (across messages/rollups/summaries/signals/skill_activations) and cold-reconciles. Known limit: a workflow launched from inside a subagent file may not resolve a parent → `unattributed`.
 
 **v5 (2026-05-22)** — per-TTL cache-creation split + speed capture:
 
