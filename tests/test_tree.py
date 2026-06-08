@@ -420,3 +420,103 @@ def test_workflow_name_none_when_unparseable() -> None:
     assert _workflow_name({"script": "no meta here"}) is None
     assert _workflow_name({}) is None
     assert _workflow_name("not a dict") is None
+
+
+# ---------- discover_spawn workflow ----------
+
+
+def _wf_parent_entries() -> list[TranscriptEntry]:
+    return [
+        parse_entry({
+            "type": "assistant",
+            "uuid": "p1",
+            "sessionId": "SESS",
+            "timestamp": "2026-06-08T10:00:00Z",
+            "requestId": "r1",
+            "message": {
+                "id": "m1",
+                "role": "assistant",
+                "model": "claude-opus-4-8",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "tu-wf",
+                    "name": "Workflow",
+                    "input": {"script": "export const meta = { name: 'sdk-drift-audit' }"},
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        }),
+    ]
+
+
+def _wf_child_entries() -> list[TranscriptEntry]:
+    return [
+        parse_entry({
+            "type": "assistant",
+            "uuid": "c1",
+            "sessionId": "SESS",
+            "agentId": "dead",
+            "timestamp": "2026-06-08T10:00:30Z",
+            "isSidechain": True,
+            "requestId": "r2",
+            "message": {
+                "id": "m2",
+                "role": "assistant",
+                "model": "claude-haiku-4-5-20251001",
+                "content": [{"type": "text", "text": "x"}],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        }),
+    ]
+
+
+def test_discover_spawn_workflow_links_and_names() -> None:
+    child_path = Path("/p/-enc/SESS/subagents/workflows/wf_2328ca35-f9d/agent-dead.jsonl")
+    meta = SpawnMeta(agentType="Explore")  # per-agent type MUST be ignored for the bucket name
+    spawn = discover_spawn(
+        parent_session_id="SESS",
+        child_agent_id="dead",
+        child_file_path=child_path,
+        child_entries=_wf_child_entries(),
+        parent_entries=_wf_parent_entries(),
+        meta=meta,
+        is_workflow=True,
+    )
+    assert spawn is not None
+    assert spawn.subagent_type == "workflow:sdk-drift-audit"
+    assert spawn.parent_tool_use_id == "tu-wf"
+    assert spawn.parent_message_uuid == "p1"
+    assert spawn.model_hint == "claude-haiku-4-5-20251001"
+
+
+def test_discover_spawn_workflow_falls_back_to_wf_id() -> None:
+    child_path = Path("/p/-enc/SESS/subagents/workflows/wf_abc123/agent-dead.jsonl")
+    parent = _wf_parent_entries()
+    parent[0].message.content[0].input = {}  # type: ignore[index]  # wipe the script so no name extractable
+    spawn = discover_spawn(
+        parent_session_id="SESS",
+        child_agent_id="dead",
+        child_file_path=child_path,
+        child_entries=_wf_child_entries(),
+        parent_entries=parent,
+        meta=None,
+        is_workflow=True,
+    )
+    assert spawn is not None
+    assert spawn.subagent_type == "workflow:wf_abc123"
+
+
+def test_discover_spawn_workflow_unresolvable_parent() -> None:
+    child_path = Path("/p/-enc/SESS/subagents/workflows/wf_abc123/agent-dead.jsonl")
+    spawn = discover_spawn(
+        parent_session_id="SESS",
+        child_agent_id="dead",
+        child_file_path=child_path,
+        child_entries=_wf_child_entries(),
+        parent_entries=[],
+        meta=None,
+        is_workflow=True,
+    )
+    assert spawn is not None
+    assert spawn.parent_message_uuid is None
+    assert spawn.subagent_type == "workflow:wf_abc123"
