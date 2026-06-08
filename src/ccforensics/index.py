@@ -64,7 +64,7 @@ def _is_pure_hook_injection(text: str) -> bool:
     return _HOOK_INJECTION_MARKER in text and len(text) > 500
 
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 MIGRATIONS: list[list[str]] = [
     [
@@ -273,6 +273,22 @@ MIGRATIONS: list[list[str]] = [
         "ALTER TABLE messages ADD COLUMN cache_creation_1h INTEGER",
         "ALTER TABLE messages ADD COLUMN cache_creation_5m INTEGER",
         "ALTER TABLE messages ADD COLUMN speed TEXT",
+        "UPDATE files SET mtime_ns = 0",
+    ],
+    # v5 → v6: dynamic-workflow attribution. Workflow-tool agents live at
+    # ``<enc>/<sess>/subagents/workflows/wf_<id>/agent-<hex>.jsonl`` — two
+    # levels below ``subagents/`` — so the pre-v6 ``_classify_file`` mislabeled
+    # them as ``main`` sessions named ``agent-<hex>`` (and ``journal``). Purge
+    # those phantom rows, drop the workflow files rows (CASCADE removes their
+    # messages), then cold-reconcile so the files re-classify into the new
+    # ``workflow:<name>`` bucket.
+    [
+        "DELETE FROM session_rollups WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
+        "DELETE FROM session_summaries WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
+        "DELETE FROM session_signals WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
+        "DELETE FROM skill_activations WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
+        "DELETE FROM messages WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
+        "DELETE FROM files WHERE path LIKE '%/subagents/workflows/%'",
         "UPDATE files SET mtime_ns = 0",
     ],
 ]
