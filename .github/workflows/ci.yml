@@ -126,7 +126,7 @@ jobs:
           # gets a placeholder. CI holds no real secrets; these only let the
           # compose file parse so the build resolves.
           stub_env() {
-            local compose="$1" dir env cur
+            local compose="$1" dir env cur vars v
             dir="$(dirname "$compose")"
             env="$dir/.env"
             # Seed from an example if present, else start empty.
@@ -136,16 +136,18 @@ jobs:
               done
               [ -f "$env" ] || : > "$env"
             fi
-            # Ensure every ${VAR...} the compose references resolves to a NON-EMPTY
-            # value. `${VAR:?msg}` hard-fails at parse time when the value is
-            # empty (an example may ship the key blank), so fill blanks/missing
-            # with a placeholder; compose uses the last definition, so appending
-            # overrides an earlier empty one. CI holds no real secrets.
-            grep -hoE '\$\{[A-Za-z_][A-Za-z0-9_]*' "$compose" 2>/dev/null \
-              | sed 's/^\${//' | sort -u | while read -r v; do
-                cur="$(grep -E "^$v=" "$env" 2>/dev/null | tail -1 | cut -d= -f2-)"
-                [ -n "$cur" ] || echo "$v=ci-stub" >> "$env"
-              done
+            # Only `${VAR:?msg}` / `${VAR?msg}` hard-fail at parse time on an
+            # empty/unset value. `${VAR:-default}` and bare `${VAR}` tolerate
+            # empty — stubbing them would override a sensible default and break
+            # the build. So placeholder ONLY the required vars, and only when
+            # blank/missing (an example may ship the key blank). `|| true` keeps
+            # a no-match grep from aborting the `-e` shell. CI holds no secrets.
+            vars="$(grep -hoE '\$\{[A-Za-z_][A-Za-z0-9_]*:?\?' "$compose" 2>/dev/null \
+                    | sed -E 's/^\$\{//; s/:?\?$//' | sort -u || true)"
+            for v in $vars; do
+              cur="$(grep -E "^$v=" "$env" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+              [ -n "$cur" ] || echo "$v=ci-stub" >> "$env"
+            done
           }
           compose=( docker-compose.y*ml compose.y*ml */docker-compose.y*ml */compose.y*ml )
           if [ ${#compose[@]} -gt 0 ]; then
