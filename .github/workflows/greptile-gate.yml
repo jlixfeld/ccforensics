@@ -1,0 +1,63 @@
+# Enforcement gate for Greptile AI review.
+#
+# Greptile detects but does not block: its own "Greptile Review" status check
+# reports success on completion regardless of findings (verified: it stayed
+# green on a 2/5-confidence command-injection bug), and it is flaky — it can
+# fail to post a check at all on a clean first review. So it must NOT be a
+# required check. This workflow turns Greptile's PR-body confidence score into
+# a hard, deterministic merge gate instead.
+#
+# Greptile writes "Confidence Score: N/5" into the PR description when it
+# finishes reviewing (shouldUpdateDescription, default true). Editing the
+# description fires `pull_request: edited`, which re-runs this gate — so the
+# gate clears the moment Greptile posts a passing score.
+#
+# Fail-closed: missing score (review still pending) or score < THRESHOLD => red.
+# Required in branch protection alongside lint/sast/secrets/uv-checks/docker-build.
+name: greptile-gate
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  greptile-gate:
+    name: greptile-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Enforce Greptile confidence threshold
+        env:
+          # PR body is attacker-controlled — never inline in run:, pass via env.
+          BODY: ${{ github.event.pull_request.body }}
+          THRESHOLD: "4"
+        run: |
+          set -euo pipefail
+
+          # First digit-bearing "Confidence Score: N/5" Greptile injects.
+          score="$(printf '%s' "$BODY" \
+            | grep -oiE 'Confidence Score:[[:space:]]*[0-9]+/5' \
+            | head -1 | grep -oE '[0-9]+' | head -1 || true)"
+
+          if [ -z "$score" ]; then
+            echo "::error::No Greptile confidence score in PR description yet."
+            echo "Greptile review is pending or shouldUpdateDescription is off."
+            echo "Gate stays red until Greptile posts a score >= $THRESHOLD/5."
+            exit 1
+          fi
+
+          echo "Greptile confidence: $score/5 (threshold: $THRESHOLD/5)"
+
+          if [ "$score" -lt "$THRESHOLD" ]; then
+            echo "::error::Greptile confidence $score/5 below threshold $THRESHOLD/5 — blocking merge."
+            exit 1
+          fi
+
+          echo "Confidence $score/5 meets threshold — gate passes."
