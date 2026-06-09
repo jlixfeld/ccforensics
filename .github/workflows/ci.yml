@@ -119,23 +119,39 @@ jobs:
           # each Dockerfile in its own directory. Repos with neither no-op.
           # No secrets, no push — this only proves the images still build.
           shopt -s nullglob
-          # Compose `env_file:` / `${VAR:?}` placeholders need a .env to exist.
+          # Compose `${VAR}` / `${VAR:?msg}` placeholders need a .env to exist.
           # Seed a stub next to each compose file from an example if present,
-          # else an empty file (defaults via ${VAR:-...} still apply). CI never
-          # holds real secrets — this only lets the build resolve.
+          # else synthesize one. NB: `${VAR:?msg}` hard-fails at parse time on an
+          # EMPTY value, so an empty .env is not enough — every referenced var
+          # gets a placeholder. CI holds no real secrets; these only let the
+          # compose file parse so the build resolves.
           stub_env() {
-            local dir="$1"
-            [ -f "$dir/.env" ] && return
-            for ex in "$dir/.env.example" "$dir/.env.sample"; do
-              [ -f "$ex" ] && { cp "$ex" "$dir/.env"; return; }
-            done
-            : > "$dir/.env"
+            local compose="$1" dir env cur
+            dir="$(dirname "$compose")"
+            env="$dir/.env"
+            # Seed from an example if present, else start empty.
+            if [ ! -f "$env" ]; then
+              for ex in "$dir/.env.example" "$dir/.env.sample"; do
+                [ -f "$ex" ] && { cp "$ex" "$env"; break; }
+              done
+              [ -f "$env" ] || : > "$env"
+            fi
+            # Ensure every ${VAR...} the compose references resolves to a NON-EMPTY
+            # value. `${VAR:?msg}` hard-fails at parse time when the value is
+            # empty (an example may ship the key blank), so fill blanks/missing
+            # with a placeholder; compose uses the last definition, so appending
+            # overrides an earlier empty one. CI holds no real secrets.
+            grep -hoE '\$\{[A-Za-z_][A-Za-z0-9_]*' "$compose" 2>/dev/null \
+              | sed 's/^\${//' | sort -u | while read -r v; do
+                cur="$(grep -E "^$v=" "$env" 2>/dev/null | tail -1 | cut -d= -f2-)"
+                [ -n "$cur" ] || echo "$v=ci-stub" >> "$env"
+              done
           }
           compose=( docker-compose.y*ml compose.y*ml */docker-compose.y*ml */compose.y*ml )
           if [ ${#compose[@]} -gt 0 ]; then
             fail=0
             for f in "${compose[@]}"; do
-              stub_env "$(dirname "$f")"
+              stub_env "$f"
               echo "::group::docker compose -f $f build"
               docker compose -f "$f" build || fail=1
               echo "::endgroup::"
