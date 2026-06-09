@@ -1,24 +1,30 @@
-# Enforcement gate for Greptile AI review.
+# Enforcement gate for Greptile AI review — forge-proof, SHA-anchored.
 #
-# Greptile detects but does not block: its own "Greptile Review" status check
-# reports success on completion regardless of findings (verified: it stayed
-# green on a 2/5-confidence command-injection bug), and it is flaky — it can
-# fail to post a check at all on a clean first review. So it must NOT be a
-# required check. This workflow turns Greptile's PR-body confidence score into
-# a hard, deterministic merge gate instead.
+# Greptile detects but does not block: its native "Greptile Review" check is
+# completion-only (green even on a real bug) and flaky. This gate turns
+# Greptile's confidence score into a hard, deterministic merge block.
 #
-# Greptile writes "Confidence Score: N/5" into the PR description when it
-# finishes reviewing (shouldUpdateDescription, default true). Editing the
-# description fires `pull_request: edited`, which re-runs this gate — so the
-# gate clears the moment Greptile posts a passing score.
+# SECURITY MODEL — the score is read ONLY from a comment authored by
+# `greptile-apps[bot]` that references the PR's CURRENT head commit SHA:
+#   - Forge-proof: a PR author cannot post (or edit) a comment AS the bot, so
+#     the author cannot fabricate a passing score. (Reading the score from the
+#     author-editable PR description — an earlier design — was trivially
+#     bypassable; do NOT revert to that.)
+#   - No stale-score window: the comment must contain the head SHA, so a score
+#     from a previous commit never satisfies a newer one.
 #
-# Fail-closed: missing score (review still pending) or score < THRESHOLD => red.
-# Required in branch protection alongside lint/sast/secrets/uv-checks/docker-build.
+# PREREQUISITES (Greptile dashboard, global — one-time per account):
+#   - Code Review Settings > PR Summaries > "Update original summary" = OFF
+#     (so Greptile posts its score as a bot COMMENT, not into the PR body).
+#   - Review on every commit / update = ON (so each push is re-reviewed and a
+#     fresh bot comment for the new head SHA appears; otherwise the gate blocks
+#     until you re-trigger Greptile manually — fail-closed by design).
+# Plus: the repo must be enrolled in the Greptile dashboard.
 name: greptile-gate
 
 on:
   pull_request:
-    types: [opened, edited, synchronize, reopened]
+    types: [opened, reopened, synchronize]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -26,38 +32,48 @@ concurrency:
 
 permissions:
   contents: read
+  pull-requests: read
+  issues: read
 
 jobs:
   greptile-gate:
     name: greptile-gate
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 12
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      THRESHOLD: "4"
+      MAX_WAIT_SECS: "420"
+      POLL_SECS: "15"
     steps:
-      - name: Enforce Greptile confidence threshold
-        env:
-          # PR body is attacker-controlled — never inline in run:, pass via env.
-          BODY: ${{ github.event.pull_request.body }}
-          THRESHOLD: "4"
+      - name: Enforce Greptile confidence (bot comment, anchored to head SHA)
         run: |
           set -euo pipefail
-
-          # First digit-bearing "Confidence Score: N/5" Greptile injects.
-          score="$(printf '%s' "$BODY" \
-            | grep -oiE 'Confidence Score:[[:space:]]*[0-9]+/5' \
-            | head -1 | grep -oE '[0-9]+' | head -1 || true)"
-
-          if [ -z "$score" ]; then
-            echo "::error::No Greptile confidence score in PR description yet."
-            echo "Greptile review is pending or shouldUpdateDescription is off."
-            echo "Gate stays red until Greptile posts a score >= $THRESHOLD/5."
-            exit 1
-          fi
-
-          echo "Greptile confidence: $score/5 (threshold: $THRESHOLD/5)"
-
+          deadline=$(( SECONDS + MAX_WAIT_SECS ))
+          score=""
+          while :; do
+            # Only the bot can author this comment, and it must reference the
+            # current head SHA — neither is forgeable by the PR author.
+            body="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+              --jq "[.[] | select(.user.login==\"greptile-apps[bot]\") | select(.body | contains(\"$HEAD_SHA\")) | .body] | last // empty")"
+            if [ -n "$body" ]; then
+              score="$(printf '%s' "$body" | grep -oiE 'Confidence Score:[[:space:]]*[0-9]+/5' | grep -oE '[0-9]+' | head -1 || true)"
+              [ -n "$score" ] && break
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::No greptile-apps[bot] review comment for head commit $HEAD_SHA after ${MAX_WAIT_SECS}s."
+              echo "Repo not enrolled in Greptile, review-on-update disabled, or 'Update original summary' still ON (score goes to PR body, not a comment). Gate fails closed."
+              exit 1
+            fi
+            echo "waiting for Greptile review comment on $HEAD_SHA … (${SECONDS}s elapsed)"
+            sleep "$POLL_SECS"
+          done
+          echo "Greptile confidence for $HEAD_SHA: $score/5 (threshold $THRESHOLD/5)"
           if [ "$score" -lt "$THRESHOLD" ]; then
             echo "::error::Greptile confidence $score/5 below threshold $THRESHOLD/5 — blocking merge."
             exit 1
           fi
-
           echo "Confidence $score/5 meets threshold — gate passes."
