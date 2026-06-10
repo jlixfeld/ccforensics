@@ -60,14 +60,14 @@ def _candidates(model: str) -> list[str]:
     ]
 
 
-def resolve_pricing(model: str, data: dict[str, dict[str, Any]]) -> ModelPrice | None:
-    """Resolve a model name to a ModelPrice via fuzzy lookup.
+def _lookup(model: str, data: dict[str, dict[str, Any]]) -> ModelPrice | None:
+    """Fuzzy-resolve ``model`` against a single pricing dict (no fallback).
 
     Tries the candidate list (exact + common prefixes) first; falls back to
-    substring match where a LiteLLM key is a substring of the model name,
-    picking the longest such key for determinism. The reverse direction
-    (model-substring-of-key) is intentionally dropped: it silently maps short
-    aliases onto arbitrary bedrock/vertex variants with different pricing.
+    substring match where a key is a substring of the model name, picking the
+    longest such key for determinism. The reverse direction (model-substring-
+    of-key) is intentionally dropped: it silently maps short aliases onto
+    arbitrary bedrock/vertex variants with different pricing.
     """
     for c in _candidates(model):
         if c in data:
@@ -85,6 +85,25 @@ def resolve_pricing(model: str, data: dict[str, dict[str, Any]]) -> ModelPrice |
             best[0],
         )
         return ModelPrice.from_entry(best[1])
+    return None
+
+
+def resolve_pricing(model: str, data: dict[str, dict[str, Any]]) -> ModelPrice | None:
+    """Resolve a model name to a ModelPrice, live data first.
+
+    Looks up ``data`` (normally the LiteLLM table) via :func:`_lookup`. When
+    that misses, consults the hardcoded current-model table as a last resort —
+    so a model LiteLLM hasn't ingested yet (e.g. one released today) still
+    prices, instead of resolving to NULL cost on every command. Maintained
+    LiteLLM entries always win because ``data`` is tried first. Returns None
+    only when neither table knows the model.
+    """
+    hit = _lookup(model, data)
+    if hit is not None:
+        return hit
+    fb = fallback_hardcoded()
+    if fb is not data:  # guard against re-scanning when data already IS the fallback
+        return _lookup(model, fb)
     return None
 
 
@@ -129,6 +148,18 @@ def fallback_hardcoded() -> dict[str, dict[str, float]]:
     as the fallback.
     """
     return {
+        "claude-fable-5": {
+            # Mythos-class flagship, released 2026-06-08/09. $10/1M input,
+            # $50/1M output (2x Opus 4.8); standard Anthropic cache multipliers
+            # (5m 1.25x, 1h 2.0x, read 0.1x). LiteLLM does not carry it yet, so
+            # this entry is reached via resolve_pricing's hardcoded last-resort
+            # tier — not only on a full fetch failure.
+            "input_cost_per_token": 0.00001,
+            "output_cost_per_token": 0.00005,
+            "cache_creation_input_token_cost": 0.0000125,
+            "cache_creation_input_token_cost_above_1hr": 0.00002,
+            "cache_read_input_token_cost": 0.000001,
+        },
         "claude-sonnet-4-5-20250929": {
             "input_cost_per_token": 0.000003,
             "output_cost_per_token": 0.000015,

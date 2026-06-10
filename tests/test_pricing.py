@@ -261,6 +261,53 @@ def test_fallback_hardcoded_includes_1h_rates_for_4x_models() -> None:
         ), key
 
 
+def test_fallback_hardcoded_fable_5_rates() -> None:
+    """Claude Fable 5 (released 2026-06-09): $10/1M input, $50/1M output (2x
+    Opus 4.8); standard cache multipliers 5m $12.50 / 1h $20 / read $1.00."""
+    entry = fallback_hardcoded()["claude-fable-5"]
+    assert entry["input_cost_per_token"] == 0.00001
+    assert entry["output_cost_per_token"] == 0.00005
+    assert entry["cache_creation_input_token_cost"] == 0.0000125
+    assert entry["cache_creation_input_token_cost_above_1hr"] == 0.00002
+    assert entry["cache_read_input_token_cost"] == 0.000001
+
+
+def test_resolve_pricing_uses_hardcoded_when_live_data_missing_model(pricing_data: dict) -> None:
+    """The load-bearing fix: claude-fable-5 is NOT in the LiteLLM fixture, so
+    resolve_pricing must fall through to the hardcoded table rather than return
+    None (which would leave fable rows with NULL cost on the live path)."""
+    assert "claude-fable-5" not in pricing_data
+    p = resolve_pricing("claude-fable-5", pricing_data)
+    assert p is not None
+    assert p.input_cost == 0.00001
+    assert p.output_cost == 0.00005
+    assert p.cache_creation_cost == 0.0000125
+    assert p.cache_creation_1h_cost == 0.00002
+    assert p.cache_read_cost == 0.000001
+
+
+def test_resolve_pricing_live_data_wins_over_hardcoded(pricing_data: dict) -> None:
+    """A model present in BOTH live data and the hardcoded table resolves from
+    live data (maintained source of truth), not the hardcoded fallback."""
+    overlaid = {
+        **pricing_data,
+        "claude-fable-5": {
+            "input_cost_per_token": 0.42,  # sentinel — clearly not the hardcoded rate
+            "output_cost_per_token": 0.84,
+        },
+    }
+    p = resolve_pricing("claude-fable-5", overlaid)
+    assert p is not None
+    assert p.input_cost == 0.42
+    assert p.output_cost == 0.84
+
+
+def test_resolve_pricing_still_none_for_truly_unknown(pricing_data: dict) -> None:
+    """Hardcoded last-resort must not turn genuine unknowns into matches —
+    a name absent from both tables still resolves to None."""
+    assert resolve_pricing("definitely-not-a-real-model-xyz", pricing_data) is None
+
+
 def test_pricing_cache_reads_fresh_snapshot(tmp_path: Path, pricing_data: dict) -> None:
     cache_file = tmp_path / "litellm.json"
     cache_file.write_text(json.dumps({"fetched_at": 9999999999, "data": pricing_data}))
