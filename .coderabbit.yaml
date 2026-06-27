@@ -1,0 +1,81 @@
+# yaml-language-server: $schema=https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+#
+# Canonical CodeRabbit config — the AI-review layer of the deploy-ci bundle.
+# CodeRabbit replaces Greptile; it does NOT replace the deterministic CI jobs
+# (lint/secrets/sast/uv-checks/docker-build). Those remain the mechanical,
+# forge-proof gate. CodeRabbit is the semantic reviewer on top.
+#
+# Hard gate: `pre_merge_checks` in `error` mode block ONLY when paired with
+# `request_changes_workflow: true` — CodeRabbit then posts a changes-requested
+# review and auto-approves once checks pass. Branch protection requiring 1
+# approving review (set by set_protection.py) makes that approval the merge gate.
+language: en-US
+tone_instructions: "Be direct and technical. Skip praise. Flag only real issues."
+
+reviews:
+  profile: assertive
+  request_changes_workflow: true
+  poem: false
+  in_progress_fortune: false
+  sequence_diagrams: false
+  collapse_walkthrough: true
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    drafts: false
+  # CI/generated noise CodeRabbit should not review.
+  path_filters:
+    - "!**/*.lock"
+    - "!eval/results*/**"
+    - "!**/*.xcodeproj/**"
+    - "!**/Generated-Info.plist"
+  # Project-specific invariants are NOT hardcoded here — they are inferred from
+  # each repo's CLAUDE.md via knowledge_base.code_guidelines below, so they stay
+  # current as the repo's rules change. The only checks defined inline are the
+  # version-free policy gates in pre_merge_checks.custom_checks.
+  pre_merge_checks:
+    # Only requested reviewers (not the PR author) may override a failed check.
+    override_requested_reviewers_only: true
+    title:
+      mode: error
+    description:
+      mode: warning
+    docstrings:
+      mode: "off"
+    issue_assessment:
+      mode: warning
+    # custom_checks require CodeRabbit Pro+.
+    custom_checks:
+      - name: "No silent failures or weakened gates"
+        mode: error
+        instructions: >-
+          FAIL if the diff swallows exceptions without logging or re-raising,
+          adds a bare `except:`, weakens or disables a CI check to make a repo
+          pass, uses `--no-verify` / a hook-skip flag, or hardcodes a secret.
+          Otherwise PASS.
+      - name: "Secrets hygiene"
+        mode: error
+        instructions: >-
+          FAIL if any credential, token, API key, password, or `.env` value is
+          committed in plaintext (test fixtures with obviously fake values are
+          exempt). Otherwise PASS.
+
+  # The deterministic CI jobs already own these — disable here so CodeRabbit
+  # does not double-report what `lint`/`secrets`/`sast` already gate.
+  tools:
+    ruff:
+      enabled: false
+    gitleaks:
+      enabled: false
+    trufflehog:
+      enabled: false
+    semgrep:
+      enabled: false
+
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "**/CLAUDE.md"
+  learnings:
+    scope: auto
