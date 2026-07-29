@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  push:
+    branches: [main]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
@@ -18,7 +20,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
       - run: uv tool install ruff
       - run: ruff check .
@@ -30,7 +32,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
       - name: Discover uv projects, run mypy + pytest
         shell: bash
@@ -79,14 +81,16 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: trufflesecurity/trufflehog@v3.95.3
+      # No explicit base/head: the action derives the commit range from the
+      # event itself (PR range on pull_request, pushed commits on push).
+      # Hardcoding the pull_request refs made them empty on push events,
+      # which is why this workflow was PR-only.
+      - uses: trufflesecurity/trufflehog@v3.96.0
         with:
           path: ./
-          base: ${{ github.event.pull_request.base.sha }}
-          head: ${{ github.event.pull_request.head.sha }}
           extra_args: --only-verified
 
   sast:
@@ -95,9 +99,9 @@ jobs:
     permissions:
       contents: read
     container:
-      image: returntocorp/semgrep
+      image: semgrep/semgrep:1.172.0
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - run: semgrep ci --config=auto
 
   docker-build:
@@ -106,7 +110,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # QEMU + Buildx so multi-arch `platforms:` builds (e.g. linux/arm64) work.
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
