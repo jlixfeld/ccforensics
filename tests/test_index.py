@@ -144,7 +144,9 @@ def test_v8_migration_adds_meta_sidecar_stat_columns(tmp_path: Path) -> None:
     # No corpus-wide cold reconcile for this migration: the mismatch between
     # a stored NULL and a real sidecar stat is what drives the next walk to
     # re-check subagent files, not a blanket mtime_ns reset.
-    assert conn.execute("SELECT mtime_ns FROM files WHERE path='/p/-enc/S.jsonl'").fetchone()[0] == 999
+    assert (
+        conn.execute("SELECT mtime_ns FROM files WHERE path='/p/-enc/S.jsonl'").fetchone()[0] == 999
+    )
 
 
 def test_classify_workflow_agent_path() -> None:
