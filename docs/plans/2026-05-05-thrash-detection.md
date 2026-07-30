@@ -93,10 +93,10 @@ def test_schema_v4_creates_thrash_columns_and_session_signals(tmp_path: Path) ->
 
 Append to `MIGRATIONS`:
 ```python
-("ALTER TABLE session_rollups ADD COLUMN thrash_score REAL",)
-("ALTER TABLE session_rollups ADD COLUMN thrash_score_version INTEGER",)
-("ALTER TABLE session_rollups ADD COLUMN escalation_event TEXT",)
-(
+[
+    "ALTER TABLE session_rollups ADD COLUMN thrash_score REAL",
+    "ALTER TABLE session_rollups ADD COLUMN thrash_score_version INTEGER",
+    "ALTER TABLE session_rollups ADD COLUMN escalation_event TEXT",
     """CREATE TABLE session_signals (
     session_id     TEXT NOT NULL,
     signal_type    TEXT NOT NULL,
@@ -105,9 +105,9 @@ Append to `MIGRATIONS`:
     signal_version INTEGER NOT NULL,
     PRIMARY KEY (session_id, signal_type)
 )""",
-)
-("CREATE INDEX idx_signals_session ON session_signals(session_id)",)
-("UPDATE files SET mtime_ns = 0",)
+    "CREATE INDEX idx_signals_session ON session_signals(session_id)",
+    "UPDATE files SET mtime_ns = 0",
+]
 ```
 Bump `CURRENT_SCHEMA_VERSION = 4`.
 

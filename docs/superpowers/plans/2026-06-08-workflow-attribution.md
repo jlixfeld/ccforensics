@@ -159,17 +159,15 @@ Append a new element to the `MIGRATIONS` list (after the v5 block's closing `]` 
 # those phantom rows, drop the workflow files rows (CASCADE removes their
 # messages), then cold-reconcile so the files re-classify into the new
 # ``workflow:<name>`` bucket.
-(
-    [
-        "DELETE FROM session_rollups WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
-        "DELETE FROM session_summaries WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
-        "DELETE FROM session_signals WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
-        "DELETE FROM skill_activations WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
-        "DELETE FROM messages WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
-        "DELETE FROM files WHERE path LIKE '%/subagents/workflows/%'",
-        "UPDATE files SET mtime_ns = 0",
-    ],
-)
+[
+    "DELETE FROM session_rollups WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
+    "DELETE FROM session_summaries WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
+    "DELETE FROM session_signals WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
+    "DELETE FROM skill_activations WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
+    "DELETE FROM messages WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
+    "DELETE FROM files WHERE path LIKE '%/subagents/workflows/%'",
+    "UPDATE files SET mtime_ns = 0",
+]
 ```
 
 - [ ] **Step 4: Run test to verify it passes**

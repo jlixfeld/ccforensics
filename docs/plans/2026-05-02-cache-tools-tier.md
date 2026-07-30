@@ -134,23 +134,21 @@ Append to the `MIGRATIONS: list[list[str]]` list (which currently has two inner 
 # table (one row per tool_use block on an assistant message — the writer
 # currently stores only the first). Trailing UPDATE forces cold backfill
 # on next reconcile so existing data populates.
-(
-    [
-        "ALTER TABLE messages ADD COLUMN service_tier TEXT",
-        """CREATE TABLE message_tool_uses (
-        message_dedup_key  TEXT NOT NULL REFERENCES messages(dedup_key) ON DELETE CASCADE,
-        ordinal            INTEGER NOT NULL,
-        tool_use_id        TEXT NOT NULL,
-        tool_name          TEXT NOT NULL,
-        mcp_server         TEXT,
-        args_size_bytes    INTEGER NOT NULL,
-        PRIMARY KEY (message_dedup_key, ordinal)
-    )""",
-        "CREATE INDEX idx_mtu_tool_name ON message_tool_uses(tool_name)",
-        "CREATE INDEX idx_mtu_mcp_server ON message_tool_uses(mcp_server) WHERE mcp_server IS NOT NULL",
-        "UPDATE files SET mtime_ns = 0",
-    ],
-)
+[
+    "ALTER TABLE messages ADD COLUMN service_tier TEXT",
+    """CREATE TABLE message_tool_uses (
+    message_dedup_key  TEXT NOT NULL REFERENCES messages(dedup_key) ON DELETE CASCADE,
+    ordinal            INTEGER NOT NULL,
+    tool_use_id        TEXT NOT NULL,
+    tool_name          TEXT NOT NULL,
+    mcp_server         TEXT,
+    args_size_bytes    INTEGER NOT NULL,
+    PRIMARY KEY (message_dedup_key, ordinal)
+)""",
+    "CREATE INDEX idx_mtu_tool_name ON message_tool_uses(tool_name)",
+    "CREATE INDEX idx_mtu_mcp_server ON message_tool_uses(mcp_server) WHERE mcp_server IS NOT NULL",
+    "UPDATE files SET mtime_ns = 0",
+]
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -477,16 +475,14 @@ Replace the tool_use extraction block with:
 Locate the `INSERT OR REPLACE INTO messages` statement. Add `service_tier` to the column list and the parameter tuple. The column list block should become:
 
 ```python
-(
-    """INSERT OR REPLACE INTO messages (
+"""INSERT OR REPLACE INTO messages (
     dedup_key, file_path, session_id, uuid, parent_uuid,
     source_tool_use_id, source_tool_assistant_uuid,
     tool_use_id, tool_name, agent_id, role, type, model, ts,
     is_sidechain, is_meta,
     input_tokens, output_tokens, cache_creation, cache_read, cost_usd,
     service_tier
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-)
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
 ```
 
 And the parameter tuple's tail should become:
@@ -501,22 +497,22 @@ And the parameter tuple's tail should become:
 Immediately after the `conn.execute(...)` call that inserts the message row, add the per-tool_use loop:
 
 ```python
-for ordinal, tu_id, tu_name, tu_input in tool_uses_for_aux:
-    mcp_server = (
-        tu_name.split("__", 2)[1]
-        if tu_name.startswith("mcp__") and tu_name.count("__") >= 2
-        else None
-    )
-    try:
-        args_size = len(json.dumps(tu_input, sort_keys=True, separators=(",", ":")).encode())
-    except (TypeError, ValueError):
-        args_size = 0
-    conn.execute(
-        """INSERT OR REPLACE INTO message_tool_uses
-           (message_dedup_key, ordinal, tool_use_id, tool_name, mcp_server, args_size_bytes)
-           VALUES (?,?,?,?,?,?)""",
-        (key, ordinal, tu_id, tu_name, mcp_server, args_size),
-    )
+    for ordinal, tu_id, tu_name, tu_input in tool_uses_for_aux:
+        mcp_server = (
+            tu_name.split("__", 2)[1]
+            if tu_name.startswith("mcp__") and tu_name.count("__") >= 2
+            else None
+        )
+        try:
+            args_size = len(json.dumps(tu_input, sort_keys=True, separators=(",", ":")).encode())
+        except (TypeError, ValueError):
+            args_size = 0
+        conn.execute(
+            """INSERT OR REPLACE INTO message_tool_uses
+               (message_dedup_key, ordinal, tool_use_id, tool_name, mcp_server, args_size_bytes)
+               VALUES (?,?,?,?,?,?)""",
+            (key, ordinal, tu_id, tu_name, mcp_server, args_size),
+        )
 ```
 
 - [ ] **Step 4: Run tests to verify pass**
