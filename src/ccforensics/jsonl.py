@@ -201,7 +201,16 @@ def annotate_cost(
     pricing_data: dict[str, dict[str, Any]],
 ) -> list[AnnotatedEntry]:
     """Annotate entries with cost. ``cost_usd=0.0`` for non-billable,
-    ``None`` + ``pricing_unresolved_model`` when pricing can't be resolved."""
+    ``None`` + ``pricing_unresolved_model`` when pricing can't be resolved.
+
+    Each message is priced **as of its own timestamp**, not as of now. For
+    models with a scheduled price change (currently Sonnet 5's launch
+    promotion) that is the difference between billing a message the rate it
+    was actually charged and retroactively re-billing it at whatever rate
+    happens to be current when the index is rebuilt. This only reaches the
+    hardcoded fallback table — LiteLLM publishes current rates only, so on
+    the live path history is still priced at today's rate.
+    """
     out: list[AnnotatedEntry] = []
     for e in entries:
         if e.type != "assistant" or e.message is None or e.message.usage is None:
@@ -211,7 +220,7 @@ def annotate_cost(
         if model is None:
             out.append(AnnotatedEntry(entry=e, cost_usd=None))
             continue
-        price = resolve_pricing(model, pricing_data)
+        price = resolve_pricing(model, pricing_data, at=e.timestamp)
         if price is None:
             out.append(AnnotatedEntry(entry=e, cost_usd=None, pricing_unresolved_model=model))
             continue

@@ -291,7 +291,7 @@ def test_resolve_pricing_opus_5_falls_through_to_hardcoded(pricing_data: dict) -
 def test_fallback_hardcoded_sonnet_5_serves_promo_rates_during_the_window() -> None:
     """Through 2026-08-31 Sonnet 5 bills at the launch promotion, $2/$10 per
     MTok — the same rate LiteLLM serves, so offline and online agree."""
-    entry = fallback_hardcoded(now=datetime(2026, 7, 30, tzinfo=UTC))["claude-sonnet-5"]
+    entry = fallback_hardcoded(at=datetime(2026, 7, 30, tzinfo=UTC))["claude-sonnet-5"]
     assert entry["input_cost_per_token"] == 0.000002
     assert entry["output_cost_per_token"] == 0.00001
     assert entry["cache_creation_input_token_cost"] == 0.0000025
@@ -301,7 +301,7 @@ def test_fallback_hardcoded_sonnet_5_serves_promo_rates_during_the_window() -> N
 
 def test_fallback_hardcoded_sonnet_5_serves_list_rates_after_the_promo() -> None:
     """From 2026-09-01 the promotion lapses and list price ($3/$15) applies."""
-    entry = fallback_hardcoded(now=datetime(2026, 12, 25, tzinfo=UTC))["claude-sonnet-5"]
+    entry = fallback_hardcoded(at=datetime(2026, 12, 25, tzinfo=UTC))["claude-sonnet-5"]
     assert entry["input_cost_per_token"] == 0.000003
     assert entry["output_cost_per_token"] == 0.000015
     assert entry["cache_creation_input_token_cost"] == 0.00000375
@@ -316,11 +316,11 @@ def test_sonnet_5_promo_cutover_is_exact_to_the_second() -> None:
     assert last_promo_instant == datetime(2026, 8, 31, 23, 59, 59, tzinfo=UTC)
 
     assert (
-        fallback_hardcoded(now=last_promo_instant)["claude-sonnet-5"]["input_cost_per_token"]
+        fallback_hardcoded(at=last_promo_instant)["claude-sonnet-5"]["input_cost_per_token"]
         == 0.000002
     )
     assert (
-        fallback_hardcoded(now=SONNET_5_PROMO_ENDS)["claude-sonnet-5"]["input_cost_per_token"]
+        fallback_hardcoded(at=SONNET_5_PROMO_ENDS)["claude-sonnet-5"]["input_cost_per_token"]
         == 0.000003
     )
 
@@ -332,7 +332,7 @@ def test_sonnet_5_promo_cache_rates_are_not_naively_derived() -> None:
     LiteLLM's published values by one ULP, which is enough to break equality
     comparisons in cost reconciliation.
     """
-    entry = fallback_hardcoded(now=datetime(2026, 7, 30, tzinfo=UTC))["claude-sonnet-5"]
+    entry = fallback_hardcoded(at=datetime(2026, 7, 30, tzinfo=UTC))["claude-sonnet-5"]
     assert 0.000002 * 1.25 != 0.0000025, "premise: the naive derivation is inexact"
     assert entry["cache_creation_input_token_cost"] == 0.0000025
 
@@ -340,10 +340,52 @@ def test_sonnet_5_promo_cache_rates_are_not_naively_derived() -> None:
 def test_fallback_hardcoded_treats_naive_datetime_as_utc() -> None:
     """A naive datetime must not blow up on comparison with the tz-aware
     cutover constant; it is read as UTC."""
-    naive_promo = fallback_hardcoded(now=datetime(2026, 7, 30))["claude-sonnet-5"]
-    naive_post = fallback_hardcoded(now=datetime(2026, 12, 25))["claude-sonnet-5"]
+    naive_promo = fallback_hardcoded(at=datetime(2026, 7, 30))["claude-sonnet-5"]
+    naive_post = fallback_hardcoded(at=datetime(2026, 12, 25))["claude-sonnet-5"]
     assert naive_promo["input_cost_per_token"] == 0.000002
     assert naive_post["input_cost_per_token"] == 0.000003
+
+
+def test_annotate_cost_prices_each_message_at_its_own_timestamp() -> None:
+    """End-to-end: two Sonnet 5 messages either side of the promo cutover, in
+    one transcript, must bill at *different* rates.
+
+    This is the whole point of threading the timestamp through — pricing as of
+    "now" would retroactively re-bill the July message at list price the
+    moment the promo lapses, so the same untouched transcript would report a
+    different cost every time the index was rebuilt.
+    """
+    from ccforensics.jsonl import annotate_cost
+    from ccforensics.models import parse_entry
+
+    def _msg(ts: str) -> dict:
+        return {
+            "type": "assistant",
+            "uuid": f"u-{ts}",
+            "sessionId": "s1",
+            "timestamp": ts,
+            "isSidechain": False,
+            "isMeta": False,
+            "requestId": f"r-{ts}",
+            "message": {
+                "id": f"m-{ts}",
+                "role": "assistant",
+                "model": "claude-sonnet-5",
+                "content": [{"type": "text", "text": "hi"}],
+                "usage": {"input_tokens": 1_000_000, "output_tokens": 0},
+            },
+        }
+
+    during_promo = parse_entry(_msg("2026-08-15T00:00:00Z"))
+    after_promo = parse_entry(_msg("2026-09-15T00:00:00Z"))
+
+    # Empty live data forces the hardcoded (time-aware) table.
+    annotated = annotate_cost([during_promo, after_promo], {})
+    costs = [a.cost_usd for a in annotated]
+
+    assert costs[0] == pytest.approx(2.00), "August message bills at the promo rate"
+    assert costs[1] == pytest.approx(3.00), "September message bills at list price"
+    assert costs[0] != costs[1]
 
 
 def test_fallback_hardcoded_defaults_to_wall_clock() -> None:
@@ -358,8 +400,8 @@ def test_time_dependence_is_confined_to_sonnet_5() -> None:
     """Only Sonnet 5 has a scheduled price change. Every other entry must be
     identical across the cutover — a date-sensitive table is a footgun if it
     silently starts moving rates nobody scheduled."""
-    before = fallback_hardcoded(now=datetime(2026, 7, 30, tzinfo=UTC))
-    after = fallback_hardcoded(now=datetime(2026, 12, 25, tzinfo=UTC))
+    before = fallback_hardcoded(at=datetime(2026, 7, 30, tzinfo=UTC))
+    after = fallback_hardcoded(at=datetime(2026, 12, 25, tzinfo=UTC))
     assert before.keys() == after.keys()
     differing = {k for k in before if before[k] != after[k]}
     assert differing == {"claude-sonnet-5"}
@@ -392,15 +434,13 @@ def test_resolve_pricing_sonnet_5_falls_through_to_hardcoded(pricing_data: dict)
     """
     assert "claude-sonnet-5" not in pricing_data
 
-    promo = resolve_pricing("claude-sonnet-5", pricing_data, now=datetime(2026, 7, 30, tzinfo=UTC))
+    promo = resolve_pricing("claude-sonnet-5", pricing_data, at=datetime(2026, 7, 30, tzinfo=UTC))
     assert promo is not None
     assert promo.input_cost == 0.000002
     assert promo.output_cost == 0.00001
     assert promo.cache_creation_1h_cost == 0.000004
 
-    listed = resolve_pricing(
-        "claude-sonnet-5", pricing_data, now=datetime(2026, 12, 25, tzinfo=UTC)
-    )
+    listed = resolve_pricing("claude-sonnet-5", pricing_data, at=datetime(2026, 12, 25, tzinfo=UTC))
     assert listed is not None
     assert listed.input_cost == 0.000003
     assert listed.output_cost == 0.000015

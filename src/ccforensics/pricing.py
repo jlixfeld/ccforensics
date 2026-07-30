@@ -56,7 +56,9 @@ def _as_utc(when: datetime | None) -> datetime:
 
     Without this a naive ``datetime`` would raise ``TypeError`` on comparison
     with the tz-aware cutover constant — an unhelpful crash deep inside cost
-    annotation, for a caller that almost certainly meant UTC.
+    annotation, for a caller that almost certainly meant UTC. Transcript
+    timestamps are tz-aware already; the naive branch is for hand-built
+    callers and tests.
     """
     if when is None:
         return _utc_now()
@@ -137,7 +139,7 @@ def _lookup(model: str, data: dict[str, dict[str, Any]]) -> ModelPrice | None:
 
 
 def resolve_pricing(
-    model: str, data: dict[str, dict[str, Any]], now: datetime | None = None
+    model: str, data: dict[str, dict[str, Any]], at: datetime | None = None
 ) -> ModelPrice | None:
     """Resolve a model name to a ModelPrice, live data first.
 
@@ -148,14 +150,15 @@ def resolve_pricing(
     LiteLLM entries always win because ``data`` is tried first. Returns None
     only when neither table knows the model.
 
-    ``now`` is forwarded to :func:`fallback_hardcoded` to pick the rate card in
-    effect; it has no bearing on the live path, which serves whatever rate
-    LiteLLM currently publishes.
+    ``at`` is forwarded to :func:`fallback_hardcoded` to pick the rate card
+    that was in effect at that instant. It has no bearing on the live path:
+    LiteLLM publishes only current rates, so historical messages resolved
+    against live data are priced at today's rate regardless.
     """
     hit = _lookup(model, data)
     if hit is not None:
         return hit
-    fb = fallback_hardcoded(now)
+    fb = fallback_hardcoded(at)
     if fb is not data:  # guard against re-scanning when data already IS the fallback
         return _lookup(model, fb)
     return None
@@ -193,7 +196,7 @@ def compute_message_cost(
     )
 
 
-def fallback_hardcoded(now: datetime | None = None) -> dict[str, dict[str, float]]:
+def fallback_hardcoded(at: datetime | None = None) -> dict[str, dict[str, float]]:
     """Minimal offline fallback covering current Claude models.
 
     ``cache_creation_input_token_cost_above_1hr`` is the 1h-TTL rate (2.0x
@@ -201,18 +204,15 @@ def fallback_hardcoded(now: datetime | None = None) -> dict[str, dict[str, float
     the field is omitted — ``ModelPrice.from_entry`` synthesizes 2.0x input
     as the fallback.
 
-    ``now`` selects which rate card is in effect for models with a scheduled
-    price change (currently only Sonnet 5's launch promotion). It defaults to
-    the current UTC time so the table tracks whatever LiteLLM would have
-    served; tests pass an explicit instant. Naive datetimes are read as UTC.
-
-    Note this makes the returned table time-dependent: the *same* offline
-    corpus prices differently before and after a cutover. That matches the
-    live path, which has always re-priced history at current rates, and
-    already-indexed ``messages.cost_usd`` values are not disturbed until the
-    file is re-reconciled.
+    ``at`` is the instant to price *as of* — for cost annotation that is the
+    message's own timestamp, so a message is billed the rate that was in
+    effect when it was actually sent, not the rate in effect whenever the
+    index happens to be rebuilt. It only affects models with a scheduled price
+    change (currently just Sonnet 5's launch promotion) and defaults to the
+    current UTC time for callers with no specific instant in mind. Naive
+    datetimes are read as UTC.
     """
-    at = _as_utc(now)
+    at = _as_utc(at)
     return {
         "claude-fable-5": {
             # Mythos-class flagship, released 2026-06-08/09. $10/1M input,
