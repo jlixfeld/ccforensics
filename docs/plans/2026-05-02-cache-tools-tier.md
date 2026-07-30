@@ -1213,13 +1213,13 @@ def test_isolated_cost_sum_equals_single_tool_turn_cost_sum(
 
 def test_query_tool_costs_top_clamps(tmp_path: Path, pricing_data: dict) -> None:
     conn, session_ids = _build_corpus(tmp_path, pricing_data)
-    rows = query_tool_costs(conn, session_ids=session_ids, detail=False, top=2, sort="isolated_cost")
+    rows = query_tool_costs(
+        conn, session_ids=session_ids, detail=False, top=2, sort="isolated_cost"
+    )
     assert len(rows) <= 2
 
 
-def test_query_tool_costs_sort_by_invocations(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_query_tool_costs_sort_by_invocations(tmp_path: Path, pricing_data: dict) -> None:
     conn, session_ids = _build_corpus(tmp_path, pricing_data)
     rows = query_tool_costs(conn, session_ids=session_ids, detail=False, top=50, sort="invocations")
     invocations = [r.invocations for r in rows]
@@ -1293,9 +1293,7 @@ def query_tool_costs(
     if sort not in _SORT_TO_SQL:
         raise ValueError(f"invalid sort key: {sort!r}")
 
-    group_key_expr = (
-        "mtu.tool_name" if detail else "COALESCE(mtu.mcp_server, mtu.tool_name)"
-    )
+    group_key_expr = "mtu.tool_name" if detail else "COALESCE(mtu.mcp_server, mtu.tool_name)"
     group_kind_expr = (
         # When detail=True, mcp__* rows are 'mcp_tool'; non-mcp are 'native'.
         # When detail=False, mcp__* rows are 'mcp_server'; non-mcp are 'native'.
@@ -1504,8 +1502,10 @@ def test_tools_command_default_render(tmp_path: Path, pricing_data: dict) -> Non
     result = runner.invoke(
         cli_main,
         ["tools", "--no-refresh"],
-        env={"CCFORENSICS_PROJECTS_DIR": str(tmp_path / "projects"),
-             "CCFORENSICS_DB": str(tmp_path / "i.sqlite")},
+        env={
+            "CCFORENSICS_PROJECTS_DIR": str(tmp_path / "projects"),
+            "CCFORENSICS_DB": str(tmp_path / "i.sqlite"),
+        },
     )
     assert result.exit_code == 0, result.output
     assert "TOOL / MCP SERVER" in result.output
@@ -1545,9 +1545,13 @@ In `src/ccforensics/cli.py`, after the existing `plugins` command:
 
 ```python
 @main.command()
-@click.option("--session", "session_id", default=None, help="Scope to one session (id prefix or path).")
+@click.option(
+    "--session", "session_id", default=None, help="Scope to one session (id prefix or path)."
+)
 @click.option("--days", type=int, default=None, help="Last N days.")
-@click.option("--since", type=str, default=None, help="Lower bound (Nd | YYYY-MM-DD | today | yesterday).")
+@click.option(
+    "--since", type=str, default=None, help="Lower bound (Nd | YYYY-MM-DD | today | yesterday)."
+)
 @click.option("--until", type=str, default=None, help="Upper bound.")
 @click.option("--detail", is_flag=True, help="Expand mcp__server rows to per-tool rows.")
 @click.option("--top", type=int, default=50, help="Keep top N rows.")
@@ -1657,9 +1661,7 @@ def test_session_show_omits_tier_line_when_only_standard(
     ...
 
 
-def test_session_show_renders_tier_line_when_mixed(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_session_show_renders_tier_line_when_mixed(tmp_path: Path, pricing_data: dict) -> None:
     """When any non-standard tier is present, render breakdown."""
     # Build a session with one 'standard' message and one 'priority' message.
     # Invoke. Assert 'Service tiers:' IS in output, with both counts.
@@ -1667,9 +1669,7 @@ def test_session_show_renders_tier_line_when_mixed(
     ...
 
 
-def test_session_show_json_includes_tier_breakdown(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_session_show_json_includes_tier_breakdown(tmp_path: Path, pricing_data: dict) -> None:
     """JSON output ALWAYS includes service_tier_breakdown dict (empty if none)."""
     ...
 ```
@@ -1700,9 +1700,7 @@ breakdown = {tier: count for tier, count in tier_rows}
 non_standard_present = any(t not in ("standard", "unknown") for t in breakdown)
 if non_standard_present:
     parts = [f"{t} {c:,} msgs" for t, c in sorted(breakdown.items())]
-    out_lines.append(
-        f"Service tiers: {' · '.join(parts)}  (non-standard pricing not yet applied)"
-    )
+    out_lines.append(f"Service tiers: {' · '.join(parts)}  (non-standard pricing not yet applied)")
 
 # JSON: always include the dict (empty if no assistant messages).
 output_dict["service_tier_breakdown"] = breakdown
