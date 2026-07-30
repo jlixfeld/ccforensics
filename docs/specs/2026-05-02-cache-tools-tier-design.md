@@ -169,7 +169,9 @@ for ordinal, tu_id, tu_name, tu_input in tool_uses_for_aux:
         else None
     )
     try:
-        args_size = len(json.dumps(tu_input, sort_keys=True, separators=(",", ":")).encode())
+        args_size = len(
+            json.dumps(tu_input, sort_keys=True, separators=(",", ":")).encode()
+        )
     except (TypeError, ValueError):
         args_size = 0  # defensive; pydantic-shaped input should always serialize
     conn.execute(

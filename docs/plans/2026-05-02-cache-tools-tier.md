@@ -63,11 +63,15 @@ def test_schema_v3_creates_message_tool_uses_and_service_tier(tmp_path: Path) ->
 
     tables = {
         row[0]
-        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
     }
     assert "message_tool_uses" in tables
 
-    mtu_cols = {row[1] for row in conn.execute("PRAGMA table_info(message_tool_uses)").fetchall()}
+    mtu_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(message_tool_uses)").fetchall()
+    }
     assert mtu_cols == {
         "message_dedup_key",
         "ordinal",
@@ -130,25 +134,25 @@ CURRENT_SCHEMA_VERSION = 3
 Append to the `MIGRATIONS: list[list[str]]` list (which currently has two inner lists for v0→v1 and v1→v2):
 
 ```python
-# v2 → v3: add messages.service_tier column and new message_tool_uses
-# table (one row per tool_use block on an assistant message — the writer
-# currently stores only the first). Trailing UPDATE forces cold backfill
-# on next reconcile so existing data populates.
-[
-    "ALTER TABLE messages ADD COLUMN service_tier TEXT",
-    """CREATE TABLE message_tool_uses (
-    message_dedup_key  TEXT NOT NULL REFERENCES messages(dedup_key) ON DELETE CASCADE,
-    ordinal            INTEGER NOT NULL,
-    tool_use_id        TEXT NOT NULL,
-    tool_name          TEXT NOT NULL,
-    mcp_server         TEXT,
-    args_size_bytes    INTEGER NOT NULL,
-    PRIMARY KEY (message_dedup_key, ordinal)
-)""",
-    "CREATE INDEX idx_mtu_tool_name ON message_tool_uses(tool_name)",
-    "CREATE INDEX idx_mtu_mcp_server ON message_tool_uses(mcp_server) WHERE mcp_server IS NOT NULL",
-    "UPDATE files SET mtime_ns = 0",
-]
+    # v2 → v3: add messages.service_tier column and new message_tool_uses
+    # table (one row per tool_use block on an assistant message — the writer
+    # currently stores only the first). Trailing UPDATE forces cold backfill
+    # on next reconcile so existing data populates.
+    [
+        "ALTER TABLE messages ADD COLUMN service_tier TEXT",
+        """CREATE TABLE message_tool_uses (
+            message_dedup_key  TEXT NOT NULL REFERENCES messages(dedup_key) ON DELETE CASCADE,
+            ordinal            INTEGER NOT NULL,
+            tool_use_id        TEXT NOT NULL,
+            tool_name          TEXT NOT NULL,
+            mcp_server         TEXT,
+            args_size_bytes    INTEGER NOT NULL,
+            PRIMARY KEY (message_dedup_key, ordinal)
+        )""",
+        "CREATE INDEX idx_mtu_tool_name ON message_tool_uses(tool_name)",
+        "CREATE INDEX idx_mtu_mcp_server ON message_tool_uses(mcp_server) WHERE mcp_server IS NOT NULL",
+        "UPDATE files SET mtime_ns = 0",
+    ],
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -357,7 +361,9 @@ def _assistant_multi_tool(
     }
 
 
-def test_multi_tool_turn_writes_all_tool_use_rows(tmp_path: Path, pricing_data: dict) -> None:
+def test_multi_tool_turn_writes_all_tool_use_rows(
+    tmp_path: Path, pricing_data: dict
+) -> None:
     proj = tmp_path / "projects"
     enc = proj / "-home-test"
     sid = "sess-multi"
@@ -365,7 +371,9 @@ def test_multi_tool_turn_writes_all_tool_use_rows(tmp_path: Path, pricing_data: 
         enc / f"{sid}.jsonl",
         [
             _user("u1", sid, "2026-04-22T10:00:00Z", "go", cwd="/home/test"),
-            _assistant_multi_tool("u2", sid, "2026-04-22T10:00:05Z", msg_id="m1", req_id="r1"),
+            _assistant_multi_tool(
+                "u2", sid, "2026-04-22T10:00:05Z", msg_id="m1", req_id="r1"
+            ),
         ],
     )
     db = tmp_path / "index.sqlite"
@@ -402,7 +410,9 @@ def test_multi_tool_turn_writes_all_tool_use_rows(tmp_path: Path, pricing_data: 
         assert r[4] > 0
 
 
-def test_multi_tool_messages_tool_name_unchanged(tmp_path: Path, pricing_data: dict) -> None:
+def test_multi_tool_messages_tool_name_unchanged(
+    tmp_path: Path, pricing_data: dict
+) -> None:
     """Regression guard: messages.tool_name must still equal the FIRST tool_use's
     name. tree.discover_spawn relies on this."""
     proj = tmp_path / "projects"
@@ -412,7 +422,9 @@ def test_multi_tool_messages_tool_name_unchanged(tmp_path: Path, pricing_data: d
         enc / f"{sid}.jsonl",
         [
             _user("u1", sid, "2026-04-22T10:00:00Z", "go", cwd="/home/test"),
-            _assistant_multi_tool("u2", sid, "2026-04-22T10:00:05Z", msg_id="m1", req_id="r1"),
+            _assistant_multi_tool(
+                "u2", sid, "2026-04-22T10:00:05Z", msg_id="m1", req_id="r1"
+            ),
         ],
     )
     db = tmp_path / "index.sqlite"
@@ -420,12 +432,16 @@ def test_multi_tool_messages_tool_name_unchanged(tmp_path: Path, pricing_data: d
     ensure_schema(conn)
     reconcile_projects_dir(conn, proj, pricing_data)
 
-    row = conn.execute("SELECT tool_name, tool_use_id FROM messages WHERE uuid='u2'").fetchone()
+    row = conn.execute(
+        "SELECT tool_name, tool_use_id FROM messages WHERE uuid='u2'"
+    ).fetchone()
     assert row[0] == "Edit"
     assert row[1] == "tu_native"
 
 
-def test_service_tier_persisted_on_message(tmp_path: Path, pricing_data: dict) -> None:
+def test_service_tier_persisted_on_message(
+    tmp_path: Path, pricing_data: dict
+) -> None:
     proj = tmp_path / "projects"
     enc = proj / "-home-test"
     sid = "sess-tier"
@@ -433,7 +449,9 @@ def test_service_tier_persisted_on_message(tmp_path: Path, pricing_data: dict) -
         enc / f"{sid}.jsonl",
         [
             _user("u1", sid, "2026-04-22T10:00:00Z", "go", cwd="/home/test"),
-            _assistant_multi_tool("u2", sid, "2026-04-22T10:00:05Z", msg_id="m1", req_id="r1"),
+            _assistant_multi_tool(
+                "u2", sid, "2026-04-22T10:00:05Z", msg_id="m1", req_id="r1"
+            ),
         ],
     )
     db = tmp_path / "index.sqlite"
@@ -441,7 +459,9 @@ def test_service_tier_persisted_on_message(tmp_path: Path, pricing_data: dict) -
     ensure_schema(conn)
     reconcile_projects_dir(conn, proj, pricing_data)
 
-    row = conn.execute("SELECT service_tier FROM messages WHERE uuid='u2'").fetchone()
+    row = conn.execute(
+        "SELECT service_tier FROM messages WHERE uuid='u2'"
+    ).fetchone()
     assert row[0] == "standard"
 ```
 
@@ -475,14 +495,14 @@ Replace the tool_use extraction block with:
 Locate the `INSERT OR REPLACE INTO messages` statement. Add `service_tier` to the column list and the parameter tuple. The column list block should become:
 
 ```python
-"""INSERT OR REPLACE INTO messages (
-    dedup_key, file_path, session_id, uuid, parent_uuid,
-    source_tool_use_id, source_tool_assistant_uuid,
-    tool_use_id, tool_name, agent_id, role, type, model, ts,
-    is_sidechain, is_meta,
-    input_tokens, output_tokens, cache_creation, cache_read, cost_usd,
-    service_tier
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+        """INSERT OR REPLACE INTO messages (
+            dedup_key, file_path, session_id, uuid, parent_uuid,
+            source_tool_use_id, source_tool_assistant_uuid,
+            tool_use_id, tool_name, agent_id, role, type, model, ts,
+            is_sidechain, is_meta,
+            input_tokens, output_tokens, cache_creation, cache_read, cost_usd,
+            service_tier
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
 ```
 
 And the parameter tuple's tail should become:
@@ -504,7 +524,9 @@ Immediately after the `conn.execute(...)` call that inserts the message row, add
             else None
         )
         try:
-            args_size = len(json.dumps(tu_input, sort_keys=True, separators=(",", ":")).encode())
+            args_size = len(
+                json.dumps(tu_input, sort_keys=True, separators=(",", ":")).encode()
+            )
         except (TypeError, ValueError):
             args_size = 0
         conn.execute(
@@ -624,7 +646,9 @@ def test_cache_metrics_unknown_model_excluded_and_counted() -> None:
         CacheRow(model="unknown-x", input_tokens=500, cache_creation=0, cache_read=500),
     ]
     pricing = {
-        "known": FakePricing(input_cost=3e-6, cache_creation_cost=3.75e-6, cache_read_cost=0.3e-6)
+        "known": FakePricing(
+            input_cost=3e-6, cache_creation_cost=3.75e-6, cache_read_cost=0.3e-6
+        )
     }
     m = cache_metrics(rows, _resolver(pricing))
 
@@ -810,7 +834,9 @@ def test_session_show_includes_cache_efficiency(
     assert "saved $" in result.output
 
 
-def test_session_show_json_includes_cache_keys(tmp_path: Path, pricing_data: dict) -> None:
+def test_session_show_json_includes_cache_keys(
+    tmp_path: Path, pricing_data: dict
+) -> None:
     """Ensure JSON output carries cache_eff_pct + cache_savings_usd."""
     # Mirror the structure of the test above but pass --json. Parse the JSON
     # and assert the keys exist at the top level.
@@ -869,7 +895,6 @@ def _human_count(n: int) -> str:
     if n >= 1_000:
         return f"{n / 1_000:.1f}K"
     return str(n)
-
 
 if total_cache_read or total_cache_create:
     eff_str = f"{metrics.eff_pct:.1f}%" if metrics.eff_pct else "—"
@@ -931,7 +956,9 @@ Run: `grep -n "def \|total\|TOTAL\|json" src/ccforensics/report/aggregate.py | h
 Append to `tests/test_aggregate_and_plugins.py` (mirror the pattern of any existing aggregate test in that file):
 
 ```python
-def test_aggregate_includes_cache_efficiency(tmp_path: Path, pricing_data: dict) -> None:
+def test_aggregate_includes_cache_efficiency(
+    tmp_path: Path, pricing_data: dict
+) -> None:
     """Aggregate report carries the same cache totals line as session show."""
     from ccforensics.cli import main as cli_main
     from click.testing import CliRunner
@@ -944,7 +971,9 @@ def test_aggregate_includes_cache_efficiency(tmp_path: Path, pricing_data: dict)
     # assert "efficiency" in result.output
 
 
-def test_aggregate_json_includes_cache_keys(tmp_path: Path, pricing_data: dict) -> None:
+def test_aggregate_json_includes_cache_keys(
+    tmp_path: Path, pricing_data: dict
+) -> None:
     """JSON output includes cache_eff_pct, cache_savings_usd."""
     # ... same shape, assert JSON keys ...
 ```
@@ -972,9 +1001,7 @@ cache_rows_data = conn.execute(
     """SELECT model, COALESCE(SUM(input_tokens), 0),
               COALESCE(SUM(cache_creation), 0), COALESCE(SUM(cache_read), 0)
        FROM messages
-       WHERE session_id IN ("""
-    + ",".join("?" * len(session_ids))
-    + """)
+       WHERE session_id IN (""" + ",".join("?" * len(session_ids)) + """)
          AND model IS NOT NULL
        GROUP BY model""",
     tuple(session_ids),
@@ -1078,7 +1105,9 @@ def _assistant(
 ) -> dict[str, Any]:
     content: list[dict[str, Any]] = [{"type": "text", "text": "ok"}]
     for tu_id, tu_name in tools:
-        content.append({"type": "tool_use", "id": tu_id, "name": tu_name, "input": {"x": 1}})
+        content.append(
+            {"type": "tool_use", "id": tu_id, "name": tu_name, "input": {"x": 1}}
+        )
     return {
         "type": "assistant",
         "uuid": uuid,
@@ -1113,35 +1142,23 @@ def _build_corpus(tmp_path: Path, pricing_data: dict) -> tuple[Any, list[str]]:
         [
             _user("u1", sid, "2026-04-22T10:00:00Z", cwd="/home/test"),
             _assistant(  # single Edit
-                "u2",
-                sid,
-                "2026-04-22T10:00:01Z",
-                msg_id="m1",
-                req_id="r1",
+                "u2", sid, "2026-04-22T10:00:01Z",
+                msg_id="m1", req_id="r1",
                 tools=[("tu1", "Edit")],
             ),
             _assistant(  # single Read
-                "u3",
-                sid,
-                "2026-04-22T10:00:02Z",
-                msg_id="m2",
-                req_id="r2",
+                "u3", sid, "2026-04-22T10:00:02Z",
+                msg_id="m2", req_id="r2",
                 tools=[("tu2", "Read")],
             ),
             _assistant(  # single MCP
-                "u4",
-                sid,
-                "2026-04-22T10:00:03Z",
-                msg_id="m3",
-                req_id="r3",
+                "u4", sid, "2026-04-22T10:00:03Z",
+                msg_id="m3", req_id="r3",
                 tools=[("tu3", "mcp__stratplaybook__query")],
             ),
             _assistant(  # multi-tool: Edit + MCP
-                "u5",
-                sid,
-                "2026-04-22T10:00:04Z",
-                msg_id="m4",
-                req_id="r4",
+                "u5", sid, "2026-04-22T10:00:04Z",
+                msg_id="m4", req_id="r4",
                 tools=[
                     ("tu4", "Edit"),
                     ("tu5", "mcp__stratplaybook__build"),
@@ -1156,11 +1173,11 @@ def _build_corpus(tmp_path: Path, pricing_data: dict) -> tuple[Any, list[str]]:
     return conn, [sid]
 
 
-def test_query_tool_costs_isolated_and_shared(tmp_path: Path, pricing_data: dict) -> None:
+def test_query_tool_costs_isolated_and_shared(
+    tmp_path: Path, pricing_data: dict
+) -> None:
     conn, session_ids = _build_corpus(tmp_path, pricing_data)
-    rows = query_tool_costs(
-        conn, session_ids=session_ids, detail=False, top=50, sort="isolated_cost"
-    )
+    rows = query_tool_costs(conn, session_ids=session_ids, detail=False, top=50, sort="isolated_cost")
     by_key = {r.group_key: r for r in rows}
 
     # Edit: 1 isolated turn (m1), 1 shared turn (m4)
@@ -1185,9 +1202,7 @@ def test_isolated_cost_sum_equals_single_tool_turn_cost_sum(
     """Spec invariant: sum(isolated_cost across all tools) == sum of cost
     of single-tool turns in messages. Exact equality."""
     conn, session_ids = _build_corpus(tmp_path, pricing_data)
-    rows = query_tool_costs(
-        conn, session_ids=session_ids, detail=False, top=50, sort="isolated_cost"
-    )
+    rows = query_tool_costs(conn, session_ids=session_ids, detail=False, top=50, sort="isolated_cost")
 
     isolated_total = sum(r.isolated_cost_usd for r in rows)
 
@@ -1209,13 +1224,13 @@ def test_isolated_cost_sum_equals_single_tool_turn_cost_sum(
 
 def test_query_tool_costs_top_clamps(tmp_path: Path, pricing_data: dict) -> None:
     conn, session_ids = _build_corpus(tmp_path, pricing_data)
-    rows = query_tool_costs(
-        conn, session_ids=session_ids, detail=False, top=2, sort="isolated_cost"
-    )
+    rows = query_tool_costs(conn, session_ids=session_ids, detail=False, top=2, sort="isolated_cost")
     assert len(rows) <= 2
 
 
-def test_query_tool_costs_sort_by_invocations(tmp_path: Path, pricing_data: dict) -> None:
+def test_query_tool_costs_sort_by_invocations(
+    tmp_path: Path, pricing_data: dict
+) -> None:
     conn, session_ids = _build_corpus(tmp_path, pricing_data)
     rows = query_tool_costs(conn, session_ids=session_ids, detail=False, top=50, sort="invocations")
     invocations = [r.invocations for r in rows]
@@ -1289,7 +1304,9 @@ def query_tool_costs(
     if sort not in _SORT_TO_SQL:
         raise ValueError(f"invalid sort key: {sort!r}")
 
-    group_key_expr = "mtu.tool_name" if detail else "COALESCE(mtu.mcp_server, mtu.tool_name)"
+    group_key_expr = (
+        "mtu.tool_name" if detail else "COALESCE(mtu.mcp_server, mtu.tool_name)"
+    )
     group_kind_expr = (
         # When detail=True, mcp__* rows are 'mcp_tool'; non-mcp are 'native'.
         # When detail=False, mcp__* rows are 'mcp_server'; non-mcp are 'native'.
@@ -1498,10 +1515,8 @@ def test_tools_command_default_render(tmp_path: Path, pricing_data: dict) -> Non
     result = runner.invoke(
         cli_main,
         ["tools", "--no-refresh"],
-        env={
-            "CCFORENSICS_PROJECTS_DIR": str(tmp_path / "projects"),
-            "CCFORENSICS_DB": str(tmp_path / "i.sqlite"),
-        },
+        env={"CCFORENSICS_PROJECTS_DIR": str(tmp_path / "projects"),
+             "CCFORENSICS_DB": str(tmp_path / "i.sqlite")},
     )
     assert result.exit_code == 0, result.output
     assert "TOOL / MCP SERVER" in result.output
@@ -1541,13 +1556,9 @@ In `src/ccforensics/cli.py`, after the existing `plugins` command:
 
 ```python
 @main.command()
-@click.option(
-    "--session", "session_id", default=None, help="Scope to one session (id prefix or path)."
-)
+@click.option("--session", "session_id", default=None, help="Scope to one session (id prefix or path).")
 @click.option("--days", type=int, default=None, help="Last N days.")
-@click.option(
-    "--since", type=str, default=None, help="Lower bound (Nd | YYYY-MM-DD | today | yesterday)."
-)
+@click.option("--since", type=str, default=None, help="Lower bound (Nd | YYYY-MM-DD | today | yesterday).")
 @click.option("--until", type=str, default=None, help="Upper bound.")
 @click.option("--detail", is_flag=True, help="Expand mcp__server rows to per-tool rows.")
 @click.option("--top", type=int, default=50, help="Keep top N rows.")
@@ -1657,7 +1668,9 @@ def test_session_show_omits_tier_line_when_only_standard(
     ...
 
 
-def test_session_show_renders_tier_line_when_mixed(tmp_path: Path, pricing_data: dict) -> None:
+def test_session_show_renders_tier_line_when_mixed(
+    tmp_path: Path, pricing_data: dict
+) -> None:
     """When any non-standard tier is present, render breakdown."""
     # Build a session with one 'standard' message and one 'priority' message.
     # Invoke. Assert 'Service tiers:' IS in output, with both counts.
@@ -1665,7 +1678,9 @@ def test_session_show_renders_tier_line_when_mixed(tmp_path: Path, pricing_data:
     ...
 
 
-def test_session_show_json_includes_tier_breakdown(tmp_path: Path, pricing_data: dict) -> None:
+def test_session_show_json_includes_tier_breakdown(
+    tmp_path: Path, pricing_data: dict
+) -> None:
     """JSON output ALWAYS includes service_tier_breakdown dict (empty if none)."""
     ...
 ```
@@ -1696,7 +1711,9 @@ breakdown = {tier: count for tier, count in tier_rows}
 non_standard_present = any(t not in ("standard", "unknown") for t in breakdown)
 if non_standard_present:
     parts = [f"{t} {c:,} msgs" for t, c in sorted(breakdown.items())]
-    out_lines.append(f"Service tiers: {' · '.join(parts)}  (non-standard pricing not yet applied)")
+    out_lines.append(
+        f"Service tiers: {' · '.join(parts)}  (non-standard pricing not yet applied)"
+    )
 
 # JSON: always include the dict (empty if no assistant messages).
 output_dict["service_tier_breakdown"] = breakdown
@@ -1743,17 +1760,15 @@ def test_invariant_holds_after_v3_migration(tmp_path: Path, pricing_data: dict) 
         [
             _user("u1", sid, "2026-04-22T10:00:00Z", "go", cwd="/home/test"),
             _assistant(
-                "u2",
-                sid,
-                "2026-04-22T10:00:05Z",
-                msg_id="m1",
-                req_id="r1",
+                "u2", sid, "2026-04-22T10:00:05Z",
+                msg_id="m1", req_id="r1",
                 content=[
-                    {"type": "tool_use", "id": "tu1", "name": "Edit", "input": {"x": 1}},
-                    {"type": "tool_use", "id": "tu2", "name": "Read", "input": {"y": 2}},
+                    {"type": "tool_use", "id": "tu1", "name": "Edit",
+                     "input": {"x": 1}},
+                    {"type": "tool_use", "id": "tu2", "name": "Read",
+                     "input": {"y": 2}},
                 ],
-                input_tokens=100,
-                output_tokens=50,
+                input_tokens=100, output_tokens=50,
             ),
         ],
     )
