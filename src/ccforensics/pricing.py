@@ -355,7 +355,10 @@ class PricingCache:
         except Exception as e:
             logger.warning("pricing fetch failed (%s); using hardcoded fallback", e)
             self.last_source = "fallback"
-            return fallback_hardcoded()
+            # Empty, not `fallback_hardcoded()`: that would freeze scheduled
+            # price changes at whatever was in effect on this call, overriding
+            # every message's own timestamp in resolve_pricing.
+            return {}
 
     def _fetch_and_store(self, client: httpx.Client | None, now: int) -> dict[str, dict[str, Any]]:
         client = client or httpx.Client(timeout=15.0, follow_redirects=False, verify=True)

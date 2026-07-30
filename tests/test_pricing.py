@@ -388,6 +388,55 @@ def test_annotate_cost_prices_each_message_at_its_own_timestamp() -> None:
     assert costs[0] != costs[1]
 
 
+def test_annotate_cost_via_offline_fallback_prices_each_message_at_its_own_timestamp(
+    tmp_path: Path,
+) -> None:
+    """Regression for the P1: a totally-offline ``PricingCache.load_or_fetch()``
+    used to bake ``fallback_hardcoded()`` at call time into the returned dict,
+    so every message in the run resolved via that single frozen snapshot
+    instead of ``annotate_cost``'s per-message ``at``. Reindexing an August
+    transcript after the Sonnet 5 promo lapsed would silently re-bill it from
+    $2/MTok to $3/MTok. The fix makes the offline path return ``{}`` so
+    ``resolve_pricing`` falls through to its own ``at``-aware fallback for
+    every call, same as ``test_annotate_cost_prices_each_message_at_its_own_timestamp``
+    but exercised through the real cache object instead of a bare ``{}``.
+    """
+    from ccforensics.jsonl import annotate_cost
+    from ccforensics.models import parse_entry
+
+    def _msg(ts: str) -> dict:
+        return {
+            "type": "assistant",
+            "uuid": f"u-{ts}",
+            "sessionId": "s1",
+            "timestamp": ts,
+            "isSidechain": False,
+            "isMeta": False,
+            "requestId": f"r-{ts}",
+            "message": {
+                "id": f"m-{ts}",
+                "role": "assistant",
+                "model": "claude-sonnet-5",
+                "content": [{"type": "text", "text": "hi"}],
+                "usage": {"input_tokens": 1_000_000, "output_tokens": 0},
+            },
+        }
+
+    during_promo = parse_entry(_msg("2026-08-15T00:00:00Z"))
+    after_promo = parse_entry(_msg("2026-09-15T00:00:00Z"))
+
+    cache = PricingCache(cache_file=tmp_path / "litellm.json", ttl_seconds=86400)
+    pricing_data = cache.load_or_fetch(http_client=_failing_client())
+    assert cache.last_source == "fallback"
+
+    annotated = annotate_cost([during_promo, after_promo], pricing_data)
+    costs = [a.cost_usd for a in annotated]
+
+    assert costs[0] == pytest.approx(2.00), "August message must still bill at the promo rate"
+    assert costs[1] == pytest.approx(3.00), "September message bills at list price"
+    assert costs[0] != costs[1]
+
+
 def test_fallback_hardcoded_defaults_to_wall_clock() -> None:
     """Called with no argument the table still resolves — to whichever card is
     in effect right now, without raising."""
@@ -554,11 +603,19 @@ def test_pricing_cache_falls_back_to_stale_on_fetch_failure(
 
 
 def test_pricing_cache_falls_back_to_hardcoded_when_empty(tmp_path: Path) -> None:
+    """No cache and no network leaves ``load_or_fetch`` returning empty,
+    NOT a ``fallback_hardcoded()`` snapshot frozen at call time — that would
+    defeat ``resolve_pricing``'s own ``at``-aware fallback lookup for every
+    message annotated from this data (see
+    ``test_annotate_cost_via_offline_fallback_prices_each_message_at_its_own_timestamp``).
+    ``resolve_pricing`` still resolves known models from an empty dict via
+    its internal, per-call, timestamp-aware hardcoded fallback."""
     cache_file = tmp_path / "litellm.json"
     cache = PricingCache(cache_file=cache_file, ttl_seconds=86400)
     data = cache.load_or_fetch(http_client=_failing_client())
-    assert "claude-sonnet-4-5-20250929" in data
+    assert data == {}
     assert cache.last_source == "fallback"
+    assert resolve_pricing("claude-sonnet-4-5-20250929", data) is not None
 
 
 def test_pricing_cache_corrupt_json_refetches(tmp_path: Path, pricing_data: dict) -> None:
@@ -597,7 +654,8 @@ def test_pricing_cache_string_fetched_at_falls_through(tmp_path: Path) -> None:
     data = cache.load_or_fetch(http_client=_failing_client())
     # Reader raised on int() → outer except → fallback chain.
     assert cache.last_source == "fallback"
-    assert "claude-sonnet-4-5-20250929" in data
+    assert data == {}
+    assert resolve_pricing("claude-sonnet-4-5-20250929", data) is not None
 
 
 def test_pricing_cache_aborts_on_oversize_response(tmp_path: Path) -> None:
@@ -616,7 +674,8 @@ def test_pricing_cache_aborts_on_oversize_response(tmp_path: Path) -> None:
     data = cache.load_or_fetch(http_client=httpx.Client(transport=httpx.MockTransport(handler)))
     # Falls back because the fetch aborts at the size cap.
     assert cache.last_source == "fallback"
-    assert "claude-sonnet-4-5-20250929" in data
+    assert data == {}
+    assert resolve_pricing("claude-sonnet-4-5-20250929", data) is not None
 
 
 def test_pricing_cache_fresh_fetch_marks_source(tmp_path: Path, pricing_data: dict) -> None:
