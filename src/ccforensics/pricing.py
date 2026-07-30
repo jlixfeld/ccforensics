@@ -175,6 +175,24 @@ def fallback_hardcoded() -> dict[str, dict[str, float]]:
             "cache_creation_input_token_cost_above_1hr": 0.00001,
             "cache_read_input_token_cost": 0.0000005,
         },
+        "claude-sonnet-5": {
+            # Standard list price: $3/1M input, $15/1M output; standard cache
+            # multipliers (5m 1.25x, 1h 2.0x, read 0.1x).
+            #
+            # Deliberately NOT the launch promotion ($2/$10, through
+            # 2026-08-31) that LiteLLM currently carries. This table is only
+            # consulted when LiteLLM is unreachable, and it outlives the
+            # promo window by years — pinning the promo rate would silently
+            # under-count every offline run from 2026-09-01 onward, whereas
+            # pinning list price over-counts only offline runs made during
+            # the promo. Live LiteLLM data wins either way, so a normal run
+            # bills at whichever rate is actually in effect.
+            "input_cost_per_token": 0.000003,
+            "output_cost_per_token": 0.000015,
+            "cache_creation_input_token_cost": 0.00000375,
+            "cache_creation_input_token_cost_above_1hr": 0.000006,
+            "cache_read_input_token_cost": 0.0000003,
+        },
         "claude-sonnet-4-5-20250929": {
             "input_cost_per_token": 0.000003,
             "output_cost_per_token": 0.000015,

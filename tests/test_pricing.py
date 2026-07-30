@@ -286,6 +286,76 @@ def test_resolve_pricing_opus_5_falls_through_to_hardcoded(pricing_data: dict) -
     assert p.cache_read_cost == 0.0000005
 
 
+def test_fallback_hardcoded_sonnet_5_pins_list_price_not_the_promo() -> None:
+    """Sonnet 5's list price is $3/$15; its launch promotion ($2/$10) runs
+    through 2026-08-31 and is what LiteLLM carries today.
+
+    The hardcoded table is offline-only and outlives the promo window, so it
+    pins list price on purpose. If this assertion is ever "fixed" to $2/$10,
+    every offline run after the promo ends silently under-counts Sonnet 5 by
+    a third.
+    """
+    entry = fallback_hardcoded()["claude-sonnet-5"]
+    assert entry["input_cost_per_token"] == 0.000003
+    assert entry["output_cost_per_token"] == 0.000015
+    assert entry["cache_creation_input_token_cost"] == 0.00000375
+    assert entry["cache_creation_input_token_cost_above_1hr"] == 0.000006
+    assert entry["cache_read_input_token_cost"] == 0.0000003
+
+
+def test_resolve_pricing_sonnet_5_prefers_live_promo_rate(pricing_data: dict) -> None:
+    """The promo/list split must not cost anyone money on the normal path:
+    when LiteLLM has Sonnet 5, its (promotional) rate wins over the hardcoded
+    list price."""
+    overlaid = {
+        **pricing_data,
+        "claude-sonnet-5": {
+            "input_cost_per_token": 0.000002,
+            "output_cost_per_token": 0.00001,
+        },
+    }
+    p = resolve_pricing("claude-sonnet-5", overlaid)
+    assert p is not None
+    assert p.input_cost == 0.000002, "live promo rate must win over the hardcoded list price"
+    assert p.output_cost == 0.00001
+
+
+def test_resolve_pricing_sonnet_5_falls_through_to_hardcoded(pricing_data: dict) -> None:
+    """Without live data Sonnet 5 must still price. Before it was added to the
+    fallback table no hardcoded key was a substring of ``claude-sonnet-5``, so
+    an offline run resolved it to None and left every row at NULL cost."""
+    assert "claude-sonnet-5" not in pricing_data
+    p = resolve_pricing("claude-sonnet-5", pricing_data)
+    assert p is not None
+    assert p.input_cost == 0.000003
+    assert p.output_cost == 0.000015
+    assert p.cache_creation_1h_cost == 0.000006
+
+
+def test_resolve_pricing_sonnet_5_does_not_capture_sonnet_4x_names() -> None:
+    """Sonnet 4.x names must not fuzzy-match the new ``claude-sonnet-5`` key.
+
+    Sonnet 4.x and Sonnet 5 happen to share list rates, so comparing resolved
+    prices proves nothing. Feed a sentinel-priced ``claude-sonnet-5`` as the
+    only live entry instead: if the substring resolver wrongly matched it, the
+    sentinel rate would surface.
+    """
+    sentinel = {
+        "claude-sonnet-5": {
+            "input_cost_per_token": 0.42,
+            "output_cost_per_token": 0.84,
+        }
+    }
+    for model in ("claude-sonnet-4-6", "claude-sonnet-4-5-20250929", "claude-sonnet-4-20250514"):
+        p = resolve_pricing(model, sentinel)
+        assert p is not None, model
+        assert p.input_cost == 0.000003, f"{model} must not resolve via the sonnet-5 key"
+        assert p.output_cost == 0.000015, model
+    # Sanity: the sentinel IS reachable for its own name, so a passing loop
+    # above can't be explained by the sentinel simply never matching anything.
+    assert resolve_pricing("claude-sonnet-5", sentinel).input_cost == 0.42  # type: ignore[union-attr]
+
+
 def test_resolve_pricing_opus_5_does_not_capture_opus_4x_names() -> None:
     """``_lookup``'s substring fallback matches keys that are substrings of the
     model name, so a new short key can silently hijack older names. Resolve
