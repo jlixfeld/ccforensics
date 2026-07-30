@@ -121,6 +121,48 @@ def backfill_spawn_totals(conn: sqlite3.Connection, session_id: str) -> None:
     )
 
 
+#: Ceiling on the ``parent_agent_id`` chain walk. Real spawn trees are a few
+#: levels deep; this only exists so malformed metadata (a cycle, or an agent
+#: naming itself as its parent) can't spin the recursive CTE forever.
+MAX_SPAWN_DEPTH = 32
+
+
+def backfill_spawn_depths(conn: sqlite3.Connection, session_id: str) -> None:
+    """Populate ``subagent_spawns.spawn_depth`` from the parent-agent chain.
+
+    Depth counts transcripts, matching how a user reads the tree: the main
+    session is 1, a subagent it spawns is 2, a subagent spawned *by* that
+    subagent is 3, and so on. Computed here rather than read from meta.json's
+    ``spawnDepth`` because Claude Code only emits that field on some spawn
+    paths, whereas the ``parentAgentId`` chain is always present for nesting.
+
+    Rows whose ``parent_agent_id`` names an agent with no spawn row of its own
+    (parent transcript missing) are left NULL rather than guessed at.
+    """
+    conn.execute(
+        """
+        WITH RECURSIVE chain(spawn_id, agent_id, depth) AS (
+            SELECT spawn_id, child_agent_id, 2
+              FROM subagent_spawns
+             WHERE parent_session_id = ?1
+               AND parent_agent_id IS NULL
+            UNION ALL
+            SELECT s.spawn_id, s.child_agent_id, c.depth + 1
+              FROM subagent_spawns s
+              JOIN chain c ON s.parent_agent_id = c.agent_id
+             WHERE s.parent_session_id = ?1
+               AND c.depth < ?2
+        )
+        UPDATE subagent_spawns
+           SET spawn_depth = (
+                SELECT MIN(c.depth) FROM chain c WHERE c.spawn_id = subagent_spawns.spawn_id
+           )
+         WHERE parent_session_id = ?1
+        """,
+        (session_id, MAX_SPAWN_DEPTH),
+    )
+
+
 def find_invariant_violators(conn: sqlite3.Connection, tolerance: float = 1e-6) -> list[str]:
     """Return session_ids where ``sum(messages.cost_usd) != sum(rollups.cost_usd)``.
 

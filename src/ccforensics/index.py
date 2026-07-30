@@ -10,12 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from .attribution import (
+    backfill_spawn_depths,
     backfill_spawn_totals,
     find_invariant_violators,
     recompute_session_rollups,
 )
 from .jsonl import _dedup_preference, annotate_cost, dedup_key, parse_file
-from .models import TranscriptEntry, load_meta_json
+from .models import SpawnMeta, TranscriptEntry, load_meta_json
 from .paths import claude_home, claude_plugins_cache_dir, decode_project_dirname
 from .registry import populate_registry
 from .skills import build_resolver_from_paths, populate_from_session_files
@@ -29,6 +30,11 @@ _SUBAGENT_FILENAME = re.compile(r"^agent-([0-9a-f]+)\.jsonl$", re.IGNORECASE)
 _WORKFLOW_AGENT_RE = re.compile(
     r"subagents/workflows/wf_[^/]+/agent-([0-9a-f]+)\.jsonl$", re.IGNORECASE
 )
+
+# Parent transcripts held in memory during a reconcile walk. Small enough to
+# stay bounded on a huge corpus, large enough that a session's main file plus
+# a few nested-spawn parents coexist.
+_PARENT_CACHE_MAX = 8
 
 _COMMAND_WRAPPER_RE = re.compile(
     r"<command-(name|message|args)>.*?</command-\1>",
@@ -67,7 +73,7 @@ def _is_pure_hook_injection(text: str) -> bool:
     return _HOOK_INJECTION_MARKER in text and len(text) > 500
 
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 
 MIGRATIONS: list[list[str]] = [
     [
@@ -294,6 +300,20 @@ MIGRATIONS: list[list[str]] = [
         "DELETE FROM files WHERE path LIKE '%/subagents/workflows/%'",
         "UPDATE files SET mtime_ns = 0",
     ],
+    # v6 → v7: nested (depth-3+) subagent attribution. A subagent that spawns
+    # its own subagent writes the child *flat* into ``<sess>/subagents/``, so
+    # the path alone can't distinguish it from a main-loop spawn — only
+    # meta.json's ``parentAgentId`` can. Pre-v7, spawn discovery always scanned
+    # the main session file, so a nested child bound to whichever unrelated
+    # Agent/Task call happened to precede it (or to nothing at all). Record the
+    # real parent agent plus a computed depth, then cold-reconcile so existing
+    # transcripts re-resolve against the correct parent transcript.
+    [
+        "ALTER TABLE subagent_spawns ADD COLUMN parent_agent_id TEXT",
+        "ALTER TABLE subagent_spawns ADD COLUMN spawn_depth INTEGER",
+        "CREATE INDEX idx_spawns_parent_agent ON subagent_spawns(parent_agent_id)",
+        "UPDATE files SET mtime_ns = 0",
+    ],
 ]
 
 
@@ -374,14 +394,80 @@ def _parent_session_path(subagent_path: Path) -> Path:
     return session_dir.parent / f"{session_dir.name}.jsonl"
 
 
+def _subagents_root(subagent_path: Path) -> Path | None:
+    """Nearest enclosing ``subagents/`` directory, or None if not under one."""
+    for parent in subagent_path.parents:
+        if parent.name == "subagents":
+            return parent
+    return None
+
+
+def _nested_parent_agent_path(subagent_path: Path, parent_agent_id: str) -> Path | None:
+    """Locate ``agent-<parent_agent_id>.jsonl`` under this session's
+    ``subagents/`` tree, or None if it isn't on disk.
+
+    Nested subagents are written *flat* into ``<sess>/subagents/`` regardless
+    of depth — only workflow agents get a subdirectory. So the parent is
+    usually a plain sibling, but a workflow agent that spawns a nested child
+    lives one tree over (``subagents/workflows/wf_<id>/``); the recursive
+    search covers that case.
+    """
+    root = _subagents_root(subagent_path)
+    if root is None:
+        return None
+    filename = f"agent-{parent_agent_id}.jsonl"
+    sibling = root / filename
+    if sibling.is_file():
+        return sibling
+    try:
+        return next((p for p in root.rglob(filename) if p.is_file()), None)
+    except OSError:
+        logger.warning("failed to search %s for nested parent %s", root, filename, exc_info=True)
+        return None
+
+
+def _spawn_parent_path(subagent_path: Path, meta: SpawnMeta | None) -> Path:
+    """The transcript that emitted this subagent's spawning tool_use.
+
+    For an ordinary main-loop spawn that's the session's main file. When
+    meta.json carries ``parentAgentId`` the spawner was itself a subagent
+    (depth 3+), so the Agent/Task call lives in *that* agent's transcript —
+    scanning the main file instead would silently bind the nested child to
+    whichever unrelated Agent call happened to precede it.
+
+    Falls back to the main session file (with a warning) when the named
+    parent transcript is missing, which at worst restores the old behaviour.
+    """
+    if meta is not None and meta.parent_agent_id:
+        nested = _nested_parent_agent_path(subagent_path, meta.parent_agent_id)
+        if nested is not None:
+            return nested
+        logger.warning(
+            "subagent %s names parentAgentId %s but no agent-%s.jsonl exists; "
+            "falling back to the main session file",
+            subagent_path,
+            meta.parent_agent_id,
+            meta.parent_agent_id,
+        )
+    return _parent_session_path(subagent_path)
+
+
 def _load_parent_entries_cached(
     parent_path: Path,
     cache: dict[Path, list[TranscriptEntry]],
 ) -> list[TranscriptEntry]:
-    """Size-1 cache keyed on ``parent_path``. Missing/unreadable → []."""
+    """Bounded cache keyed on ``parent_path``. Missing/unreadable → [].
+
+    Holds a handful of entries rather than one: with nested subagents the walk
+    alternates between the (large) main session file and parent *subagent*
+    files, and a size-1 cache would re-parse the main file on every switch.
+    Cleared wholesale when full — the working set is a single session's
+    parents, so a full clear is the right eviction shape.
+    """
     if parent_path in cache:
         return cache[parent_path]
-    cache.clear()
+    if len(cache) >= _PARENT_CACHE_MAX:
+        cache.clear()
     try:
         entries = list(parse_file(parent_path).entries)
     except FileNotFoundError:
@@ -407,14 +493,15 @@ def _reconcile_spawn(
     session_id: str,
     agent_id: str | None,
     parent_cache: dict[Path, list[TranscriptEntry]],
-) -> None:
-    """Write the subagent_spawns row. Caller must have run reconcile_file first."""
+) -> bool:
+    """Write the subagent_spawns row. Caller must have run reconcile_file first.
+
+    Returns True when this spawn is nested (its parent is another subagent),
+    which the walk uses to schedule a post-walk re-resolution pass.
+    """
     if agent_id is None:
         logger.warning("subagent %s has no agent_id; skipping spawn discovery", subagent_path)
-        return
-
-    parent_path = _parent_session_path(subagent_path)
-    parent_entries = _load_parent_entries_cached(parent_path, parent_cache)
+        return False
 
     try:
         child_entries = list(parse_file(subagent_path).entries)
@@ -424,10 +511,14 @@ def _reconcile_spawn(
             subagent_path,
             exc_info=True,
         )
-        return
+        return False
 
     meta_path = subagent_path.with_suffix(".meta.json")
     meta = load_meta_json(meta_path)
+
+    # meta.json decides which transcript to scan, so it must be read first.
+    parent_path = _spawn_parent_path(subagent_path, meta)
+    parent_entries = _load_parent_entries_cached(parent_path, parent_cache)
 
     spawn = discover_spawn(
         parent_session_id=session_id,
@@ -439,7 +530,7 @@ def _reconcile_spawn(
         is_workflow=bool(_WORKFLOW_AGENT_RE.search(subagent_path.as_posix())),
     )
     if spawn is None:
-        return
+        return bool(meta and meta.parent_agent_id)
 
     # Parallel Agent tool_uses in one response share a dedup_key, so looking
     # up messages by uuid or tool_use_id would miss. Compute the key from
@@ -476,6 +567,9 @@ def _reconcile_spawn(
             session_id,
         )
 
+    # ``spawn_depth`` is intentionally left NULL here — it depends on the whole
+    # session's parent chain, so ``attribution.backfill_spawn_depths`` fills it
+    # after every file has been indexed.
     conn.execute(
         """INSERT OR REPLACE INTO subagent_spawns (
             spawn_id, parent_session_id, parent_message_dedup_key,
@@ -483,8 +577,9 @@ def _reconcile_spawn(
             subagent_type, description, model,
             ts_spawned, ts_returned,
             total_cost_usd, total_input, total_output,
-            total_cache_create, total_cache_read
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            total_cache_create, total_cache_read,
+            parent_agent_id, spawn_depth
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             str(subagent_path),
             spawn.parent_session_id,
@@ -501,8 +596,11 @@ def _reconcile_spawn(
             None,
             None,
             None,
+            spawn.parent_agent_id,
+            None,
         ),
     )
+    return spawn.parent_agent_id is not None
 
 
 def _reresolve_spawns_for_sessions(
@@ -870,6 +968,12 @@ def reconcile_projects_dir(
     # subagent in these sessions needs spawn discovery re-run to restore the
     # linkage — including subagents whose own files didn't change.
     main_touched_sessions: set[str] = set()
+    # Sessions in which a nested (depth-3+) subagent was reconciled this pass.
+    # Nested children are siblings of their parent in ``subagents/``, so the
+    # sorted walk can reach a child before the parent's messages are indexed —
+    # its ``parent_message_dedup_key`` would come out NULL. A single post-walk
+    # re-resolution fixes any depth, because by then every file is indexed.
+    nested_touched_sessions: set[str] = set()
 
     # Sort by string form (not Path's part-by-part compare) so that
     # ``<enc>/<sess>.jsonl`` sorts before ``<enc>/<sess>/subagents/...``.
@@ -888,7 +992,8 @@ def reconcile_projects_dir(
         kind, agent_id, session_id = _classify_file(path)
         reconcile_file(conn, path, pricing_data)
         if kind == "subagent":
-            _reconcile_spawn(conn, path, session_id, agent_id, parent_cache)
+            if _reconcile_spawn(conn, path, session_id, agent_id, parent_cache):
+                nested_touched_sessions.add(session_id)
         elif kind == "main":
             main_touched_sessions.add(session_id)
         conn.commit()
@@ -896,8 +1001,22 @@ def reconcile_projects_dir(
         stats.files_changed += 1
         stats.sessions_recomputed.add(session_id)
 
-    if main_touched_sessions:
-        _reresolve_spawns_for_sessions(conn, main_touched_sessions, parent_cache)
+    # A re-ingested *subagent* file cascades its nested children's
+    # ``parent_message_dedup_key`` to NULL exactly as a main file does, and the
+    # child's own mtime hasn't changed — so any touched session that contains
+    # nesting needs the same re-resolution treatment, not just the ones whose
+    # main file moved.
+    nested_sessions = {
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT parent_session_id FROM subagent_spawns "
+            "WHERE parent_agent_id IS NOT NULL"
+        )
+    }
+    to_reresolve = main_touched_sessions | nested_touched_sessions
+    to_reresolve |= nested_sessions & stats.sessions_recomputed
+    if to_reresolve:
+        _reresolve_spawns_for_sessions(conn, to_reresolve, parent_cache)
         conn.commit()
 
     # Refresh the plugin + user-level registry once per reconcile pass.
@@ -970,6 +1089,14 @@ def _recompute_session_aggregates(
     except sqlite3.Error:
         logger.warning(
             "backfill_spawn_totals failed for session_id=%s; skipping",
+            sid,
+            exc_info=True,
+        )
+    try:
+        backfill_spawn_depths(conn, sid)
+    except sqlite3.Error:
+        logger.warning(
+            "backfill_spawn_depths failed for session_id=%s; skipping",
             sid,
             exc_info=True,
         )

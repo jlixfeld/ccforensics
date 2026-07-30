@@ -160,6 +160,20 @@ def fallback_hardcoded() -> dict[str, dict[str, float]]:
             "cache_creation_input_token_cost_above_1hr": 0.00002,
             "cache_read_input_token_cost": 0.000001,
         },
+        "claude-opus-5": {
+            # Successor to Opus 4.8. Drop-in at Opus 4.8's rates: $5/1M
+            # input, $25/1M output; standard Anthropic cache multipliers
+            # (5m 1.25x, 1h 2.0x, read 0.1x). LiteLLM already carries this
+            # model at the same rates, so this entry is offline insurance
+            # rather than the live path (unlike claude-fable-5). Fast mode
+            # bills differently ($10/$50) — not modelled; see the deferred
+            # ``usage.speed`` pricing branch.
+            "input_cost_per_token": 0.000005,
+            "output_cost_per_token": 0.000025,
+            "cache_creation_input_token_cost": 0.00000625,
+            "cache_creation_input_token_cost_above_1hr": 0.00001,
+            "cache_read_input_token_cost": 0.0000005,
+        },
         "claude-sonnet-4-5-20250929": {
             "input_cost_per_token": 0.000003,
             "output_cost_per_token": 0.000015,

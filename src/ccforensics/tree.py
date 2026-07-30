@@ -153,6 +153,10 @@ class Spawn:
 
     ``model_hint`` is the model of the first assistant message in the
     child file (for reports only; cost math uses per-message models).
+
+    ``parent_agent_id`` is set (from meta.json) when the spawner was itself
+    a subagent — i.e. this is a nested, depth-3-or-deeper spawn. ``None``
+    for the ordinary main-loop → subagent case.
     """
 
     parent_session_id: str
@@ -164,6 +168,7 @@ class Spawn:
     parent_message_uuid: str | None
     parent_tool_use_id: str | None
     model_hint: str | None
+    parent_agent_id: str | None = None
 
 
 def _iter_agent_tool_uses(
@@ -223,7 +228,13 @@ def discover_spawn(
     """Link a subagent file to its parent Agent/Task call (or, when
     ``is_workflow``, its parent ``Workflow`` call). Rank key for Agent/Task is
     ``(type_match, timestamp)``; for workflows it is ``timestamp`` alone
-    (nearest-before)."""
+    (nearest-before).
+
+    ``parent_entries`` is whichever transcript actually emitted the spawning
+    tool_use — the main session file for a direct subagent, or the parent
+    subagent's own file when ``meta.parent_agent_id`` says this is a nested
+    spawn. The matching logic is identical either way; the caller
+    (``index._spawn_parent_path``) picks the file."""
     child_list = list(child_entries)
     if not child_list:
         return None
@@ -269,4 +280,5 @@ def discover_spawn(
         parent_message_uuid=parent_uuid,
         parent_tool_use_id=parent_tu_id,
         model_hint=model_hint,
+        parent_agent_id=meta.parent_agent_id if meta else None,
     )

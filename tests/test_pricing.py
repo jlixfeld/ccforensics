@@ -261,6 +261,46 @@ def test_fallback_hardcoded_includes_1h_rates_for_4x_models() -> None:
         ), key
 
 
+def test_fallback_hardcoded_opus_5_rates() -> None:
+    """Claude Opus 5: a drop-in upgrade at Opus 4.8's pricing — $5/1M input,
+    $25/1M output, cache 5m $6.25 / 1h $10 / read $0.50."""
+    entry = fallback_hardcoded()["claude-opus-5"]
+    assert entry["input_cost_per_token"] == 0.000005
+    assert entry["output_cost_per_token"] == 0.000025
+    assert entry["cache_creation_input_token_cost"] == 0.00000625
+    assert entry["cache_creation_input_token_cost_above_1hr"] == 0.00001
+    assert entry["cache_read_input_token_cost"] == 0.0000005
+
+
+def test_resolve_pricing_opus_5_falls_through_to_hardcoded(pricing_data: dict) -> None:
+    """claude-opus-5 is absent from the LiteLLM fixture, so resolve_pricing must
+    reach the hardcoded table rather than returning None (which would leave
+    every Opus 5 row with NULL cost)."""
+    assert "claude-opus-5" not in pricing_data
+    p = resolve_pricing("claude-opus-5", pricing_data)
+    assert p is not None
+    assert p.input_cost == 0.000005
+    assert p.output_cost == 0.000025
+    assert p.cache_creation_cost == 0.00000625
+    assert p.cache_creation_1h_cost == 0.00001
+    assert p.cache_read_cost == 0.0000005
+
+
+def test_resolve_pricing_opus_5_does_not_capture_opus_4x_names() -> None:
+    """``_lookup``'s substring fallback matches keys that are substrings of the
+    model name, so a new short key can silently hijack older names. Resolve
+    against the hardcoded table alone (empty live data) to prove the 4.x
+    entries still win for their own names after ``claude-opus-5`` was added."""
+    for model, expected_input in (
+        ("claude-opus-4-1-20250805", 0.000015),
+        ("claude-opus-4-8", 0.000005),
+        ("claude-fable-5", 0.00001),
+    ):
+        p = resolve_pricing(model, {})
+        assert p is not None, model
+        assert p.input_cost == expected_input, model
+
+
 def test_fallback_hardcoded_fable_5_rates() -> None:
     """Claude Fable 5 (released 2026-06-09): $10/1M input, $50/1M output (2x
     Opus 4.8); standard cache multipliers 5m $12.50 / 1h $20 / read $1.00."""
