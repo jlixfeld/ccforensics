@@ -122,6 +122,31 @@ def test_v7_migration_adds_nesting_columns_and_forces_cold_reconcile(tmp_path: P
     assert conn.execute("SELECT mtime_ns FROM files").fetchone()[0] == 0
 
 
+def test_v8_migration_adds_meta_sidecar_stat_columns(tmp_path: Path) -> None:
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    _apply_migrations_through(conn, 7)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+
+    conn.execute(
+        "INSERT INTO files (path, mtime_ns, size, session_id, kind, agent_id, "
+        "schema_version, parse_warnings, last_parsed_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("/p/-enc/S.jsonl", 999, 111, "S", "main", None, "7", 0, 0),
+    )
+    conn.commit()
+
+    ensure_schema(conn)
+
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()}
+    assert "meta_mtime_ns" in cols
+    assert "meta_size" in cols
+    # No corpus-wide cold reconcile for this migration: the mismatch between
+    # a stored NULL and a real sidecar stat is what drives the next walk to
+    # re-check subagent files, not a blanket mtime_ns reset.
+    assert conn.execute("SELECT mtime_ns FROM files WHERE path='/p/-enc/S.jsonl'").fetchone()[0] == 999
+
+
 def test_classify_workflow_agent_path() -> None:
     p = Path("/p/-enc/SESS-UUID/subagents/workflows/wf_2328ca35-f9d/agent-deadbeef.jsonl")
     assert _classify_file(p) == ("subagent", "deadbeef", "SESS-UUID")

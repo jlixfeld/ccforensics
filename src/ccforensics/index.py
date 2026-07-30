@@ -73,7 +73,7 @@ def _is_pure_hook_injection(text: str) -> bool:
     return _HOOK_INJECTION_MARKER in text and len(text) > 500
 
 
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 8
 
 MIGRATIONS: list[list[str]] = [
     [
@@ -313,6 +313,24 @@ MIGRATIONS: list[list[str]] = [
         "ALTER TABLE subagent_spawns ADD COLUMN spawn_depth INTEGER",
         "CREATE INDEX idx_spawns_parent_agent ON subagent_spawns(parent_agent_id)",
         "UPDATE files SET mtime_ns = 0",
+    ],
+    # v7 → v8: track a subagent's ``agent-<hex>.meta.json`` sidecar's own
+    # ``(mtime_ns, size)`` so incremental reconcile notices when it changes
+    # independently of the paired ``.jsonl`` (e.g. ``parentAgentId`` is added
+    # or corrected after the transcript has already stabilized). Before this,
+    # ``_row_is_unchanged`` only ever looked at the ``.jsonl``'s own stat, so a
+    # sidecar-only edit was invisible to the walk forever — the file's
+    # (mtime_ns, size) never changes again, so it keeps getting skipped.
+    #
+    # No trailing ``UPDATE files SET mtime_ns = 0`` here: unlike prior
+    # migrations, this one doesn't need a corpus-wide cold reparse. Existing
+    # subagent rows get NULL in both new columns, which mismatches any real
+    # on-disk sidecar's stat — that mismatch alone is what makes the next
+    # walk re-run spawn discovery for exactly the subagent files that have a
+    # meta.json, without re-parsing every message in the corpus.
+    [
+        "ALTER TABLE files ADD COLUMN meta_mtime_ns INTEGER",
+        "ALTER TABLE files ADD COLUMN meta_size INTEGER",
     ],
 ]
 
@@ -639,6 +657,44 @@ def _row_is_unchanged(conn: sqlite3.Connection, path: Path, mtime_ns: int, size:
     return bool(row) and row[0] == mtime_ns and row[1] == size
 
 
+def _sidecar_meta_stat(subagent_path: Path) -> tuple[int, int] | None:
+    """``(mtime_ns, size)`` of a subagent's ``.meta.json`` sidecar, or None
+    when it doesn't exist (or isn't readable)."""
+    try:
+        stat = subagent_path.with_suffix(".meta.json").stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _subagent_meta_unchanged(conn: sqlite3.Connection, subagent_path: Path) -> bool:
+    """True when this subagent's sidecar stat matches what's stored in
+    ``files``. Only meaningful once the ``.jsonl`` itself has a row — the
+    caller only consults this when the ``.jsonl`` was already unchanged."""
+    row = conn.execute(
+        "SELECT meta_mtime_ns, meta_size FROM files WHERE path=?", (str(subagent_path),)
+    ).fetchone()
+    if row is None:
+        return False
+    stored = (row[0], row[1])
+    current = _sidecar_meta_stat(subagent_path) or (None, None)
+    return stored == current
+
+
+def _update_subagent_meta_stat(conn: sqlite3.Connection, subagent_path: Path) -> None:
+    """Persist the sidecar's current stat without touching the rest of the
+    ``files`` row — used when only ``.meta.json`` changed."""
+    meta_stat = _sidecar_meta_stat(subagent_path)
+    conn.execute(
+        "UPDATE files SET meta_mtime_ns=?, meta_size=? WHERE path=?",
+        (
+            meta_stat[0] if meta_stat else None,
+            meta_stat[1] if meta_stat else None,
+            str(subagent_path),
+        ),
+    )
+
+
 def _purge_file_rows(conn: sqlite3.Connection, path: Path) -> None:
     s = str(path)
     conn.execute("DELETE FROM subagent_spawns WHERE child_file_path=?", (s,))
@@ -766,11 +822,12 @@ def reconcile_file(conn: sqlite3.Connection, path: Path, pricing_data: dict[str,
         if prev is None or _dedup_preference(a.entry) > _dedup_preference(prev[0]):
             seen[key] = (a.entry, a.cost_usd)
 
+    meta_stat = _sidecar_meta_stat(path) if kind == "subagent" else None
     conn.execute(
         """INSERT OR REPLACE INTO files
            (path, mtime_ns, size, session_id, kind, agent_id, schema_version,
-            parse_warnings, last_parsed_at)
-           VALUES (?,?,?,?,?,?,?,?,?)""",
+            parse_warnings, last_parsed_at, meta_mtime_ns, meta_size)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
         (
             str(path),
             mtime_ns,
@@ -781,6 +838,8 @@ def reconcile_file(conn: sqlite3.Connection, path: Path, pricing_data: dict[str,
             min(result.seen_versions, default=None),
             len(result.warnings),
             int(time.time()),
+            meta_stat[0] if meta_stat else None,
+            meta_stat[1] if meta_stat else None,
         ),
     )
 
@@ -986,11 +1045,23 @@ def reconcile_projects_dir(
             continue
         stats.files_scanned += 1
         stat = path.stat()
-        if _row_is_unchanged(conn, path, stat.st_mtime_ns, stat.st_size):
-            stats.files_skipped_unchanged += 1
-            continue
         kind, agent_id, session_id = _classify_file(path)
-        reconcile_file(conn, path, pricing_data)
+        if _row_is_unchanged(conn, path, stat.st_mtime_ns, stat.st_size):
+            if kind != "subagent" or _subagent_meta_unchanged(conn, path):
+                stats.files_skipped_unchanged += 1
+                continue
+            # Only the .meta.json sidecar changed — the transcript's own
+            # messages are still current, so skip the full reparse and just
+            # persist the sidecar's new stat before spawn discovery re-runs
+            # below.
+            _update_subagent_meta_stat(conn, path)
+        else:
+            reconcile_file(conn, path, pricing_data)
+            # This path's previously cached parse (if any) is now stale
+            # relative to what was just written to `messages` — evict it so
+            # a later lookup (this walk or the post-walk re-resolve pass)
+            # re-parses instead of reusing the earlier snapshot.
+            parent_cache.pop(path, None)
         if kind == "subagent":
             if _reconcile_spawn(conn, path, session_id, agent_id, parent_cache):
                 nested_touched_sessions.add(session_id)

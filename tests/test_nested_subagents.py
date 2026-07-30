@@ -10,6 +10,7 @@ keeps a nested child's cost off an unrelated main-loop Agent call.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -539,6 +540,123 @@ def test_nested_child_of_a_workflow_agent_finds_its_parent(
     ).fetchone()
     assert parent_uuid == "w-agent"
     assert parent_file == str(wf_agent)
+
+
+def test_meta_json_parent_id_added_after_jsonl_indexed_is_picked_up(
+    tmp_path: Path, pricing_data: dict
+) -> None:
+    """A subagent's ``.meta.json`` can gain (or be corrected to add)
+    ``parentAgentId`` after its ``.jsonl`` has already stabilized and been
+    indexed. Incremental reconcile keys off the ``.jsonl``'s own
+    ``(mtime_ns, size)``; without independently tracking the sidecar's own
+    stat, a stale main-loop binding would survive forever, because the
+    ``.jsonl`` itself never changes again."""
+    proj = tmp_path / "projects"
+    paths = _build_nested_corpus(proj)
+    inner_meta = paths["inner"].with_suffix(".meta.json")
+
+    # Start without parentAgentId, as if the sidecar hadn't been corrected yet.
+    inner_meta.write_text(json.dumps({"agentType": "Plan", "description": "plan the work"}))
+
+    conn = _reconcile(tmp_path, proj, pricing_data)
+
+    def spawn_row() -> tuple:
+        return conn.execute(
+            """SELECT parent_message_dedup_key, parent_agent_id, spawn_depth
+                 FROM subagent_spawns WHERE child_file_path=?""",
+            (str(paths["inner"]),),
+        ).fetchone()
+
+    parent_key, parent_agent_id, depth = spawn_row()
+    assert parent_agent_id is None
+    assert depth == 2
+    parent_uuid = conn.execute(
+        "SELECT uuid FROM messages WHERE dedup_key=?", (parent_key,)
+    ).fetchone()[0]
+    assert parent_uuid == "m-agent", "without parentAgentId, falls back to the main-loop binding"
+
+    # Correct the sidecar in place — the child's own .jsonl is untouched.
+    inner_meta.write_text(
+        json.dumps(
+            {
+                "agentType": "Plan",
+                "description": "plan the work",
+                "parentAgentId": "bbbb1111",
+            }
+        )
+    )
+
+    reconcile_projects_dir(conn, proj, pricing_data)
+
+    parent_key, parent_agent_id, depth = spawn_row()
+    assert parent_agent_id == "bbbb1111", (
+        "meta.json change must be picked up even though the .jsonl didn't change"
+    )
+    assert depth == 3
+    parent_uuid = conn.execute(
+        "SELECT uuid FROM messages WHERE dedup_key=?", (parent_key,)
+    ).fetchone()[0]
+    assert parent_uuid == "o-agent"
+
+
+def test_stale_parent_cache_not_reused_by_post_walk_reresolution(
+    tmp_path: Path, pricing_data: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bounded parent-transcript cache (``_load_parent_entries_cached``)
+    must not serve a stale parse to the post-walk re-resolution pass.
+
+    Simulates Claude Code still appending to the outer subagent's transcript:
+    when the nested child is walked first (its parent hasn't fully landed on
+    disk yet from the walk's point of view), the cache gets warmed with a
+    parse that's missing the spawning Agent/Task call. Moments later in the
+    same walk, ``reconcile_file`` re-ingests the outer file directly and sees
+    the complete content. If the cache entry isn't evicted at that point, the
+    post-walk re-resolution pass reuses the earlier incomplete parse and the
+    nested spawn never resolves — even though ``messages`` already has the
+    right row.
+    """
+    import ccforensics.index as index_mod
+
+    proj = tmp_path / "projects"
+    # 'aaaa0000' sorts before 'ffff9999', so the walk reaches the nested
+    # child before the outer subagent that's its actual parent.
+    paths = _build_nested_corpus(proj, outer_agent_id="ffff9999", inner_agent_id="aaaa0000")
+    assert str(paths["inner"]) < str(paths["outer"]), "test needs child-before-parent ordering"
+
+    real_parse_file = index_mod.parse_file
+    outer_reads = {"n": 0}
+
+    def flaky_parse_file(path: Path):
+        result = real_parse_file(path)
+        if path == paths["outer"]:
+            outer_reads["n"] += 1
+            if outer_reads["n"] == 1:
+                # First read (triggered by the child's spawn discovery):
+                # the outer file's spawning Agent/Task turn hasn't been
+                # written yet.
+                return dataclasses.replace(
+                    result, entries=[e for e in result.entries if e.uuid != "o-agent"]
+                )
+        return result
+
+    monkeypatch.setattr(index_mod, "parse_file", flaky_parse_file)
+
+    conn = _reconcile(tmp_path, proj, pricing_data)
+
+    assert outer_reads["n"] >= 2, "test setup must actually re-read the outer file"
+
+    parent_key, depth = conn.execute(
+        "SELECT parent_message_dedup_key, spawn_depth FROM subagent_spawns WHERE child_file_path=?",
+        (str(paths["inner"]),),
+    ).fetchone()
+    assert parent_key is not None, (
+        "post-walk re-resolution must not reuse the stale cached parent parse"
+    )
+    assert depth == 3
+    parent_uuid = conn.execute(
+        "SELECT uuid FROM messages WHERE dedup_key=?", (parent_key,)
+    ).fetchone()[0]
+    assert parent_uuid == "o-agent"
 
 
 def test_spawn_parent_path_picks_transcript_by_meta(tmp_path: Path) -> None:

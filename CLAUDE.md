@@ -43,10 +43,10 @@ The data flow is **filesystem → JSONL parser → SQLite index → reports**. T
 
 For every `*.jsonl` under `~/.claude/projects/` (sorted by string so `<enc>/<sess>.jsonl` is processed **before** `<enc>/<sess>/subagents/*.jsonl` — subagent spawn discovery needs the parent already indexed; nested subagents are siblings of their parent, so ordering alone can't save them — the post-walk re-resolve pass does):
 
-1. `_row_is_unchanged` — skip if `(mtime_ns, size)` match.
+1. `_row_is_unchanged` — skip if `(mtime_ns, size)` match. For `subagent` files this is necessary but not sufficient: `_subagent_meta_unchanged` also has to agree, otherwise a `.meta.json` sidecar edited after the `.jsonl` stabilized (see v8) would never be re-read.
 2. `_classify_file` — classify into `main` | `subagent` | `auto-compact` from filename pattern.
-3. `reconcile_file` — purge stale rows, `jsonl.parse_file` → `jsonl.annotate_cost` (via `pricing.resolve_pricing`) → dedup → bulk `INSERT OR REPLACE INTO messages`.
-4. `_reconcile_spawn` (subagents only) — read `agent-<hex>.meta.json` **first** (its `parentAgentId` decides which transcript to scan — see v7), load that parent's entries, call `tree.discover_spawn` to link to the parent Agent/Task tool_use, then write the `subagent_spawns` row. Parent linkage is recomputed via `dedup_key` of the raw parent entry, not by `uuid`/`tool_use_id` — because parallel Agent tool_uses in one LLM response share a `dedup_key` and the messages column only holds one `tool_use_id`.
+3. `reconcile_file` — purge stale rows, `jsonl.parse_file` → `jsonl.annotate_cost` (via `pricing.resolve_pricing`) → dedup → bulk `INSERT OR REPLACE INTO messages`. Skipped when only the sidecar changed — `_update_subagent_meta_stat` persists the new stat instead.
+4. `_reconcile_spawn` (subagents only) — read `agent-<hex>.meta.json` **first** (its `parentAgentId` decides which transcript to scan — see v7), load that parent's entries (`_load_parent_entries_cached`, evicted for a path as soon as `reconcile_file` re-ingests it — see v8's cache-staleness fix below), call `tree.discover_spawn` to link to the parent Agent/Task tool_use, then write the `subagent_spawns` row. Parent linkage is recomputed via `dedup_key` of the raw parent entry, not by `uuid`/`tool_use_id` — because parallel Agent tool_uses in one LLM response share a `dedup_key` and the messages column only holds one `tool_use_id`.
 5. Commit per file (mid-walk interrupt only drops the in-flight file).
 
 After the walk: `_reresolve_spawns_for_sessions` for every touched session whose main file was re-ingested **or** that contains nested spawns (see v7), then `registry.populate_registry` (plugin + user-level artifact scan), then for each touched session `recompute_session_summary` + `attribution.recompute_session_rollups` + `attribution.backfill_spawn_totals` + `attribution.backfill_spawn_depths` + `skills.populate_from_session_files`.
@@ -61,9 +61,16 @@ The bucket decision is a single SQL CASE over `files.kind` and `subagent_spawns.
 - `auto-compact`: `agent-acompact-*.jsonl` — real billable cost from Claude Code's context-compaction worker, explicitly bucketed, not routed to `unattributed`.
 - `unattributed`: subagent file whose parent Agent/Task (or `Workflow`) call couldn't be resolved (~0.5% on real corpus).
 
-### Schema (current: v7)
+### Schema (current: v8)
 
 Migrations live in `index.py::MIGRATIONS` and are gated by `PRAGMA user_version`. `CURRENT_SCHEMA_VERSION` in the same file pins the active target.
+
+**v8 (2026-07-30)** — track the subagent `.meta.json` sidecar's own stat:
+
+- `files.meta_mtime_ns` / `files.meta_size` — nullable INTEGER, populated for `kind='subagent'` rows only. `_row_is_unchanged` only ever compared the `.jsonl`'s own `(mtime_ns, size)`, so a sidecar edited after its paired transcript had already stabilized (e.g. `parentAgentId` added or corrected post-hoc) was invisible to the walk forever — the `.jsonl` never changes again, so it kept getting skipped and the stale (or missing) parent linkage never healed.
+- The walk (`reconcile_projects_dir`) now checks both stats independently for `subagent` files: `.jsonl` unchanged + sidecar unchanged → skip as before; `.jsonl` unchanged but sidecar changed → skip the (expensive) full reparse, persist the new sidecar stat, and still re-run `_reconcile_spawn` so spawn discovery re-reads the corrected `meta.json`.
+- No trailing `UPDATE files SET mtime_ns = 0` — existing subagent rows get NULL in both new columns, which mismatches any real on-disk sidecar's stat and alone is enough to trigger a one-time spawn re-discovery for exactly the subagent files that have a `meta.json`, without a corpus-wide reparse.
+- Same release, separate bug: `_load_parent_entries_cached`'s bounded cache (keyed by parent path) could serve a stale parse to the post-walk `_reresolve_spawns_for_sessions` pass — if a nested child was walked while its parent subagent file was still incomplete on disk, the cache latched onto that incomplete snapshot, and nothing evicted it even after `reconcile_file` re-ingested the parent's newer content moments later in the same walk. Fixed by popping a path from `parent_cache` right after `reconcile_file` re-ingests it, so any later read (same walk or the post-walk pass) re-parses instead of reusing the earlier snapshot.
 
 **v7 (2026-07-30)** — nested (depth-3+) subagent attribution (spec: `docs/specs/2026-07-30-nested-subagent-attribution.md`):
 
