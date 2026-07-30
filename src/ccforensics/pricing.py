@@ -4,6 +4,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -15,6 +16,55 @@ LITELLM_URL = (
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 )
 _LITELLM_MAX_BYTES = 10 * 1024 * 1024  # 10 MB cap — real file is ~600 KB
+
+#: First instant at which Claude Sonnet 5 bills at list price. Its launch
+#: promotion runs through 2026-08-31 inclusive, so the cutover is midnight UTC
+#: on 2026-09-01. Anthropic quotes the window by date without a timezone; UTC is
+#: the assumption, and being a few hours off only matters for offline runs made
+#: during that single night.
+SONNET_5_PROMO_ENDS = datetime(2026, 9, 1, tzinfo=UTC)
+
+#: Sonnet 5 launch-promotion rates: $2/1M input, $10/1M output. Cache rates are
+#: written out rather than derived — ``0.000002 * 1.25`` is not exactly
+#: ``0.0000025`` in binary floating point, and these values must compare equal
+#: to LiteLLM's so the live and offline paths agree to the cent.
+_SONNET_5_PROMO_RATES: dict[str, float] = {
+    "input_cost_per_token": 0.000002,
+    "output_cost_per_token": 0.00001,
+    "cache_creation_input_token_cost": 0.0000025,
+    "cache_creation_input_token_cost_above_1hr": 0.000004,
+    "cache_read_input_token_cost": 0.0000002,
+}
+
+#: Sonnet 5 list rates: $3/1M input, $15/1M output. In effect from
+#: ``SONNET_5_PROMO_ENDS``.
+_SONNET_5_LIST_RATES: dict[str, float] = {
+    "input_cost_per_token": 0.000003,
+    "output_cost_per_token": 0.000015,
+    "cache_creation_input_token_cost": 0.00000375,
+    "cache_creation_input_token_cost_above_1hr": 0.000006,
+    "cache_read_input_token_cost": 0.0000003,
+}
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _as_utc(when: datetime | None) -> datetime:
+    """Normalize a caller-supplied instant to UTC; naive input is assumed UTC.
+
+    Without this a naive ``datetime`` would raise ``TypeError`` on comparison
+    with the tz-aware cutover constant — an unhelpful crash deep inside cost
+    annotation, for a caller that almost certainly meant UTC. Transcript
+    timestamps are tz-aware already; the naive branch is for hand-built
+    callers and tests.
+    """
+    if when is None:
+        return _utc_now()
+    if when.tzinfo is None:
+        return when.replace(tzinfo=UTC)
+    return when.astimezone(UTC)
 
 
 @dataclass(frozen=True)
@@ -88,7 +138,9 @@ def _lookup(model: str, data: dict[str, dict[str, Any]]) -> ModelPrice | None:
     return None
 
 
-def resolve_pricing(model: str, data: dict[str, dict[str, Any]]) -> ModelPrice | None:
+def resolve_pricing(
+    model: str, data: dict[str, dict[str, Any]], at: datetime | None = None
+) -> ModelPrice | None:
     """Resolve a model name to a ModelPrice, live data first.
 
     Looks up ``data`` (normally the LiteLLM table) via :func:`_lookup`. When
@@ -97,11 +149,16 @@ def resolve_pricing(model: str, data: dict[str, dict[str, Any]]) -> ModelPrice |
     prices, instead of resolving to NULL cost on every command. Maintained
     LiteLLM entries always win because ``data`` is tried first. Returns None
     only when neither table knows the model.
+
+    ``at`` is forwarded to :func:`fallback_hardcoded` to pick the rate card
+    that was in effect at that instant. It has no bearing on the live path:
+    LiteLLM publishes only current rates, so historical messages resolved
+    against live data are priced at today's rate regardless.
     """
     hit = _lookup(model, data)
     if hit is not None:
         return hit
-    fb = fallback_hardcoded()
+    fb = fallback_hardcoded(at)
     if fb is not data:  # guard against re-scanning when data already IS the fallback
         return _lookup(model, fb)
     return None
@@ -139,27 +196,57 @@ def compute_message_cost(
     )
 
 
-def fallback_hardcoded() -> dict[str, dict[str, float]]:
+def fallback_hardcoded(at: datetime | None = None) -> dict[str, dict[str, float]]:
     """Minimal offline fallback covering current Claude models.
 
     ``cache_creation_input_token_cost_above_1hr`` is the 1h-TTL rate (2.0x
     input). Pre-4.x models (claude-3-5-haiku) predate the 1h cache TTL so
     the field is omitted — ``ModelPrice.from_entry`` synthesizes 2.0x input
     as the fallback.
+
+    ``at`` is the instant to price *as of* — for cost annotation that is the
+    message's own timestamp, so a message is billed the rate that was in
+    effect when it was actually sent, not the rate in effect whenever the
+    index happens to be rebuilt. It only affects models with a scheduled price
+    change (currently just Sonnet 5's launch promotion) and defaults to the
+    current UTC time for callers with no specific instant in mind. Naive
+    datetimes are read as UTC.
     """
+    at = _as_utc(at)
     return {
         "claude-fable-5": {
             # Mythos-class flagship, released 2026-06-08/09. $10/1M input,
             # $50/1M output (2x Opus 4.8); standard Anthropic cache multipliers
-            # (5m 1.25x, 1h 2.0x, read 0.1x). LiteLLM does not carry it yet, so
-            # this entry is reached via resolve_pricing's hardcoded last-resort
-            # tier — not only on a full fetch failure.
+            # (5m 1.25x, 1h 2.0x, read 0.1x). LiteLLM did not carry this model
+            # when the entry was added, so it was then the live path; LiteLLM
+            # has since ingested it at identical rates and now wins, leaving
+            # this as offline insurance.
             "input_cost_per_token": 0.00001,
             "output_cost_per_token": 0.00005,
             "cache_creation_input_token_cost": 0.0000125,
             "cache_creation_input_token_cost_above_1hr": 0.00002,
             "cache_read_input_token_cost": 0.000001,
         },
+        "claude-opus-5": {
+            # Successor to Opus 4.8. Drop-in at Opus 4.8's rates: $5/1M
+            # input, $25/1M output; standard Anthropic cache multipliers
+            # (5m 1.25x, 1h 2.0x, read 0.1x). LiteLLM already carries this
+            # model at the same rates, so this entry is offline insurance
+            # rather than the live path. Fast mode bills differently
+            # ($10/$50) — not modelled; see the deferred ``usage.speed``
+            # pricing branch.
+            "input_cost_per_token": 0.000005,
+            "output_cost_per_token": 0.000025,
+            "cache_creation_input_token_cost": 0.00000625,
+            "cache_creation_input_token_cost_above_1hr": 0.00001,
+            "cache_read_input_token_cost": 0.0000005,
+        },
+        # Promotional rates through 2026-08-31, list price thereafter — see
+        # SONNET_5_PROMO_ENDS. Mirrors what LiteLLM serves, so an offline run
+        # bills Sonnet 5 the same as an online one.
+        "claude-sonnet-5": dict(
+            _SONNET_5_PROMO_RATES if at < SONNET_5_PROMO_ENDS else _SONNET_5_LIST_RATES
+        ),
         "claude-sonnet-4-5-20250929": {
             "input_cost_per_token": 0.000003,
             "output_cost_per_token": 0.000015,
@@ -268,7 +355,10 @@ class PricingCache:
         except Exception as e:
             logger.warning("pricing fetch failed (%s); using hardcoded fallback", e)
             self.last_source = "fallback"
-            return fallback_hardcoded()
+            # Empty, not `fallback_hardcoded()`: that would freeze scheduled
+            # price changes at whatever was in effect on this call, overriding
+            # every message's own timestamp in resolve_pricing.
+            return {}
 
     def _fetch_and_store(self, client: httpx.Client | None, now: int) -> dict[str, dict[str, Any]]:
         client = client or httpx.Client(timeout=15.0, follow_redirects=False, verify=True)

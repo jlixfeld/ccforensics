@@ -141,12 +141,25 @@ def _normalize_message_content(raw: dict[str, Any]) -> None:
 
 
 class SpawnMeta(BaseModel):
-    """Schema for agent-<id>.meta.json."""
+    """Schema for agent-<id>.meta.json.
+
+    ``parent_agent_id`` is the load-bearing field for nested (depth-3+)
+    subagents: Claude Code writes it only when the spawner was itself an
+    agent, so its presence means "this subagent's Agent/Task tool_use lives
+    in ``agent-<parent_agent_id>.jsonl``, not in the main session file".
+    Absent for the ordinary main-loop → subagent case.
+
+    The sidecar also carries a ``spawnDepth``, but Claude Code emits it only
+    on some spawn paths, so it is deliberately not modelled — depth is
+    computed from the ``parent_agent_id`` chain instead
+    (``attribution.backfill_spawn_depths``).
+    """
 
     model_config = ConfigDict(extra="allow", populate_by_name=True)
 
     agent_type: str | None = Field(default=None, alias="agentType")
     description: str | None = None
+    parent_agent_id: str | None = Field(default=None, alias="parentAgentId")
 
 
 def load_meta_json(path: Path) -> SpawnMeta | None:

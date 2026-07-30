@@ -41,29 +41,45 @@ The data flow is **filesystem → JSONL parser → SQLite index → reports**. T
 
 ### Reconcile pipeline (`src/ccforensics/index.py::reconcile_projects_dir`)
 
-For every `*.jsonl` under `~/.claude/projects/` (sorted by string so `<enc>/<sess>.jsonl` is processed **before** `<enc>/<sess>/subagents/*.jsonl` — subagent spawn discovery needs the parent already indexed):
+For every `*.jsonl` under `~/.claude/projects/` (sorted by string so `<enc>/<sess>.jsonl` is processed **before** `<enc>/<sess>/subagents/*.jsonl` — subagent spawn discovery needs the parent already indexed; nested subagents are siblings of their parent, so ordering alone can't save them — the post-walk re-resolve pass does):
 
-1. `_row_is_unchanged` — skip if `(mtime_ns, size)` match.
+1. `_row_is_unchanged` — skip if `(mtime_ns, size)` match. For `subagent` files this is necessary but not sufficient: `_subagent_meta_unchanged` also has to agree, otherwise a `.meta.json` sidecar edited after the `.jsonl` stabilized (see v8) would never be re-read.
 2. `_classify_file` — classify into `main` | `subagent` | `auto-compact` from filename pattern.
-3. `reconcile_file` — purge stale rows, `jsonl.parse_file` → `jsonl.annotate_cost` (via `pricing.resolve_pricing`) → dedup → bulk `INSERT OR REPLACE INTO messages`.
-4. `_reconcile_spawn` (subagents only) — load parent session entries, call `tree.discover_spawn` to link to the parent Agent/Task tool_use, then write `subagent_spawns` row. Parent linkage is recomputed via `dedup_key` of the raw parent entry, not by `uuid`/`tool_use_id` — because parallel Agent tool_uses in one LLM response share a `dedup_key` and the messages column only holds one `tool_use_id`.
+3. `reconcile_file` — purge stale rows, `jsonl.parse_file` → `jsonl.annotate_cost` (via `pricing.resolve_pricing`) → dedup → bulk `INSERT OR REPLACE INTO messages`. Skipped when only the sidecar changed — `_update_subagent_meta_stat` persists the new stat instead.
+4. `_reconcile_spawn` (subagents only) — read `agent-<hex>.meta.json` **first** (its `parentAgentId` decides which transcript to scan — see v7), load that parent's entries (`_load_parent_entries_cached`, evicted for a path as soon as `reconcile_file` re-ingests it — see v8's cache-staleness fix below), call `tree.discover_spawn` to link to the parent Agent/Task tool_use, then write the `subagent_spawns` row. Parent linkage is recomputed via `dedup_key` of the raw parent entry, not by `uuid`/`tool_use_id` — because parallel Agent tool_uses in one LLM response share a `dedup_key` and the messages column only holds one `tool_use_id`.
 5. Commit per file (mid-walk interrupt only drops the in-flight file).
 
-After the walk: `registry.populate_registry` (plugin + user-level artifact scan), then for each touched session `recompute_session_summary` + `attribution.recompute_session_rollups` + `attribution.backfill_spawn_totals` + `skills.populate_from_session_files`.
+After the walk: `_reresolve_spawns_for_sessions` for every touched session whose main file was re-ingested **or** that contains nested spawns (see v7), then `registry.populate_registry` (plugin + user-level artifact scan), then for each touched session `recompute_session_summary` + `attribution.recompute_session_rollups` + `attribution.backfill_spawn_totals` + `attribution.backfill_spawn_depths` + `skills.populate_from_session_files`.
 
 ### Attribution model (`src/ccforensics/attribution.py`)
 
 The bucket decision is a single SQL CASE over `files.kind` and `subagent_spawns.parent_message_dedup_key`. **Hard invariant:** `sum(session_rollups.cost_usd) == sum(messages.cost_usd)` per session, tolerance `1e-6` — verified by `verify_invariant` and asserted in `test_attribution.py`. Don't add a code path that can route cost to more than one bucket or drop it entirely.
 
 - `main`: primary session file.
-- `subagent:<type>`: subagent file **and** `subagent_spawns` has a resolved `parent_message_dedup_key` + `subagent_type`.
+- `subagent:<type>`: subagent file **and** `subagent_spawns` has a resolved `parent_message_dedup_key` + `subagent_type`. Nested (depth-3+) subagents bucket by their **own** type, exactly like a direct spawn — nesting changes which transcript the parent call is looked up in, never which bucket the cost lands in, so the invariant is untouched.
 - `workflow:<name>`: dynamic-workflow agent (`subagents/workflows/wf_<id>/agent-<hex>.jsonl`) — first-class bucket, `subagent_type LIKE 'workflow:%'` set from the parent `Workflow` tool_use input. Reuses the `subagent_spawns` plumbing.
 - `auto-compact`: `agent-acompact-*.jsonl` — real billable cost from Claude Code's context-compaction worker, explicitly bucketed, not routed to `unattributed`.
 - `unattributed`: subagent file whose parent Agent/Task (or `Workflow`) call couldn't be resolved (~0.5% on real corpus).
 
-### Schema (current: v6)
+### Schema (current: v8)
 
 Migrations live in `index.py::MIGRATIONS` and are gated by `PRAGMA user_version`. `CURRENT_SCHEMA_VERSION` in the same file pins the active target.
+
+**v8 (2026-07-30)** — track the subagent `.meta.json` sidecar's own stat:
+
+- `files.meta_mtime_ns` / `files.meta_size` — nullable INTEGER, populated for `kind='subagent'` rows only. `_row_is_unchanged` only ever compared the `.jsonl`'s own `(mtime_ns, size)`, so a sidecar edited after its paired transcript had already stabilized (e.g. `parentAgentId` added or corrected post-hoc) was invisible to the walk forever — the `.jsonl` never changes again, so it kept getting skipped and the stale (or missing) parent linkage never healed.
+- The walk (`reconcile_projects_dir`) now checks both stats independently for `subagent` files: `.jsonl` unchanged + sidecar unchanged → skip as before; `.jsonl` unchanged but sidecar changed → skip the (expensive) full reparse, persist the new sidecar stat, and still re-run `_reconcile_spawn` so spawn discovery re-reads the corrected `meta.json`.
+- No trailing `UPDATE files SET mtime_ns = 0` — existing subagent rows get NULL in both new columns, which mismatches any real on-disk sidecar's stat and alone is enough to trigger a one-time spawn re-discovery for exactly the subagent files that have a `meta.json`, without a corpus-wide reparse.
+- Same release, separate bug: `_load_parent_entries_cached`'s bounded cache (keyed by parent path) could serve a stale parse to the post-walk `_reresolve_spawns_for_sessions` pass — if a nested child was walked while its parent subagent file was still incomplete on disk, the cache latched onto that incomplete snapshot, and nothing evicted it even after `reconcile_file` re-ingested the parent's newer content moments later in the same walk. Fixed by popping a path from `parent_cache` right after `reconcile_file` re-ingests it, so any later read (same walk or the post-walk pass) re-parses instead of reusing the earlier snapshot.
+
+**v7 (2026-07-30)** — nested (depth-3+) subagent attribution (spec: `docs/specs/2026-07-30-nested-subagent-attribution.md`):
+
+- A subagent that spawns its own subagent writes the child **flat** into `<enc>/<sess>/subagents/agent-<hex>.jsonl` — the same directory as a main-loop spawn (only workflow agents get a subdirectory). The path therefore carries no evidence of nesting; the only signal is `agent-<hex>.meta.json`'s `parentAgentId`, which Claude Code emits **only** when the spawner was itself an agent.
+- Pre-v7, `_parent_session_path` always pointed spawn discovery at `<sess>.jsonl`, so a nested child bound to whichever unrelated main-loop Agent/Task call last preceded it — wrong parent linkage (and therefore wrong per-spawn attribution), or no linkage at all. Bucket totals were unaffected: `subagent_type` comes from meta.json, so the cost was always in the right `subagent:<type>` bucket.
+- `SpawnMeta.parent_agent_id` → `index._spawn_parent_path` picks the parent transcript: sibling `agent-<parentAgentId>.jsonl` when nested, else the main session file. A workflow agent's nested child lives one tree over (parent under `subagents/workflows/wf_<id>/`), so the lookup falls back to an `rglob` under `subagents/`. A named-but-missing parent transcript warns and degrades to the old main-file scan.
+- New columns `subagent_spawns.parent_agent_id` / `spawn_depth`. Depth counts transcripts (main = 1, direct subagent = 2, nested = 3, …) and is computed by `attribution.backfill_spawn_depths` — a recursive CTE over the `parent_agent_id` chain, capped at `MAX_SPAWN_DEPTH` — **not** read from meta.json's `spawnDepth`, which Claude Code only writes on some spawn paths. A broken chain leaves `spawn_depth` NULL rather than guessing.
+- **Walk ordering:** nested children are siblings of their parent, so the sorted walk can reach a child before the parent's messages are indexed, and re-ingesting a *parent subagent* cascades its children's `parent_message_dedup_key` to NULL (`ON DELETE SET NULL`) while the child's own mtime is untouched. Both are handled by extending the post-walk `_reresolve_spawns_for_sessions` pass to sessions that contain nesting. One pass suffices at any depth — by then every file is indexed.
+- Trailing `UPDATE files SET mtime_ns = 0` forces a cold re-reconcile so existing transcripts re-resolve against the correct parent.
 
 **v6 (2026-06-08)** — dynamic-workflow attribution:
 
@@ -105,8 +121,8 @@ On collision the content-richest entry wins (`_dedup_preference`): `tool_use` bl
 
 - `models.py` — permissive pydantic schemas (`extra="allow"`) for transcript entries. Unknown fields preserved in `.extras`. `parse_entry` normalizes legacy field names (`parentToolUseId` → `sourceToolUseID`) and wraps bare-string `message.content` into a single text block.
 - `jsonl.py` — streaming parser with a 16 MB line cap and truncated-tail detection; dedup; cost annotation.
-- `pricing.py` — LiteLLM fetch (24h cache, 10 MB cap, `platformdirs`), fuzzy model resolver, hardcoded fallback for current Claude models.
-- `tree.py` — within-session tool-use graph + `discover_spawn` nearest-before Agent|Task heuristic with `(type_match, timestamp)` composite rank.
+- `pricing.py` — LiteLLM fetch (24h cache, 10 MB cap, `platformdirs`), fuzzy model resolver, hardcoded fallback for current Claude models. Live LiteLLM data always wins; the hardcoded table is the last resort. LiteLLM currently carries every model in that table — including `claude-opus-5` and `claude-fable-5`, at rates matching the hardcoded entries — so today it is purely offline insurance. `claude-sonnet-5` is the one **time-dependent** entry: `fallback_hardcoded(at=...)` serves the launch promo ($2/$10) before `SONNET_5_PROMO_ENDS` (2026-09-01 UTC) and list price ($3/$15) after. `at` threads through `resolve_pricing(model, data, at=...)`, and `jsonl.annotate_cost` passes **each message's own timestamp** — so a message is billed the rate in effect when it was sent, and an untouched transcript doesn't change cost just because the index was rebuilt after a cutover. `at` defaults to wall clock for callers with no specific instant (the `_cache.py` savings estimates, which aggregate by model and have no single timestamp); naive datetimes are read as UTC. Cache rates are written as literals, not derived — `0.000002 * 1.25` is not exactly `0.0000025` in binary float, and the offline table must compare equal to LiteLLM's. A test pins that Sonnet 5 is the *only* entry that changes across the cutover. Still absent from both tables: `claude-mythos-5` (Glasswing-only; would resolve to NULL cost offline). Fast-mode (`usage.speed`) rates are **not** modelled — Opus 5 fast mode bills at $10/$50 per MTok vs the standard $5/$25, so fast-mode sessions under-count until that branch lands.
+- `tree.py` — within-session tool-use graph + `discover_spawn` nearest-before Agent|Task heuristic with `(type_match, timestamp)` composite rank. `discover_spawn` scans whatever `parent_entries` it's handed; choosing the right transcript (main file vs. the parent subagent's, for nested spawns) is `index._spawn_parent_path`'s job.
 - `index.py` — schema migrations (via `PRAGMA user_version`), reconcile orchestration, summary extraction priority chain.
 - `attribution.py` — bucket SQL + invariant verifier.
 - `registry.py` — `~/.claude/plugins/cache/<market>/<plugin>/<version>/` scan; multiple versions collapse to highest semver; user-level artifacts from `~/.claude/{skills,agents}/`. `BUILTIN_AGENTS` is the frozenset of Claude Code's built-ins.

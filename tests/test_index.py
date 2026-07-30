@@ -72,7 +72,7 @@ def test_v6_migration_purges_phantom_workflow_sessions(tmp_path: Path) -> None:
     ensure_schema(conn)
 
     assert conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
-    assert CURRENT_SCHEMA_VERSION == 6
+    assert CURRENT_SCHEMA_VERSION >= 6
     assert (
         conn.execute(
             "SELECT COUNT(*) FROM session_rollups WHERE session_id LIKE 'agent-%' OR session_id='journal'"
@@ -88,6 +88,64 @@ def test_v6_migration_purges_phantom_workflow_sessions(tmp_path: Path) -> None:
     assert (
         conn.execute("SELECT COUNT(*) FROM messages WHERE session_id='agent-dead'").fetchone()[0]
         == 0
+    )
+
+
+def test_v7_migration_adds_nesting_columns_and_forces_cold_reconcile(tmp_path: Path) -> None:
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    _apply_migrations_through(conn, 6)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+
+    conn.execute(
+        "INSERT INTO files (path, mtime_ns, size, session_id, kind, agent_id, "
+        "schema_version, parse_warnings, last_parsed_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("/p/-enc/S/subagents/agent-abc.jsonl", 999, 111, "S", "subagent", "abc", "6", 0, 0),
+    )
+    conn.execute(
+        "INSERT INTO subagent_spawns (spawn_id, parent_session_id, child_agent_id, "
+        "child_file_path, subagent_type, ts_spawned) VALUES (?,?,?,?,?,?)",
+        ("/p/-enc/S/subagents/agent-abc.jsonl", "S", "abc", "x", "Explore", 0),
+    )
+    conn.commit()
+
+    ensure_schema(conn)
+
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
+    parent_agent_id, spawn_depth = conn.execute(
+        "SELECT parent_agent_id, spawn_depth FROM subagent_spawns"
+    ).fetchone()
+    assert parent_agent_id is None
+    assert spawn_depth is None
+    # Nesting can only be read out of meta.json, so every existing file has to
+    # be re-parsed before the new columns mean anything.
+    assert conn.execute("SELECT mtime_ns FROM files").fetchone()[0] == 0
+
+
+def test_v8_migration_adds_meta_sidecar_stat_columns(tmp_path: Path) -> None:
+    db = tmp_path / "index.sqlite"
+    conn = open_connection(db)
+    _apply_migrations_through(conn, 7)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+
+    conn.execute(
+        "INSERT INTO files (path, mtime_ns, size, session_id, kind, agent_id, "
+        "schema_version, parse_warnings, last_parsed_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("/p/-enc/S.jsonl", 999, 111, "S", "main", None, "7", 0, 0),
+    )
+    conn.commit()
+
+    ensure_schema(conn)
+
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()}
+    assert "meta_mtime_ns" in cols
+    assert "meta_size" in cols
+    # No corpus-wide cold reconcile for this migration: the mismatch between
+    # a stored NULL and a real sidecar stat is what drives the next walk to
+    # re-check subagent files, not a blanket mtime_ns reset.
+    assert (
+        conn.execute("SELECT mtime_ns FROM files WHERE path='/p/-enc/S.jsonl'").fetchone()[0] == 999
     )
 
 

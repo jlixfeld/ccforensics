@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
 import pytest
 
 from ccforensics.pricing import (
+    SONNET_5_PROMO_ENDS,
     ModelPrice,
     PricingCache,
     compute_message_cost,
@@ -261,6 +263,278 @@ def test_fallback_hardcoded_includes_1h_rates_for_4x_models() -> None:
         ), key
 
 
+def test_fallback_hardcoded_opus_5_rates() -> None:
+    """Claude Opus 5: a drop-in upgrade at Opus 4.8's pricing — $5/1M input,
+    $25/1M output, cache 5m $6.25 / 1h $10 / read $0.50."""
+    entry = fallback_hardcoded()["claude-opus-5"]
+    assert entry["input_cost_per_token"] == 0.000005
+    assert entry["output_cost_per_token"] == 0.000025
+    assert entry["cache_creation_input_token_cost"] == 0.00000625
+    assert entry["cache_creation_input_token_cost_above_1hr"] == 0.00001
+    assert entry["cache_read_input_token_cost"] == 0.0000005
+
+
+def test_resolve_pricing_opus_5_falls_through_to_hardcoded(pricing_data: dict) -> None:
+    """claude-opus-5 is absent from the LiteLLM fixture, so resolve_pricing must
+    reach the hardcoded table rather than returning None (which would leave
+    every Opus 5 row with NULL cost)."""
+    assert "claude-opus-5" not in pricing_data
+    p = resolve_pricing("claude-opus-5", pricing_data)
+    assert p is not None
+    assert p.input_cost == 0.000005
+    assert p.output_cost == 0.000025
+    assert p.cache_creation_cost == 0.00000625
+    assert p.cache_creation_1h_cost == 0.00001
+    assert p.cache_read_cost == 0.0000005
+
+
+def test_fallback_hardcoded_sonnet_5_serves_promo_rates_during_the_window() -> None:
+    """Through 2026-08-31 Sonnet 5 bills at the launch promotion, $2/$10 per
+    MTok — the same rate LiteLLM serves, so offline and online agree."""
+    entry = fallback_hardcoded(at=datetime(2026, 7, 30, tzinfo=UTC))["claude-sonnet-5"]
+    assert entry["input_cost_per_token"] == 0.000002
+    assert entry["output_cost_per_token"] == 0.00001
+    assert entry["cache_creation_input_token_cost"] == 0.0000025
+    assert entry["cache_creation_input_token_cost_above_1hr"] == 0.000004
+    assert entry["cache_read_input_token_cost"] == 0.0000002
+
+
+def test_fallback_hardcoded_sonnet_5_serves_list_rates_after_the_promo() -> None:
+    """From 2026-09-01 the promotion lapses and list price ($3/$15) applies."""
+    entry = fallback_hardcoded(at=datetime(2026, 12, 25, tzinfo=UTC))["claude-sonnet-5"]
+    assert entry["input_cost_per_token"] == 0.000003
+    assert entry["output_cost_per_token"] == 0.000015
+    assert entry["cache_creation_input_token_cost"] == 0.00000375
+    assert entry["cache_creation_input_token_cost_above_1hr"] == 0.000006
+    assert entry["cache_read_input_token_cost"] == 0.0000003
+
+
+def test_sonnet_5_promo_cutover_is_exact_to_the_second() -> None:
+    """The boundary itself: the promo covers 2026-08-31 in full and lapses at
+    midnight UTC. An off-by-one here mis-bills a whole day."""
+    last_promo_instant = SONNET_5_PROMO_ENDS - timedelta(seconds=1)
+    assert last_promo_instant == datetime(2026, 8, 31, 23, 59, 59, tzinfo=UTC)
+
+    assert (
+        fallback_hardcoded(at=last_promo_instant)["claude-sonnet-5"]["input_cost_per_token"]
+        == 0.000002
+    )
+    assert (
+        fallback_hardcoded(at=SONNET_5_PROMO_ENDS)["claude-sonnet-5"]["input_cost_per_token"]
+        == 0.000003
+    )
+
+
+def test_sonnet_5_promo_cache_rates_are_not_naively_derived() -> None:
+    """The cache rates are written as literals, not computed from the input
+    rate, because ``0.000002 * 1.25`` is not exactly ``0.0000025`` in binary
+    floating point. Deriving them would make the offline table disagree with
+    LiteLLM's published values by one ULP, which is enough to break equality
+    comparisons in cost reconciliation.
+    """
+    entry = fallback_hardcoded(at=datetime(2026, 7, 30, tzinfo=UTC))["claude-sonnet-5"]
+    assert 0.000002 * 1.25 != 0.0000025, "premise: the naive derivation is inexact"
+    assert entry["cache_creation_input_token_cost"] == 0.0000025
+
+
+def test_fallback_hardcoded_treats_naive_datetime_as_utc() -> None:
+    """A naive datetime must not blow up on comparison with the tz-aware
+    cutover constant; it is read as UTC."""
+    naive_promo = fallback_hardcoded(at=datetime(2026, 7, 30))["claude-sonnet-5"]
+    naive_post = fallback_hardcoded(at=datetime(2026, 12, 25))["claude-sonnet-5"]
+    assert naive_promo["input_cost_per_token"] == 0.000002
+    assert naive_post["input_cost_per_token"] == 0.000003
+
+
+def test_annotate_cost_prices_each_message_at_its_own_timestamp() -> None:
+    """End-to-end: two Sonnet 5 messages either side of the promo cutover, in
+    one transcript, must bill at *different* rates.
+
+    This is the whole point of threading the timestamp through — pricing as of
+    "now" would retroactively re-bill the July message at list price the
+    moment the promo lapses, so the same untouched transcript would report a
+    different cost every time the index was rebuilt.
+    """
+    from ccforensics.jsonl import annotate_cost
+    from ccforensics.models import parse_entry
+
+    def _msg(ts: str) -> dict:
+        return {
+            "type": "assistant",
+            "uuid": f"u-{ts}",
+            "sessionId": "s1",
+            "timestamp": ts,
+            "isSidechain": False,
+            "isMeta": False,
+            "requestId": f"r-{ts}",
+            "message": {
+                "id": f"m-{ts}",
+                "role": "assistant",
+                "model": "claude-sonnet-5",
+                "content": [{"type": "text", "text": "hi"}],
+                "usage": {"input_tokens": 1_000_000, "output_tokens": 0},
+            },
+        }
+
+    during_promo = parse_entry(_msg("2026-08-15T00:00:00Z"))
+    after_promo = parse_entry(_msg("2026-09-15T00:00:00Z"))
+
+    # Empty live data forces the hardcoded (time-aware) table.
+    annotated = annotate_cost([during_promo, after_promo], {})
+    costs = [a.cost_usd for a in annotated]
+
+    assert costs[0] == pytest.approx(2.00), "August message bills at the promo rate"
+    assert costs[1] == pytest.approx(3.00), "September message bills at list price"
+    assert costs[0] != costs[1]
+
+
+def test_annotate_cost_via_offline_fallback_prices_each_message_at_its_own_timestamp(
+    tmp_path: Path,
+) -> None:
+    """Regression for the P1: a totally-offline ``PricingCache.load_or_fetch()``
+    used to bake ``fallback_hardcoded()`` at call time into the returned dict,
+    so every message in the run resolved via that single frozen snapshot
+    instead of ``annotate_cost``'s per-message ``at``. Reindexing an August
+    transcript after the Sonnet 5 promo lapsed would silently re-bill it from
+    $2/MTok to $3/MTok. The fix makes the offline path return ``{}`` so
+    ``resolve_pricing`` falls through to its own ``at``-aware fallback for
+    every call, same as ``test_annotate_cost_prices_each_message_at_its_own_timestamp``
+    but exercised through the real cache object instead of a bare ``{}``.
+    """
+    from ccforensics.jsonl import annotate_cost
+    from ccforensics.models import parse_entry
+
+    def _msg(ts: str) -> dict:
+        return {
+            "type": "assistant",
+            "uuid": f"u-{ts}",
+            "sessionId": "s1",
+            "timestamp": ts,
+            "isSidechain": False,
+            "isMeta": False,
+            "requestId": f"r-{ts}",
+            "message": {
+                "id": f"m-{ts}",
+                "role": "assistant",
+                "model": "claude-sonnet-5",
+                "content": [{"type": "text", "text": "hi"}],
+                "usage": {"input_tokens": 1_000_000, "output_tokens": 0},
+            },
+        }
+
+    during_promo = parse_entry(_msg("2026-08-15T00:00:00Z"))
+    after_promo = parse_entry(_msg("2026-09-15T00:00:00Z"))
+
+    cache = PricingCache(cache_file=tmp_path / "litellm.json", ttl_seconds=86400)
+    pricing_data = cache.load_or_fetch(http_client=_failing_client())
+    assert cache.last_source == "fallback"
+
+    annotated = annotate_cost([during_promo, after_promo], pricing_data)
+    costs = [a.cost_usd for a in annotated]
+
+    assert costs[0] == pytest.approx(2.00), "August message must still bill at the promo rate"
+    assert costs[1] == pytest.approx(3.00), "September message bills at list price"
+    assert costs[0] != costs[1]
+
+
+def test_fallback_hardcoded_defaults_to_wall_clock() -> None:
+    """Called with no argument the table still resolves — to whichever card is
+    in effect right now, without raising."""
+    entry = fallback_hardcoded()["claude-sonnet-5"]
+    assert entry["input_cost_per_token"] in (0.000002, 0.000003)
+    assert entry["output_cost_per_token"] in (0.00001, 0.000015)
+
+
+def test_time_dependence_is_confined_to_sonnet_5() -> None:
+    """Only Sonnet 5 has a scheduled price change. Every other entry must be
+    identical across the cutover — a date-sensitive table is a footgun if it
+    silently starts moving rates nobody scheduled."""
+    before = fallback_hardcoded(at=datetime(2026, 7, 30, tzinfo=UTC))
+    after = fallback_hardcoded(at=datetime(2026, 12, 25, tzinfo=UTC))
+    assert before.keys() == after.keys()
+    differing = {k for k in before if before[k] != after[k]}
+    assert differing == {"claude-sonnet-5"}
+
+
+def test_resolve_pricing_sonnet_5_prefers_live_promo_rate(pricing_data: dict) -> None:
+    """The promo/list split must not cost anyone money on the normal path:
+    when LiteLLM has Sonnet 5, its (promotional) rate wins over the hardcoded
+    list price."""
+    overlaid = {
+        **pricing_data,
+        "claude-sonnet-5": {
+            "input_cost_per_token": 0.000002,
+            "output_cost_per_token": 0.00001,
+        },
+    }
+    p = resolve_pricing("claude-sonnet-5", overlaid)
+    assert p is not None
+    assert p.input_cost == 0.000002, "live promo rate must win over the hardcoded list price"
+    assert p.output_cost == 0.00001
+
+
+def test_resolve_pricing_sonnet_5_falls_through_to_hardcoded(pricing_data: dict) -> None:
+    """Without live data Sonnet 5 must still price. Before it was added to the
+    fallback table no hardcoded key was a substring of ``claude-sonnet-5``, so
+    an offline run resolved it to None and left every row at NULL cost.
+
+    ``now`` threads through to the fallback, so the offline path picks the same
+    rate card LiteLLM would have served at that instant.
+    """
+    assert "claude-sonnet-5" not in pricing_data
+
+    promo = resolve_pricing("claude-sonnet-5", pricing_data, at=datetime(2026, 7, 30, tzinfo=UTC))
+    assert promo is not None
+    assert promo.input_cost == 0.000002
+    assert promo.output_cost == 0.00001
+    assert promo.cache_creation_1h_cost == 0.000004
+
+    listed = resolve_pricing("claude-sonnet-5", pricing_data, at=datetime(2026, 12, 25, tzinfo=UTC))
+    assert listed is not None
+    assert listed.input_cost == 0.000003
+    assert listed.output_cost == 0.000015
+    assert listed.cache_creation_1h_cost == 0.000006
+
+
+def test_resolve_pricing_sonnet_5_does_not_capture_sonnet_4x_names() -> None:
+    """Sonnet 4.x names must not fuzzy-match the new ``claude-sonnet-5`` key.
+
+    Sonnet 4.x and Sonnet 5 happen to share list rates, so comparing resolved
+    prices proves nothing. Feed a sentinel-priced ``claude-sonnet-5`` as the
+    only live entry instead: if the substring resolver wrongly matched it, the
+    sentinel rate would surface.
+    """
+    sentinel = {
+        "claude-sonnet-5": {
+            "input_cost_per_token": 0.42,
+            "output_cost_per_token": 0.84,
+        }
+    }
+    for model in ("claude-sonnet-4-6", "claude-sonnet-4-5-20250929", "claude-sonnet-4-20250514"):
+        p = resolve_pricing(model, sentinel)
+        assert p is not None, model
+        assert p.input_cost == 0.000003, f"{model} must not resolve via the sonnet-5 key"
+        assert p.output_cost == 0.000015, model
+    # Sanity: the sentinel IS reachable for its own name, so a passing loop
+    # above can't be explained by the sentinel simply never matching anything.
+    assert resolve_pricing("claude-sonnet-5", sentinel).input_cost == 0.42  # type: ignore[union-attr]
+
+
+def test_resolve_pricing_opus_5_does_not_capture_opus_4x_names() -> None:
+    """``_lookup``'s substring fallback matches keys that are substrings of the
+    model name, so a new short key can silently hijack older names. Resolve
+    against the hardcoded table alone (empty live data) to prove the 4.x
+    entries still win for their own names after ``claude-opus-5`` was added."""
+    for model, expected_input in (
+        ("claude-opus-4-1-20250805", 0.000015),
+        ("claude-opus-4-8", 0.000005),
+        ("claude-fable-5", 0.00001),
+    ):
+        p = resolve_pricing(model, {})
+        assert p is not None, model
+        assert p.input_cost == expected_input, model
+
+
 def test_fallback_hardcoded_fable_5_rates() -> None:
     """Claude Fable 5 (released 2026-06-09): $10/1M input, $50/1M output (2x
     Opus 4.8); standard cache multipliers 5m $12.50 / 1h $20 / read $1.00."""
@@ -329,11 +603,19 @@ def test_pricing_cache_falls_back_to_stale_on_fetch_failure(
 
 
 def test_pricing_cache_falls_back_to_hardcoded_when_empty(tmp_path: Path) -> None:
+    """No cache and no network leaves ``load_or_fetch`` returning empty,
+    NOT a ``fallback_hardcoded()`` snapshot frozen at call time — that would
+    defeat ``resolve_pricing``'s own ``at``-aware fallback lookup for every
+    message annotated from this data (see
+    ``test_annotate_cost_via_offline_fallback_prices_each_message_at_its_own_timestamp``).
+    ``resolve_pricing`` still resolves known models from an empty dict via
+    its internal, per-call, timestamp-aware hardcoded fallback."""
     cache_file = tmp_path / "litellm.json"
     cache = PricingCache(cache_file=cache_file, ttl_seconds=86400)
     data = cache.load_or_fetch(http_client=_failing_client())
-    assert "claude-sonnet-4-5-20250929" in data
+    assert data == {}
     assert cache.last_source == "fallback"
+    assert resolve_pricing("claude-sonnet-4-5-20250929", data) is not None
 
 
 def test_pricing_cache_corrupt_json_refetches(tmp_path: Path, pricing_data: dict) -> None:
@@ -372,7 +654,8 @@ def test_pricing_cache_string_fetched_at_falls_through(tmp_path: Path) -> None:
     data = cache.load_or_fetch(http_client=_failing_client())
     # Reader raised on int() → outer except → fallback chain.
     assert cache.last_source == "fallback"
-    assert "claude-sonnet-4-5-20250929" in data
+    assert data == {}
+    assert resolve_pricing("claude-sonnet-4-5-20250929", data) is not None
 
 
 def test_pricing_cache_aborts_on_oversize_response(tmp_path: Path) -> None:
@@ -391,7 +674,8 @@ def test_pricing_cache_aborts_on_oversize_response(tmp_path: Path) -> None:
     data = cache.load_or_fetch(http_client=httpx.Client(transport=httpx.MockTransport(handler)))
     # Falls back because the fetch aborts at the size cap.
     assert cache.last_source == "fallback"
-    assert "claude-sonnet-4-5-20250929" in data
+    assert data == {}
+    assert resolve_pricing("claude-sonnet-4-5-20250929", data) is not None
 
 
 def test_pricing_cache_fresh_fetch_marks_source(tmp_path: Path, pricing_data: dict) -> None:
