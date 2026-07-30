@@ -75,7 +75,14 @@ def test_v6_migration_purges_phantom_workflow_sessions(tmp_path: Path) -> None:
         "schema_version, parse_warnings, last_parsed_at) VALUES (?,?,?,?,?,?,?,?,?)",
         (
             "/p/-enc/SESS/subagents/workflows/wf_z/agent-dead.jsonl",
-            123, 456, "agent-dead", "main", None, "5", 0, 0,
+            123,
+            456,
+            "agent-dead",
+            "main",
+            None,
+            "5",
+            0,
+            0,
         ),
     )
     conn.execute(
@@ -84,7 +91,10 @@ def test_v6_migration_purges_phantom_workflow_sessions(tmp_path: Path) -> None:
         (
             "req:m1:r1",
             "/p/-enc/SESS/subagents/workflows/wf_z/agent-dead.jsonl",
-            "agent-dead", "assistant", "assistant", 0,
+            "agent-dead",
+            "assistant",
+            "assistant",
+            0,
         ),
     )
     conn.execute(
@@ -105,14 +115,23 @@ def test_v6_migration_purges_phantom_workflow_sessions(tmp_path: Path) -> None:
     assert conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
     assert CURRENT_SCHEMA_VERSION == 6
     # Phantom rollups gone.
-    assert conn.execute(
-        "SELECT COUNT(*) FROM session_rollups WHERE session_id LIKE 'agent-%' OR session_id='journal'"
-    ).fetchone()[0] == 0
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM session_rollups WHERE session_id LIKE 'agent-%' OR session_id='journal'"
+        ).fetchone()[0]
+        == 0
+    )
     # Workflow files row gone (and its message cascaded away).
-    assert conn.execute(
-        "SELECT COUNT(*) FROM files WHERE path LIKE '%/subagents/workflows/%'"
-    ).fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM messages WHERE session_id='agent-dead'").fetchone()[0] == 0
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM files WHERE path LIKE '%/subagents/workflows/%'"
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        conn.execute("SELECT COUNT(*) FROM messages WHERE session_id='agent-dead'").fetchone()[0]
+        == 0
+    )
     # Cold reconcile armed.
     # (Any surviving files rows have mtime_ns reset; none here, so just assert no error.)
 ```
@@ -133,22 +152,22 @@ CURRENT_SCHEMA_VERSION = 6
 Append a new element to the `MIGRATIONS` list (after the v5 block's closing `]` at line 277, before the list's closing `]` at line 278):
 
 ```python
-    # v5 → v6: dynamic-workflow attribution. Workflow-tool agents live at
-    # ``<enc>/<sess>/subagents/workflows/wf_<id>/agent-<hex>.jsonl`` — two
-    # levels below ``subagents/`` — so the pre-v6 ``_classify_file`` mislabeled
-    # them as ``main`` sessions named ``agent-<hex>`` (and ``journal``). Purge
-    # those phantom rows, drop the workflow files rows (CASCADE removes their
-    # messages), then cold-reconcile so the files re-classify into the new
-    # ``workflow:<name>`` bucket.
-    [
-        "DELETE FROM session_rollups WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
-        "DELETE FROM session_summaries WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
-        "DELETE FROM session_signals WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
-        "DELETE FROM skill_activations WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
-        "DELETE FROM messages WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
-        "DELETE FROM files WHERE path LIKE '%/subagents/workflows/%'",
-        "UPDATE files SET mtime_ns = 0",
-    ],
+# v5 → v6: dynamic-workflow attribution. Workflow-tool agents live at
+# ``<enc>/<sess>/subagents/workflows/wf_<id>/agent-<hex>.jsonl`` — two
+# levels below ``subagents/`` — so the pre-v6 ``_classify_file`` mislabeled
+# them as ``main`` sessions named ``agent-<hex>`` (and ``journal``). Purge
+# those phantom rows, drop the workflow files rows (CASCADE removes their
+# messages), then cold-reconcile so the files re-classify into the new
+# ``workflow:<name>`` bucket.
+[
+    "DELETE FROM session_rollups WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
+    "DELETE FROM session_summaries WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
+    "DELETE FROM session_signals WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
+    "DELETE FROM skill_activations WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
+    "DELETE FROM messages WHERE session_id LIKE 'agent-%' OR session_id = 'journal'",
+    "DELETE FROM files WHERE path LIKE '%/subagents/workflows/%'",
+    "UPDATE files SET mtime_ns = 0",
+]
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -188,7 +207,10 @@ def test_workflow_name_from_saved_name() -> None:
 
 
 def test_workflow_name_from_script_path_strips_wf_suffix() -> None:
-    assert _workflow_name({"scriptPath": "/a/b/sdk-drift-audit-wf_2328ca35-f9d.js"}) == "sdk-drift-audit"
+    assert (
+        _workflow_name({"scriptPath": "/a/b/sdk-drift-audit-wf_2328ca35-f9d.js"})
+        == "sdk-drift-audit"
+    )
 
 
 def test_workflow_name_from_inline_script_meta() -> None:
@@ -294,46 +316,52 @@ def _entry(d: dict):
 
 def _wf_parent_entries():
     return [
-        _entry({
-            "type": "assistant",
-            "uuid": "p1",
-            "sessionId": "SESS",
-            "timestamp": "2026-06-08T10:00:00Z",
-            "requestId": "r1",
-            "message": {
-                "id": "m1",
-                "role": "assistant",
-                "model": "claude-opus-4-8",
-                "content": [{
-                    "type": "tool_use",
-                    "id": "tu-wf",
-                    "name": "Workflow",
-                    "input": {"script": "export const meta = { name: 'sdk-drift-audit' }"},
-                }],
-                "usage": {"input_tokens": 1, "output_tokens": 1},
-            },
-        }),
+        _entry(
+            {
+                "type": "assistant",
+                "uuid": "p1",
+                "sessionId": "SESS",
+                "timestamp": "2026-06-08T10:00:00Z",
+                "requestId": "r1",
+                "message": {
+                    "id": "m1",
+                    "role": "assistant",
+                    "model": "claude-opus-4-8",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tu-wf",
+                            "name": "Workflow",
+                            "input": {"script": "export const meta = { name: 'sdk-drift-audit' }"},
+                        }
+                    ],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            }
+        ),
     ]
 
 
 def _wf_child_entries():
     return [
-        _entry({
-            "type": "assistant",
-            "uuid": "c1",
-            "sessionId": "SESS",
-            "agentId": "dead",
-            "timestamp": "2026-06-08T10:00:30Z",
-            "isSidechain": True,
-            "requestId": "r2",
-            "message": {
-                "id": "m2",
-                "role": "assistant",
-                "model": "claude-haiku-4-5-20251001",
-                "content": [{"type": "text", "text": "x"}],
-                "usage": {"input_tokens": 1, "output_tokens": 1},
-            },
-        }),
+        _entry(
+            {
+                "type": "assistant",
+                "uuid": "c1",
+                "sessionId": "SESS",
+                "agentId": "dead",
+                "timestamp": "2026-06-08T10:00:30Z",
+                "isSidechain": True,
+                "requestId": "r2",
+                "message": {
+                    "id": "m2",
+                    "role": "assistant",
+                    "model": "claude-haiku-4-5-20251001",
+                    "content": [{"type": "text", "text": "x"}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            }
+        ),
     ]
 
 
@@ -710,11 +738,19 @@ def test_workflow_bucket_first_class(tmp_path: Path, pricing_data: dict) -> None
         [
             _user("u1", sid, "2026-06-08T10:00:00Z", "go", cwd="/home/test"),
             _assistant(
-                "u2", sid, "2026-06-08T10:00:10Z", msg_id="m1", req_id="r1",
-                content=[{
-                    "type": "tool_use", "id": "tu-wf", "name": "Workflow",
-                    "input": {"script": "export const meta = { name: 'sdk-drift-audit' }"},
-                }],
+                "u2",
+                sid,
+                "2026-06-08T10:00:10Z",
+                msg_id="m1",
+                req_id="r1",
+                content=[
+                    {
+                        "type": "tool_use",
+                        "id": "tu-wf",
+                        "name": "Workflow",
+                        "input": {"script": "export const meta = { name: 'sdk-drift-audit' }"},
+                    }
+                ],
             ),
         ],
     )
@@ -724,8 +760,14 @@ def test_workflow_bucket_first_class(tmp_path: Path, pricing_data: dict) -> None
         wf_dir / "agent-dead.jsonl",
         [
             _assistant(
-                "c1", sid, "2026-06-08T10:00:20Z", msg_id="m2", req_id="r2",
-                model="claude-haiku-4-5-20251001", agentId="dead", isSidechain=True,
+                "c1",
+                sid,
+                "2026-06-08T10:00:20Z",
+                msg_id="m2",
+                req_id="r2",
+                model="claude-haiku-4-5-20251001",
+                agentId="dead",
+                isSidechain=True,
             ),
         ],
     )

@@ -665,7 +665,9 @@ from ccforensics.models import TranscriptEntry, parse_entry
 
 
 def test_parses_user_entry() -> None:
-    raw = json.loads('{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"2026-04-20T10:00:00Z","isSidechain":false,"message":{"role":"user","content":[{"type":"text","text":"Hello"}]}}')
+    raw = json.loads(
+        '{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"2026-04-20T10:00:00Z","isSidechain":false,"message":{"role":"user","content":[{"type":"text","text":"Hello"}]}}'
+    )
     entry = parse_entry(raw)
     assert entry.type == "user"
     assert entry.uuid == "u1"
@@ -674,7 +676,9 @@ def test_parses_user_entry() -> None:
 
 
 def test_parses_assistant_with_usage() -> None:
-    raw = json.loads('{"type":"assistant","uuid":"u2","sessionId":"s1","timestamp":"2026-04-20T10:00:05Z","requestId":"req-a","message":{"id":"msg-1","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[],"usage":{"input_tokens":100,"output_tokens":5,"cache_read_input_tokens":500,"cache_creation_input_tokens":0}}}')
+    raw = json.loads(
+        '{"type":"assistant","uuid":"u2","sessionId":"s1","timestamp":"2026-04-20T10:00:05Z","requestId":"req-a","message":{"id":"msg-1","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[],"usage":{"input_tokens":100,"output_tokens":5,"cache_read_input_tokens":500,"cache_creation_input_tokens":0}}}'
+    )
     entry = parse_entry(raw)
     assert entry.type == "assistant"
     assert entry.request_id == "req-a"
@@ -690,8 +694,12 @@ def test_parses_assistant_with_usage() -> None:
 
 def test_field_normalization_legacy_parent_tool_use_id() -> None:
     # Older JSONL uses parentToolUseId; newer uses sourceToolUseID.
-    raw_old = json.loads('{"type":"user","parentToolUseId":"toolu-1","sessionId":"s1","timestamp":"2026-04-20T10:00:00Z","message":null}')
-    raw_new = json.loads('{"type":"user","sourceToolUseID":"toolu-1","sessionId":"s1","timestamp":"2026-04-20T10:00:00Z","message":null}')
+    raw_old = json.loads(
+        '{"type":"user","parentToolUseId":"toolu-1","sessionId":"s1","timestamp":"2026-04-20T10:00:00Z","message":null}'
+    )
+    raw_new = json.loads(
+        '{"type":"user","sourceToolUseID":"toolu-1","sessionId":"s1","timestamp":"2026-04-20T10:00:00Z","message":null}'
+    )
     entry_old = parse_entry(raw_old)
     entry_new = parse_entry(raw_new)
     assert entry_old.source_tool_use_id == "toolu-1"
@@ -699,7 +707,9 @@ def test_field_normalization_legacy_parent_tool_use_id() -> None:
 
 
 def test_unknown_type_preserved() -> None:
-    raw = json.loads('{"type":"permission-mode","sessionId":"s1","timestamp":"2026-04-20T10:00:00Z","permissionMode":"bypassPermissions"}')
+    raw = json.loads(
+        '{"type":"permission-mode","sessionId":"s1","timestamp":"2026-04-20T10:00:00Z","permissionMode":"bypassPermissions"}'
+    )
     entry = parse_entry(raw)
     assert entry.type == "permission-mode"
     # Extras preserved in __pydantic_extra__
@@ -715,7 +725,9 @@ def test_tolerates_missing_optional_fields() -> None:
 
 
 def test_tool_use_content_block_parsed() -> None:
-    raw = json.loads('{"type":"assistant","uuid":"u","timestamp":"2026-04-20T10:00:00Z","requestId":"r","message":{"id":"m","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"tool_use","id":"toolu-99","name":"Read","input":{"file_path":"/x"}}]}}')
+    raw = json.loads(
+        '{"type":"assistant","uuid":"u","timestamp":"2026-04-20T10:00:00Z","requestId":"r","message":{"id":"m","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"tool_use","id":"toolu-99","name":"Read","input":{"file_path":"/x"}}]}}'
+    )
     entry = parse_entry(raw)
     assert entry.message is not None
     blocks = entry.message.content
@@ -726,7 +738,9 @@ def test_tool_use_content_block_parsed() -> None:
 
 
 def test_attachment_hook_success_recognized() -> None:
-    raw = json.loads('{"type":"attachment","timestamp":"2026-04-20T10:00:00Z","attachment":{"type":"hook_success","hookEvent":"SessionStart","stdout":"{\\"hookSpecificOutput\\":{}}","content":""}}')
+    raw = json.loads(
+        '{"type":"attachment","timestamp":"2026-04-20T10:00:00Z","attachment":{"type":"hook_success","hookEvent":"SessionStart","stdout":"{\\"hookSpecificOutput\\":{}}","content":""}}'
+    )
     entry = parse_entry(raw)
     assert entry.type == "attachment"
     assert entry.attachment is not None
@@ -841,11 +855,21 @@ class TranscriptEntry(BaseModel):
         return self.__pydantic_extra__ or {}
 
 
-KNOWN_TYPES: frozenset[str] = frozenset({
-    "user", "assistant", "system", "attachment", "summary",
-    "file-history-snapshot", "permission-mode", "last-prompt",
-    "queue-operation", "tool_use", "tool_result",
-})
+KNOWN_TYPES: frozenset[str] = frozenset(
+    {
+        "user",
+        "assistant",
+        "system",
+        "attachment",
+        "summary",
+        "file-history-snapshot",
+        "permission-mode",
+        "last-prompt",
+        "queue-operation",
+        "tool_use",
+        "tool_result",
+    }
+)
 
 
 def parse_entry(raw: dict[str, Any]) -> TranscriptEntry:
@@ -942,6 +966,7 @@ def test_unknown_type_recorded_not_crashed() -> None:
 
 def test_missing_file_raises(tmp_path: Path) -> None:
     import pytest
+
     with pytest.raises(FileNotFoundError):
         parse_file(tmp_path / "nope.jsonl")
 ```
@@ -1010,7 +1035,9 @@ def parse_file(path: Path) -> ParseResult:
             entry = parse_entry(raw)
         except Exception as e:
             result.parse_errors += 1
-            result.warnings.append(f"{path}:{i + 1}: pydantic rejected line ({e.__class__.__name__}), skipped")
+            result.warnings.append(
+                f"{path}:{i + 1}: pydantic rejected line ({e.__class__.__name__}), skipped"
+            )
             continue
 
         if entry.type not in KNOWN_TYPES:
@@ -1083,33 +1110,39 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def test_dedup_key_prefers_message_id_plus_request_id() -> None:
-    entry = parse_entry({
-        "type": "assistant",
-        "timestamp": "2026-04-20T10:00:00Z",
-        "sessionId": "s1",
-        "requestId": "req-a",
-        "message": {"id": "msg-1", "role": "assistant", "content": []},
-    })
+    entry = parse_entry(
+        {
+            "type": "assistant",
+            "timestamp": "2026-04-20T10:00:00Z",
+            "sessionId": "s1",
+            "requestId": "req-a",
+            "message": {"id": "msg-1", "role": "assistant", "content": []},
+        }
+    )
     assert dedup_key(entry) == "req:msg-1:req-a"
 
 
 def test_dedup_key_fallback_to_session_id() -> None:
-    entry = parse_entry({
-        "type": "assistant",
-        "timestamp": "2026-04-20T10:00:00Z",
-        "sessionId": "s1",
-        "message": {"id": "msg-1", "role": "assistant", "content": []},
-    })
+    entry = parse_entry(
+        {
+            "type": "assistant",
+            "timestamp": "2026-04-20T10:00:00Z",
+            "sessionId": "s1",
+            "message": {"id": "msg-1", "role": "assistant", "content": []},
+        }
+    )
     assert dedup_key(entry) == "session:msg-1:s1"
 
 
 def test_dedup_key_returns_none_when_no_message_id() -> None:
-    entry = parse_entry({
-        "type": "user",
-        "timestamp": "2026-04-20T10:00:00Z",
-        "sessionId": "s1",
-        "message": None,
-    })
+    entry = parse_entry(
+        {
+            "type": "user",
+            "timestamp": "2026-04-20T10:00:00Z",
+            "sessionId": "s1",
+            "message": None,
+        }
+    )
     assert dedup_key(entry) is None
 
 
@@ -1143,20 +1176,24 @@ def test_dedup_deterministic_under_shuffle() -> None:
 
 def test_first_write_wins_earlier_timestamp() -> None:
     # The same dedup key appears twice; the earlier-timestamped entry should be retained.
-    e1 = parse_entry({
-        "type": "assistant",
-        "timestamp": "2026-04-20T10:00:00Z",
-        "sessionId": "s1",
-        "requestId": "r",
-        "message": {"id": "m", "role": "assistant", "content": []},
-    })
-    e2 = parse_entry({
-        "type": "assistant",
-        "timestamp": "2026-04-20T10:05:00Z",
-        "sessionId": "s1",
-        "requestId": "r",
-        "message": {"id": "m", "role": "assistant", "content": []},
-    })
+    e1 = parse_entry(
+        {
+            "type": "assistant",
+            "timestamp": "2026-04-20T10:00:00Z",
+            "sessionId": "s1",
+            "requestId": "r",
+            "message": {"id": "m", "role": "assistant", "content": []},
+        }
+    )
+    e2 = parse_entry(
+        {
+            "type": "assistant",
+            "timestamp": "2026-04-20T10:05:00Z",
+            "sessionId": "s1",
+            "requestId": "r",
+            "message": {"id": "m", "role": "assistant", "content": []},
+        }
+    )
     merged = dedup_entries([e2, e1])
     assert len(merged) == 1
     assert merged[0].timestamp == e1.timestamp
@@ -1251,6 +1288,7 @@ git commit -m "feat(jsonl): tiered dedup with deterministic ordering"
 Run with: CCFORENSICS_REAL=1 uv run pytest tests/test_real_ingest.py -v
 Skipped by default in CI.
 """
+
 from __future__ import annotations
 
 import os
@@ -1445,7 +1483,9 @@ def test_compute_message_cost() -> None:
 
 
 def test_compute_message_cost_handles_none() -> None:
-    p = ModelPrice(input_cost=1e-6, output_cost=1e-6, cache_creation_cost=1e-6, cache_read_cost=1e-6)
+    p = ModelPrice(
+        input_cost=1e-6, output_cost=1e-6, cache_creation_cost=1e-6, cache_read_cost=1e-6
+    )
     # None tokens should be treated as 0.
     assert compute_message_cost(p, None, None, None, None) == 0.0
 
@@ -1489,12 +1529,14 @@ def _unreachable_client() -> httpx.Client:
     # If anything tries to actually use this, raise.
     def handler(_request: httpx.Request) -> httpx.Response:
         raise AssertionError("unexpected HTTP call")
+
     return httpx.Client(transport=httpx.MockTransport(handler))
 
 
 def _failing_client() -> httpx.Client:
     def handler(_request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("simulated offline")
+
     return httpx.Client(transport=httpx.MockTransport(handler))
 ```
 
@@ -1524,8 +1566,7 @@ import httpx
 logger = logging.getLogger("ccforensics.pricing")
 
 LITELLM_URL = (
-    "https://raw.githubusercontent.com/BerriAI/litellm/main/"
-    "model_prices_and_context_window.json"
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 )
 
 
@@ -1737,14 +1778,20 @@ def test_user_entries_have_zero_cost(pricing_data: dict) -> None:
 def test_missing_model_pricing_yields_none(pricing_data: dict) -> None:
     # Forge an entry with an unknown model.
     from ccforensics.models import parse_entry
+
     raw = {
         "type": "assistant",
         "uuid": "u",
         "sessionId": "s",
         "timestamp": "2026-04-20T10:00:00Z",
         "requestId": "r",
-        "message": {"id": "m", "role": "assistant", "model": "imaginary-model-v99",
-                    "content": [], "usage": {"input_tokens": 100, "output_tokens": 10}},
+        "message": {
+            "id": "m",
+            "role": "assistant",
+            "model": "imaginary-model-v99",
+            "content": [],
+            "usage": {"input_tokens": 100, "output_tokens": 10},
+        },
     }
     entry = parse_entry(raw)
     annotated = annotate_cost([entry], pricing_data)
@@ -1845,6 +1892,7 @@ Write a redaction script `scripts/redact_jsonl.py`:
 
 Preserves everything cost-related; replaces text content with '[REDACTED]'.
 """
+
 from __future__ import annotations
 
 import json
@@ -1859,7 +1907,11 @@ def redact_content_block(block: dict) -> dict:
     if t == "tool_use":
         return {"type": "tool_use", "id": block.get("id"), "name": block.get("name"), "input": {}}
     if t == "tool_result":
-        return {"type": "tool_result", "tool_use_id": block.get("tool_use_id"), "content": "[REDACTED]"}
+        return {
+            "type": "tool_result",
+            "tool_use_id": block.get("tool_use_id"),
+            "content": "[REDACTED]",
+        }
     return {"type": t}
 
 
@@ -1923,6 +1975,7 @@ Record the ccusage total in a comment at the top of the test.
 The redacted session was captured alongside a ccusage-reported total.
 Our computation must match within ±1%.
 """
+
 from __future__ import annotations
 
 import json
@@ -2019,9 +2072,7 @@ def test_fresh_db_applies_current_schema(tmp_path: Path) -> None:
     assert cur.fetchone()[0] == CURRENT_SCHEMA_VERSION
 
     # Spot-check required tables exist.
-    existing = {
-        row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    }
+    existing = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     for required in (
         "files",
         "messages",
@@ -2292,9 +2343,7 @@ def test_reconcile_unchanged_file_is_noop(tmp_path: Path, pricing_data: dict) ->
     assert first_last_parsed == second_last_parsed, "unchanged file should be skipped"
 
 
-def test_reconcile_changed_file_replaces_messages(
-    tmp_path: Path, pricing_data: dict
-) -> None:
+def test_reconcile_changed_file_replaces_messages(tmp_path: Path, pricing_data: dict) -> None:
     db = tmp_path / "index.sqlite"
     conn = open_connection(db)
     ensure_schema(conn)
@@ -2369,12 +2418,8 @@ def _classify_file(path: Path) -> tuple[str, str | None, str]:
     return ("main", None, path.stem)
 
 
-def _row_is_unchanged(
-    conn: sqlite3.Connection, path: Path, mtime_ns: int, size: int
-) -> bool:
-    cur = conn.execute(
-        "SELECT mtime_ns, size FROM files WHERE path=?", (str(path),)
-    )
+def _row_is_unchanged(conn: sqlite3.Connection, path: Path, mtime_ns: int, size: int) -> bool:
+    cur = conn.execute("SELECT mtime_ns, size FROM files WHERE path=?", (str(path),))
     row = cur.fetchone()
     return bool(row) and row[0] == mtime_ns and row[1] == size
 
@@ -2383,9 +2428,7 @@ def _purge_file_rows(conn: sqlite3.Connection, path: Path) -> None:
     # Cascade on messages happens automatically via FK. For spawns + skills
     # we do it explicitly since they reference messages + sessions.
     s = str(path)
-    conn.execute(
-        "DELETE FROM subagent_spawns WHERE child_file_path=?", (s,)
-    )
+    conn.execute("DELETE FROM subagent_spawns WHERE child_file_path=?", (s,))
     conn.execute(
         "DELETE FROM skill_activations WHERE activated_by_dedup_key IN "
         "(SELECT dedup_key FROM messages WHERE file_path=?)",
@@ -2449,9 +2492,7 @@ def _insert_message(
     )
 
 
-def reconcile_file(
-    conn: sqlite3.Connection, path: Path, pricing_data: dict[str, Any]
-) -> None:
+def reconcile_file(conn: sqlite3.Connection, path: Path, pricing_data: dict[str, Any]) -> None:
     stat = path.stat()
     mtime_ns = stat.st_mtime_ns
     size = stat.st_size
@@ -2484,9 +2525,15 @@ def reconcile_file(
             parse_warnings, last_parsed_at)
            VALUES (?,?,?,?,?,?,?,?,?)""",
         (
-            str(path), mtime_ns, size, session_id, kind, agent_id,
+            str(path),
+            mtime_ns,
+            size,
+            session_id,
+            kind,
+            agent_id,
             next(iter(result.seen_versions), None) if result.seen_versions else None,
-            len(result.warnings), int(time.time()),
+            len(result.warnings),
+            int(time.time()),
         ),
     )
 
@@ -2499,9 +2546,7 @@ def reconcile_file(
 
 
 def count_messages_for_file(conn: sqlite3.Connection, path: Path) -> int:
-    row = conn.execute(
-        "SELECT COUNT(*) FROM messages WHERE file_path=?", (str(path),)
-    ).fetchone()
+    row = conn.execute("SELECT COUNT(*) FROM messages WHERE file_path=?", (str(path),)).fetchone()
     return int(row[0])
 ```
 
@@ -2756,9 +2801,7 @@ def index_stats() -> None:
         f"db_size_bytes: {stats.db_size_bytes}",
     ]
     if stats.last_refresh:
-        lines.append(
-            f"last_refresh: {datetime.utcfromtimestamp(stats.last_refresh).isoformat()}Z"
-        )
+        lines.append(f"last_refresh: {datetime.utcfromtimestamp(stats.last_refresh).isoformat()}Z")
     else:
         lines.append("last_refresh: never")
     click.echo("\n".join(lines))
@@ -2997,9 +3040,7 @@ class SessionNotFound(Exception):
 
 def resolve_session_id(spec: str, conn: sqlite3.Connection) -> str:
     if spec.endswith(".jsonl") and os.path.isabs(spec):
-        row = conn.execute(
-            "SELECT session_id FROM files WHERE path=?", (spec,)
-        ).fetchone()
+        row = conn.execute("SELECT session_id FROM files WHERE path=?", (spec,)).fetchone()
         if row is None:
             raise SessionNotFound(spec)
         return str(row[0])
@@ -3364,12 +3405,10 @@ def test_session_list_json_export(tmp_path, monkeypatch):
     ...
 
 
-def test_session_list_csv_export(tmp_path, monkeypatch):
-    ...
+def test_session_list_csv_export(tmp_path, monkeypatch): ...
 
 
-def test_session_list_grep_filter(tmp_path, monkeypatch):
-    ...
+def test_session_list_grep_filter(tmp_path, monkeypatch): ...
 ```
 
 At least one test should write a real JSONL into the fixture projects dir, run `index rebuild --force --yes`, then `session list --json`, and assert the expected session appears with correct fields.
@@ -3394,7 +3433,8 @@ from .report.session_list import query_session_list, render_session_list
 @click.option("--until", help="Date filter: YYYY-MM-DD | Nd | today | yesterday")
 @click.option("--grep", help="Case-insensitive substring on summary text.")
 @click.option(
-    "--sort", "sort_key",
+    "--sort",
+    "sort_key",
     type=click.Choice(["cost", "started", "last-active", "turns"]),
     default="last-active",
 )
@@ -3440,9 +3480,16 @@ def session_list_cmd(
         return
     if as_csv:
         headers = [
-            "session_id", "project_path", "project_display",
-            "started_at", "last_active_at", "duration_s",
-            "turn_count", "total_cost_usd", "summary_text", "summary_source",
+            "session_id",
+            "project_path",
+            "project_display",
+            "started_at",
+            "last_active_at",
+            "duration_s",
+            "turn_count",
+            "total_cost_usd",
+            "summary_text",
+            "summary_source",
         ]
         write_csv((dataclasses.asdict(r) for r in rows), headers, sys.stdout)
         return
@@ -3597,6 +3644,7 @@ _LOCAL_WRAPPER_RE = re.compile(
     r"<(local-command-(?:caveat|stdout|stderr)|bash-(?:input|stdout|stderr))>.*?</\1>",
     re.DOTALL,
 )
+
 
 def _sanitize_prompt(text: str) -> str:
     text = _LOCAL_WRAPPER_RE.sub("", text)
