@@ -151,9 +151,10 @@ def fallback_hardcoded() -> dict[str, dict[str, float]]:
         "claude-fable-5": {
             # Mythos-class flagship, released 2026-06-08/09. $10/1M input,
             # $50/1M output (2x Opus 4.8); standard Anthropic cache multipliers
-            # (5m 1.25x, 1h 2.0x, read 0.1x). LiteLLM does not carry it yet, so
-            # this entry is reached via resolve_pricing's hardcoded last-resort
-            # tier — not only on a full fetch failure.
+            # (5m 1.25x, 1h 2.0x, read 0.1x). LiteLLM did not carry this model
+            # when the entry was added, so it was then the live path; LiteLLM
+            # has since ingested it at identical rates and now wins, leaving
+            # this as offline insurance.
             "input_cost_per_token": 0.00001,
             "output_cost_per_token": 0.00005,
             "cache_creation_input_token_cost": 0.0000125,
@@ -165,9 +166,9 @@ def fallback_hardcoded() -> dict[str, dict[str, float]]:
             # input, $25/1M output; standard Anthropic cache multipliers
             # (5m 1.25x, 1h 2.0x, read 0.1x). LiteLLM already carries this
             # model at the same rates, so this entry is offline insurance
-            # rather than the live path (unlike claude-fable-5). Fast mode
-            # bills differently ($10/$50) — not modelled; see the deferred
-            # ``usage.speed`` pricing branch.
+            # rather than the live path. Fast mode bills differently
+            # ($10/$50) — not modelled; see the deferred ``usage.speed``
+            # pricing branch.
             "input_cost_per_token": 0.000005,
             "output_cost_per_token": 0.000025,
             "cache_creation_input_token_cost": 0.00000625,
