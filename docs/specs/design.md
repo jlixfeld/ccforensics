@@ -238,10 +238,8 @@ def dedup_key(entry) -> str | None:
     mid = entry.message.id if entry.message else None
     rid = entry.requestId
     sid = entry.sessionId
-    if mid and rid:
-        return f"req:{mid}:{rid}"
-    if mid and sid:
-        return f"session:{mid}:{sid}"
+    if mid and rid: return f"req:{mid}:{rid}"
+    if mid and sid: return f"session:{mid}:{sid}"
     return None  # entry inserted with synthetic key file:{path}:{lineno}
 ```
 
