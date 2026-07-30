@@ -237,7 +237,9 @@ The result-variation suppression avoids flagging legitimate retries: a Bash comm
 ### `novelty_window`
 
 ```python
-def detect_novelty_window(messages: list[Message], window: int = 6, threshold: int = 2, jaccard_min: float = 0.85) -> list[Signal]:
+def detect_novelty_window(
+    messages: list[Message], window: int = 6, threshold: int = 2, jaccard_min: float = 0.85
+) -> list[Signal]:
     """N consecutive turns with no new unique file, tool result, error, or assistant text variation."""
 ```
 
@@ -251,7 +253,9 @@ Formalizes the industry `no_progress_steps` metric (agent patterns research). Mo
 ### `turn_cost_acceleration`
 
 ```python
-def detect_turn_cost_acceleration(messages: list[Message], min_turns: int = 15, r2_threshold: float = 0.55) -> list[Signal]:
+def detect_turn_cost_acceleration(
+    messages: list[Message], min_turns: int = 15, r2_threshold: float = 0.55
+) -> list[Signal]:
     """Output-tokens-per-turn has positive slope — model compensating by generating more output."""
 ```
 
@@ -338,17 +342,18 @@ Validated by SWE-bench's `fail2pass` / `pass2pass` framework: test-state regress
 SIGNAL_VERSION = 1  # bump on any threshold/weight/extractor change
 
 WEIGHTS = {
-    "novelty_window":            0.22,  # primary: absence-of-progress metric (industry-validated)
-    "test_regression":           0.18,  # made-it-worse signal (SWE-bench fail2pass framework)
-    "repeated_edit":             0.15,
-    "repeated_error":            0.12,
-    "placeholder_emit":          0.10,  # low-confidence completion proxy (validated)
-    "user_correction":           0.08,
-    "trajectory_length_zscore":  0.06,
-    "tool_arg_churn":            0.05,
-    "turn_cost_acceleration":    0.02,
-    "session_abandoned":         0.02,
+    "novelty_window": 0.22,  # primary: absence-of-progress metric (industry-validated)
+    "test_regression": 0.18,  # made-it-worse signal (SWE-bench fail2pass framework)
+    "repeated_edit": 0.15,
+    "repeated_error": 0.12,
+    "placeholder_emit": 0.10,  # low-confidence completion proxy (validated)
+    "user_correction": 0.08,
+    "trajectory_length_zscore": 0.06,
+    "tool_arg_churn": 0.05,
+    "turn_cost_acceleration": 0.02,
+    "session_abandoned": 0.02,
 }
+
 
 def thrash_score(signals: list[Signal]) -> float:
     """Composite in [0, 1]. Each fired signal contributes its full weight; counts beyond threshold add log-scaled bonus capped at 1.5×."""
