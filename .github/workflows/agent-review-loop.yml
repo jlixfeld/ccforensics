@@ -51,7 +51,7 @@ jobs:
           repositories: ${{ github.event.repository.name }}
 
       - name: Check out trusted orchestration code
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: jlixfeld/review-automation
           ref: 047b161e28a7933e62dc253bbc9db6b8877462f9
@@ -98,7 +98,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Check out trusted pull request head
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ needs.orchestrate.outputs.head-sha }}
           persist-credentials: false
@@ -529,7 +529,7 @@ jobs:
       contents: read
     steps:
       - name: Check out the exact reviewed revision on a fresh runner
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ needs.orchestrate.outputs.head-sha }}
           persist-credentials: false
