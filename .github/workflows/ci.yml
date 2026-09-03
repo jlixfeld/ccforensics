@@ -88,7 +88,7 @@ jobs:
       # event itself (PR range on pull_request, pushed commits on push).
       # Hardcoding the pull_request refs made them empty on push events,
       # which is why this workflow was PR-only.
-      - uses: trufflesecurity/trufflehog@v3.96.0
+      - uses: trufflesecurity/trufflehog@v3.97.1
         with:
           path: ./
           extra_args: --only-verified
